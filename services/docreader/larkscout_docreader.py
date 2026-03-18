@@ -1182,9 +1182,10 @@ async def library_search(
 
     documents = index.get("documents", [])
 
-    # Filter
+    # Filter — accept "web" as an alias for "web_capture"
     if file_type:
-        documents = [d for d in documents if d.get("file_type") == file_type]
+        _ft = "web_capture" if file_type == "web" else file_type
+        documents = [d for d in documents if d.get("file_type") == _ft]
 
     if tags:
         tag_list = [t.strip() for t in tags.split(",")]
