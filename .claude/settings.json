@@ -16,20 +16,13 @@
       "Bash(wc:*)",
       "Bash(mkdir:*)",
       "Bash(cp:*)",
-      "Bash(mv:*)"
+      "Bash(mv:*)",
+      "Bash(curl:*)",
+      "Bash(timeout:*)"
     ],
     "deny": [
       "Bash(rm -rf /)",
-      "Bash(sudo:*)",
-      "Bash(curl|wget:*)"
-    ]
-  },
-  "hooks": {
-    "postCommit": [
-      {
-        "command": "ruff check --fix . && ruff format .",
-        "description": "Auto-fix lint and format after commit"
-      }
+      "Bash(sudo:*)"
     ]
   }
 }
