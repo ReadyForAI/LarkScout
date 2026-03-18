@@ -6,7 +6,6 @@
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
 import os
@@ -15,14 +14,14 @@ import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel, Field as PydField
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 
-from i18n import t, prompt, tmpl, init_locale
+from i18n import init_locale, prompt, t, tmpl
 
 init_locale()
 
@@ -68,69 +67,22 @@ class ParsedDocument:
 
 
 # ═══════════════════════════════════════════
-# Gemini API wrapper
+# LLM provider wrapper
 # ═══════════════════════════════════════════
-
-_client = None
-_model_name = "gemini-2.5-flash"
-
-
-def _init_gemini():
-    """Lazy-init Gemini client."""
-    global _client
-    if _client is not None:
-        return
-
-    try:
-        from google import genai
-    except ImportError:
-        raise RuntimeError(t("gemini_not_installed"))
-
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError(t("gemini_key_missing"))
-
-    _client = genai.Client(api_key=api_key)
 
 
 def gemini_ocr(image_bytes: bytes, page_num: int) -> str:
-    """OCR a single page image via Gemini Vision."""
-    _init_gemini()
-    import PIL.Image
+    """OCR a single page image via the active LLM provider."""
+    from providers import get_provider
 
-    img = PIL.Image.open(io.BytesIO(image_bytes))
-    ocr_prompt = prompt("ocr")
-
-    try:
-        response = _client.models.generate_content(
-            model=_model_name,
-            contents=[ocr_prompt, img],
-        )
-        return response.text.strip()
-    except Exception as e:
-        logger.warning(f"OCR failed for page {page_num}: {e}")
-        return t("ocr_failed", page=page_num)
+    return get_provider().ocr(image_bytes, page_num)
 
 
-def gemini_summarize(text: str, prompt: str, max_retries: int = 2) -> str:
-    """Generate summary via Gemini Flash."""
-    _init_gemini()
-    full_prompt = f"{prompt}\n\n---\n\n{text}"
+def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
+    """Generate summary via the active LLM provider."""
+    from providers import get_provider
 
-    for attempt in range(max_retries + 1):
-        try:
-            response = _client.models.generate_content(
-                model=_model_name,
-                contents=full_prompt,
-            )
-            return response.text.strip()
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Summary retry ({attempt + 1}/{max_retries}): {e}")
-                time.sleep(2 ** attempt)
-            else:
-                logger.error(f"Summary generation failed: {e}")
-                return t("summary_failed")
+    return get_provider().summarize(text, summarize_prompt, max_retries=max_retries)
 
 
 # ═══════════════════════════════════════════
@@ -400,6 +352,112 @@ def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
     return ParsedDocument(
         filename=filepath.name, file_type="docx", total_pages=est_pages,
         pages=pages, sections=sections, table_count=table_count,
+    )
+
+
+# ═══════════════════════════════════════════
+# XLSX parsing
+# ═══════════════════════════════════════════
+
+def parse_xlsx(filepath: Path) -> ParsedDocument:
+    """Parse an XLSX workbook; each sheet becomes one section and one Markdown table."""
+    import openpyxl
+
+    logger.info(f"Parsing XLSX: {filepath.name}")
+    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+
+    sections: list[Section] = []
+    pages: list[PageContent] = []
+    table_count = 0
+
+    for idx, sheet_name in enumerate(wb.sheetnames, 1):
+        ws = wb[sheet_name]
+        rows: list[list[str]] = []
+        for row in ws.iter_rows(values_only=True):
+            str_row = [str(cell) if cell is not None else "" for cell in row]
+            if any(c.strip() for c in str_row):
+                rows.append(str_row)
+
+        if not rows:
+            continue
+
+        md_table = _rows_to_markdown(rows)
+        page = PageContent(page_num=idx, text=md_table, tables=[md_table] if md_table else [])
+        pages.append(page)
+
+        if md_table:
+            table_count += 1
+
+        sid = _section_sid(sheet_name, md_table)
+        sections.append(Section(
+            index=idx,
+            title=sheet_name,
+            level=1,
+            text=md_table,
+            page_range=f"sheet {idx}",
+            sid=sid,
+        ))
+
+    wb.close()
+
+    logger.info(f"XLSX parse complete: {len(sections)} sheets, {table_count} tables")
+    return ParsedDocument(
+        filename=filepath.name,
+        file_type="xlsx",
+        total_pages=max(len(pages), 1),
+        pages=pages,
+        sections=sections,
+        table_count=table_count,
+    )
+
+
+# ═══════════════════════════════════════════
+# CSV parsing
+# ═══════════════════════════════════════════
+
+def parse_csv(filepath: Path) -> ParsedDocument:
+    """Parse a CSV file; the entire file becomes one section and one Markdown table."""
+    import csv
+
+    logger.info(f"Parsing CSV: {filepath.name}")
+
+    # Try UTF-8-with-BOM first (common Excel export), fall back to latin-1
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(filepath, newline="", encoding=encoding) as f:
+                reader = csv.reader(f)
+                rows: list[list[str]] = [
+                    row for row in reader if any(cell.strip() for cell in row)
+                ]
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        rows = []
+
+    md_table = _rows_to_markdown(rows) if rows else ""
+    page = PageContent(page_num=1, text=md_table, tables=[md_table] if md_table else [])
+
+    stem = filepath.stem
+    sid = _section_sid(stem, md_table)
+    section = Section(
+        index=1,
+        title=stem,
+        level=1,
+        text=md_table,
+        page_range="sheet 1",
+        sid=sid,
+    )
+
+    table_count = 1 if md_table else 0
+    logger.info(f"CSV parse complete: {len(rows)} rows, {table_count} tables")
+    return ParsedDocument(
+        filename=filepath.name,
+        file_type="csv",
+        total_pages=1,
+        pages=[page],
+        sections=[section] if md_table else [],
+        table_count=table_count,
     )
 
 
@@ -707,8 +765,8 @@ def _compress_sections_for_brief(sections: list[Section]) -> str:
 # ═══════════════════════════════════════════
 
 def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, output_dir: Path,
-                 tags: Optional[List[str]] = None, source: str = "upload",
-                 original_path: Optional[str] = None):
+                 tags: list[str] | None = None, source: str = "upload",
+                 original_path: str | None = None):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
     tables_dir = doc_dir / "tables"
@@ -723,7 +781,7 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
         "section_count": len(parsed.sections),
         "ocr_page_count": parsed.ocr_page_count,
         "table_count": parsed.table_count,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sections": [
             {"index": sec.index, "sid": sec.sid, "title": sec.title,
              "page_range": sec.page_range, "char_count": len(sec.text)}
@@ -796,7 +854,7 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
 
 
 def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: Path,
-                              tags: Optional[List[str]] = None, source: str = "upload"):
+                              tags: list[str] | None = None, source: str = "upload"):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
     doc_dir.mkdir(parents=True, exist_ok=True)
@@ -806,7 +864,7 @@ def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: P
         "doc_id": doc_id, "filename": parsed.filename, "file_type": parsed.file_type,
         "total_pages": parsed.total_pages, "section_count": len(parsed.sections),
         "ocr_page_count": parsed.ocr_page_count, "table_count": parsed.table_count,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sections": [
             {"index": sec.index, "sid": sec.sid, "title": sec.title,
              "page_range": sec.page_range, "char_count": len(sec.text)}
@@ -846,15 +904,15 @@ def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: P
 # ═══════════════════════════════════════════
 
 def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
-                      tags: Optional[List[str]] = None,
+                      tags: list[str] | None = None,
                       source: str = "upload",
-                      source_url: Optional[str] = None,
-                      content_hash: Optional[str] = None):
+                      source_url: str | None = None,
+                      content_hash: str | None = None):
     """Update doc-index.json (v2 format with source/tags/content_hash)."""
     index_path = docs_dir / "doc-index.json"
     if index_path.exists():
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
+            with open(index_path, encoding="utf-8") as f:
                 index = json.load(f)
         except (json.JSONDecodeError, Exception):
             index = {"version": 2, "documents": []}
@@ -879,7 +937,7 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
         entry["source_url"] = source_url
 
     index["documents"].append(entry)
-    index["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    index["last_updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_json(index_path, index)
 
 
@@ -961,11 +1019,11 @@ class SectionInfo(BaseModel):
 class ManifestResponse(BaseModel):
     doc_id: str
     filename: str
-    file_type: Optional[str] = None
-    source: Optional[str] = None
-    paths: Dict[str, str]
-    sections: List[Dict[str, Any]]
-    provenance: Optional[Dict[str, Any]] = None
+    file_type: str | None = None
+    source: str | None = None
+    paths: dict[str, str]
+    sections: list[dict[str, Any]]
+    provenance: dict[str, Any] | None = None
 
 
 class SearchResult(BaseModel):
@@ -973,14 +1031,14 @@ class SearchResult(BaseModel):
     filename: str
     file_type: str
     digest: str
-    tags: List[str] = []
+    tags: list[str] = []
     source: str = "upload"
-    created_at: Optional[str] = None
+    created_at: str | None = None
     score: float = 1.0
 
 
 class SearchResponse(BaseModel):
-    results: List[SearchResult]
+    results: list[SearchResult]
     total: int
 
 
@@ -995,22 +1053,22 @@ async def health():
         "ok": True,
         "version": "3.0.0",
         "docs_dir": str(_get_docs_dir()),
-        "supported_formats": ["pdf", "docx"],
+        "supported_formats": ["pdf", "docx", "xlsx", "csv"],
     }
 
 
-@app.post("/doc/parse", response_model=ParseResponse)
+@app.post("/parse", response_model=ParseResponse)
 async def api_parse_doc(
     file: UploadFile = File(...),
-    doc_id: Optional[str] = Form(None),
+    doc_id: str | None = Form(None),
     generate_summary: bool = Form(True),
     force_ocr: bool = Form(False),
-    ocr_pages: Optional[str] = Form(None),
+    ocr_pages: str | None = Form(None),
     extract_tables: bool = Form(True),
     max_tables_per_page: int = Form(3),
     concurrency: int = Form(3),
-    tags: Optional[str] = Form(None),  # JSON array string: '["Q3","financial"]'
-    metadata: Optional[str] = Form(None),  # JSON object string
+    tags: str | None = Form(None),  # JSON array string: '["Q3","financial"]'
+    metadata: str | None = Form(None),  # JSON object string
 ):
     """Parse uploaded document (PDF/DOCX), return structured result."""
     docs_dir = _get_docs_dir()
@@ -1019,11 +1077,11 @@ async def api_parse_doc(
     # Check format
     filename = file.filename or "unknown"
     suffix = Path(filename).suffix.lower()
-    if suffix not in (".pdf", ".docx"):
+    if suffix not in (".pdf", ".docx", ".xlsx", ".csv"):
         raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
     # Parse tags
-    parsed_tags: List[str] = []
+    parsed_tags: list[str] = []
     if tags:
         try:
             parsed_tags = json.loads(tags)
@@ -1051,10 +1109,14 @@ async def api_parse_doc(
                 max_tables_per_page=max_tables_per_page,
                 concurrency=concurrency, cache_dir=docs_dir / d_id,
             ))
-        else:
+        elif suffix == ".docx":
             parsed = await loop.run_in_executor(None, lambda: parse_word(
                 tmp_path, extract_tables=extract_tables,
             ))
+        elif suffix == ".xlsx":
+            parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
+        else:  # .csv
+            parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
     except Exception as e:
         raise HTTPException(500, t("parse_failed", err=str(e)))
     finally:
@@ -1102,9 +1164,9 @@ async def api_parse_doc(
 
 @app.get("/library/search", response_model=SearchResponse)
 async def library_search(
-    q: Optional[str] = None,
-    tags: Optional[str] = None,
-    file_type: Optional[str] = None,
+    q: str | None = None,
+    tags: str | None = None,
+    file_type: str | None = None,
     limit: int = 20,
 ):
     """Search document library."""

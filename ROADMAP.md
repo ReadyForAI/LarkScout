@@ -29,6 +29,7 @@
 **Goal:** Create `larkscout_server.py` that mounts browser and docreader as sub-applications on a single FastAPI instance.
 
 **Scope:**
+
 - Create `larkscout_server.py` at repo root
 - Import and mount `services/browser/larkscout_browser.py` under `/web`
 - Import and mount `services/docreader/larkscout_docreader.py` under `/doc`
@@ -36,6 +37,7 @@
 - Default port: 9898
 
 **AC:**
+
 ```bash
 # AC-1: File exists and is valid Python
 verify: python -c "import ast; ast.parse(open('larkscout_server.py').read())"
@@ -71,11 +73,13 @@ verify: ruff check larkscout_server.py
 **Goal:** Add `requirements.txt` and `pyproject.toml` so the project is installable and dependencies are pinned.
 
 **Scope:**
+
 - Create `requirements.txt` with all current dependencies (fastapi, uvicorn, playwright, pymupdf, python-docx, httpx, etc.)
 - Create `pyproject.toml` with project metadata, Python ≥3.11 requirement, ruff config, and pytest config
 - Ensure `pip install -r requirements.txt` succeeds
 
 **AC:**
+
 ```bash
 # AC-1: requirements.txt exists and contains fastapi
 verify: grep -qi "fastapi" requirements.txt
@@ -106,11 +110,13 @@ verify: ruff check .
 **Goal:** Set up pytest with baseline tests for health endpoints.
 
 **Scope:**
+
 - Create `tests/conftest.py` with a shared FastAPI TestClient fixture
 - Create `tests/test_health.py` — test `GET /health`, `GET /web/health`, `GET /doc/health`
 - All tests should pass without starting external services (Playwright, Gemini)
 
 **AC:**
+
 ```bash
 # AC-1: Test files exist
 verify: test -f tests/conftest.py && test -f tests/test_health.py
@@ -136,6 +142,7 @@ verify: ruff check tests/
 **Goal:** Add `POST /web/capture` that takes a URL, opens a browser session, distills content, persists to document library, and returns a doc_id — all in one call.
 
 **Scope:**
+
 - New endpoint `POST /web/capture` in browser service
 - Request body: `{"url": "...", "tags": [...], "extract_tables": true}`
 - Internally: session/new → goto → distill → persist to `docs/WEB-xxx/` → session/close
@@ -144,6 +151,7 @@ verify: ruff check tests/
 - Reference: `skills/larkscout-browser-SKILL.md` §6.9
 
 **AC:**
+
 ```bash
 # AC-1: Endpoint exists and returns 422 on empty body (not 404)
 verify: timeout 5 bash -c 'python larkscout_server.py &
@@ -177,6 +185,7 @@ if missing: print(f'Missing return type hints: {missing[:5]}'); sys.exit(1)
 **Goal:** Extend `POST /doc/parse` to accept `.xlsx` and `.csv` files.
 
 **Scope:**
+
 - Add openpyxl (read_only mode) for XLSX parsing
 - Add csv stdlib for CSV parsing
 - Each sheet (XLSX) or file (CSV) becomes a section
@@ -185,6 +194,7 @@ if missing: print(f'Missing return type hints: {missing[:5]}'); sys.exit(1)
 - Reference: `skills/larkscout-docreader-SKILL.md` §4.2
 
 **AC:**
+
 ```bash
 # AC-1: Health endpoint lists new formats
 verify: timeout 5 bash -c 'python larkscout_server.py &
@@ -215,6 +225,7 @@ verify: ruff check services/docreader/
 **Goal:** Replace direct Gemini API calls with a provider abstraction layer so users can configure different LLM backends.
 
 **Scope:**
+
 - Create `larkscout/providers/base.py` — abstract `LLMProvider` class with `summarize()` and `ocr()` methods
 - Create `larkscout/providers/gemini.py` — current Gemini implementation extracted
 - Create `larkscout/providers/openai_compat.py` — OpenAI-compatible provider (works with OpenAI, DeepSeek, local Ollama, etc.)
@@ -223,6 +234,7 @@ verify: ruff check services/docreader/
 - Default: Gemini (backward compatible)
 
 **AC:**
+
 ```bash
 # AC-1: Provider files exist
 verify: test -f providers/base.py && test -f providers/gemini.py && test -f providers/openai_compat.py
@@ -261,12 +273,14 @@ verify: ruff check providers/
 **Goal:** Provide a one-command way to run LarkScout with all dependencies.
 
 **Scope:**
+
 - Create `Dockerfile` — Python 3.11 slim, install deps, install Playwright browsers, expose 9898
 - Create `docker-compose.yml` — single service, volume mount for `docs/` persistence
 - Create `.dockerignore`
 - Document in README
 
 **AC:**
+
 ```bash
 # AC-1: Dockerfile exists and is valid
 verify: test -f Dockerfile && head -1 Dockerfile | grep -qi "FROM"
@@ -293,12 +307,14 @@ verify: grep -i "volume" docker-compose.yml | grep -qi "docs"
 **Goal:** Create user-facing documentation for the open-source project.
 
 **Scope:**
+
 - Create `README.md` — project overview, features, quick start (pip + Docker), configuration, API overview, contributing link
 - Create `CONTRIBUTING.md` — dev setup, code conventions (reference CLAUDE.md), PR process, issue templates
 - Create `LICENSE` — MIT
 - Add badges: CI status, license, Python version
 
 **AC:**
+
 ```bash
 # AC-1: Files exist
 verify: test -f README.md && test -f CONTRIBUTING.md && test -f LICENSE
@@ -336,12 +352,14 @@ assert len(cn) == 0, f'Found {len(cn)} Chinese characters in README'
 **Goal:** Provide a lightweight Python client SDK for LarkScout API.
 
 **Scope:**
+
 - Create `sdk/python/larkscout_client.py` — sync + async client classes
 - Methods: `capture(url)`, `parse(file)`, `search(query)`, `get_digest(doc_id)`, `get_section(doc_id, sid)`
 - Publish-ready: `sdk/python/pyproject.toml` with package metadata
 - Usage examples in `sdk/python/examples/`
 
 **AC:**
+
 ```bash
 # AC-1: SDK files exist
 verify: test -f sdk/python/larkscout_client.py && test -f sdk/python/pyproject.toml
@@ -369,31 +387,232 @@ verify: ruff check sdk/python/
 
 ---
 
+## Phase 4 — End-to-End Validation
+
+> Goal: verify the full data pipeline works on a real local environment.
+> Each task produces a runnable test script in `tests/e2e/` that can be re-run anytime.
+> **Prerequisite:** `source ~/.venv/bin/activate && python larkscout_server.py &` running on port 9898.
+
+### TASK-010: E2E — Web Capture Pipeline
+
+**Goal:** Verify the full web capture flow: capture a public webpage → persist to doc library → retrieve digest/sections.
+
+**Scope:**
+
+- Create `tests/e2e/conftest.py` with shared fixtures (base_url, httpx client, live marker config)
+- Create `tests/e2e/test_e2e_web_capture.py`
+- Use `httpx` as the HTTP client (no SDK dependency yet)
+- Target a stable public page (e.g., `https://example.com`)
+- Flow: `POST /web/capture` → get doc_id → `GET /doc/library/{doc_id}/digest` → `GET /doc/library/{doc_id}/sections` → `GET /doc/library/{doc_id}/section/{first_sid}`
+- Assert: doc_id starts with "WEB-", digest is non-empty, at least 1 section exists, section content is non-empty
+- Add a `live` pytest marker so it only runs when explicitly requested (not in CI)
+
+**AC:**
+
+```bash
+# AC-1: Test file exists
+verify: test -f tests/e2e/test_e2e_web_capture.py
+
+# AC-2: Test is collected with correct marker
+verify: pytest tests/e2e/test_e2e_web_capture.py --collect-only 2>&1 | grep "test_"
+
+# AC-3: Live test passes (requires running server + network)
+verify: pytest tests/e2e/test_e2e_web_capture.py -v -m live --timeout=60
+
+# AC-4: Lint passes
+verify: ruff check tests/e2e/
+```
+
+**Depends on:** TASK-004
+
+---
+
+### TASK-011: E2E — Document Parse Pipeline
+
+**Goal:** Verify the full document parsing flow: upload a file → persist → retrieve digest/brief/sections/tables.
+
+**Scope:**
+
+- Create `tests/e2e/test_e2e_doc_parse.py`
+- Create `tests/e2e/fixtures/` with:
+  - A small test PDF (1-2 pages, include a table)
+  - A small test DOCX (a few paragraphs)
+  - A small test CSV (5-10 rows)
+  - A small test XLSX (5-10 rows)
+  - Generate these programmatically in a `tests/e2e/fixtures/generate_fixtures.py` script
+- Flow for each file type:
+  - `POST /doc/parse` (multipart upload, `generate_summary=false`) → get doc_id
+  - `GET /doc/library/{doc_id}/digest` → non-empty
+  - `GET /doc/library/{doc_id}/sections` → list with ≥1 section
+  - `GET /doc/library/{doc_id}/section/{first_sid}` → non-empty content
+- Separate test for `generate_summary=true` (requires GEMINI_API_KEY, mark as `live_llm`)
+- Use `live` marker for all
+
+**AC:**
+
+```bash
+# AC-1: Test file and fixture generator exist
+verify: test -f tests/e2e/test_e2e_doc_parse.py && test -f tests/e2e/fixtures/generate_fixtures.py
+
+# AC-2: Fixtures can be generated
+verify: python tests/e2e/fixtures/generate_fixtures.py && ls tests/e2e/fixtures/ | grep -E "\.(pdf|docx|csv|xlsx)"
+
+# AC-3: Tests are collected
+verify: pytest tests/e2e/test_e2e_doc_parse.py --collect-only 2>&1 | grep "test_"
+
+# AC-4: No-summary parse tests pass (no LLM needed)
+verify: pytest tests/e2e/test_e2e_doc_parse.py -v -m "live and not live_llm" --timeout=60
+
+# AC-5: Lint passes
+verify: ruff check tests/e2e/
+```
+
+**Depends on:** TASK-005
+
+---
+
+### TASK-012: E2E — Cross-Source Search
+
+**Goal:** Verify that documents from both web capture and file upload are searchable through the unified library.
+
+**Scope:**
+
+- Create `tests/e2e/test_e2e_search.py`
+- Prerequisite: TASK-010 and TASK-011 tests have run (documents exist in library)
+- Flow:
+  - `GET /doc/library/search?q=<keyword>` → returns results
+  - `GET /doc/library/search?file_type=pdf` → only DOC-\* results
+  - `GET /doc/library/search?file_type=web` → only WEB-\* results
+  - `GET /doc/library/search?tags=test` → tag filtering works
+- Assert: search returns correct source types, scores > 0, digest previews non-empty
+
+**AC:**
+
+```bash
+# AC-1: Test file exists
+verify: test -f tests/e2e/test_e2e_search.py
+
+# AC-2: Tests are collected
+verify: pytest tests/e2e/test_e2e_search.py --collect-only 2>&1 | grep "test_"
+
+# AC-3: Search test passes (requires prior capture/parse to populate library)
+verify: pytest tests/e2e/test_e2e_search.py -v -m live --timeout=30
+
+# AC-4: Lint passes
+verify: ruff check tests/e2e/
+```
+
+**Depends on:** TASK-010, TASK-011
+
+---
+
+### TASK-013: E2E — SDK Round-Trip
+
+**Goal:** Verify the Python SDK works against a live server for the complete workflow.
+
+**Scope:**
+
+- Create `tests/e2e/test_e2e_sdk.py`
+- Use `LarkScoutClient` (sync) and `AsyncLarkScoutClient` from `sdk/python/larkscout_client.py`
+- Flow (sync client):
+  1. `client.capture("https://example.com")` → returns doc_id starting with WEB-
+  2. `client.get_digest(doc_id)` → non-empty
+  3. `client.parse(open("tests/e2e/fixtures/sample.pdf", "rb"))` → returns doc_id starting with DOC-
+  4. `client.search("example")` → returns results
+  5. `client.get_section(doc_id, sid)` → non-empty content
+- Flow (async client): same operations with `await`
+- Assert: all operations complete without error, return types match SDK signatures
+
+**AC:**
+
+```bash
+# AC-1: Test file exists
+verify: test -f tests/e2e/test_e2e_sdk.py
+
+# AC-2: Tests are collected
+verify: pytest tests/e2e/test_e2e_sdk.py --collect-only 2>&1 | grep "test_"
+
+# AC-3: Sync SDK test passes
+verify: pytest tests/e2e/test_e2e_sdk.py -v -m live -k "sync" --timeout=60
+
+# AC-4: Async SDK test passes
+verify: pytest tests/e2e/test_e2e_sdk.py -v -m live -k "async" --timeout=60
+
+# AC-5: Lint passes
+verify: ruff check tests/e2e/
+```
+
+**Depends on:** TASK-009, TASK-010, TASK-011
+
+---
+
+### TASK-014: E2E — Full Pipeline Smoke Test
+
+**Goal:** One single test that runs the entire pipeline end-to-end in sequence, verifying data flows correctly between all components.
+
+**Scope:**
+
+- Create `tests/e2e/test_e2e_full_pipeline.py`
+- Single test function `test_full_pipeline()` that runs the complete sequence:
+  1. Health check: all 3 endpoints respond 200
+  2. Web capture: capture a page → get WEB doc_id
+  3. Doc parse: upload PDF → get DOC doc_id
+  4. Cross search: search returns both WEB and DOC results
+  5. Three-tier loading: digest → brief → section for each doc
+  6. SDK: repeat steps 2-5 using SDK client
+- Print a summary table at the end showing each step's pass/fail status
+- This is the "one command to verify everything works" test
+
+**AC:**
+
+```bash
+# AC-1: Test file exists
+verify: test -f tests/e2e/test_e2e_full_pipeline.py
+
+# AC-2: Single test function exists
+verify: pytest tests/e2e/test_e2e_full_pipeline.py --collect-only 2>&1 | grep "test_full_pipeline"
+
+# AC-3: Full pipeline passes
+verify: pytest tests/e2e/test_e2e_full_pipeline.py -v -m live --timeout=180 -s
+
+# AC-4: Lint passes
+verify: ruff check tests/e2e/
+```
+
+**Depends on:** TASK-010, TASK-011, TASK-012, TASK-013
+
+---
+
 ## Task Dependency Graph
 
 ```
-TASK-001 (server entry)
-├── TASK-002 (packaging)
-│   └── TASK-007 (Docker)
-│       └── TASK-008 (README)
-└── TASK-003 (test framework)
-    ├── TASK-004 (web capture) ──┐
-    ├── TASK-005 (XLSX/CSV)  ───┼── TASK-009 (SDK)
-    └── TASK-006 (multi-LLM)   ┘
+Phase 0-3 (completed)
+├── TASK-001 → TASK-002 → TASK-003
+│   ├── TASK-004 ─── TASK-010 (web capture e2e) ──┐
+│   ├── TASK-005 ─── TASK-011 (doc parse e2e) ────┤
+│   ├── TASK-006                                   ├── TASK-014 (full pipeline)
+│   ├── TASK-007 → TASK-008                        │
+│   └── TASK-009 ─── TASK-013 (SDK e2e) ──────────┤
+│                    TASK-012 (search e2e) ─────────┘
 ```
 
 ---
 
 ## Status Tracking
 
-| Task ID  | Title                  | Status      | PR   |
-| -------- | ---------------------- | ----------- | ---- |
-| TASK-001 | Unified server entry   | Not started |      |
-| TASK-002 | Project packaging      | Not started |      |
-| TASK-003 | Test framework         | Not started |      |
-| TASK-004 | Web capture endpoint   | Not started |      |
-| TASK-005 | XLSX/CSV support       | Not started |      |
-| TASK-006 | Multi-LLM provider    | Not started |      |
-| TASK-007 | Docker Compose         | Not started |      |
-| TASK-008 | README & Contributing  | Not started |      |
-| TASK-009 | Python SDK             | Not started |      |
+| Task ID  | Title                 | Status      | PR  |
+| -------- | --------------------- | ----------- | --- |
+| TASK-001 | Unified server entry  | ✅ Done     |     |
+| TASK-002 | Project packaging     | ✅ Done     |     |
+| TASK-003 | Test framework        | ✅ Done     |     |
+| TASK-004 | Web capture endpoint  | ✅ Done     |     |
+| TASK-005 | XLSX/CSV support      | ✅ Done     |     |
+| TASK-006 | Multi-LLM provider    | ✅ Done     |     |
+| TASK-007 | Docker Compose        | ✅ Done     |     |
+| TASK-008 | README & Contributing | ✅ Done     |     |
+| TASK-009 | Python SDK            | ✅ Done     |     |
+| TASK-010 | E2E: Web capture      | Not started |     |
+| TASK-011 | E2E: Doc parse        | Not started |     |
+| TASK-012 | E2E: Cross search     | Not started |     |
+| TASK-013 | E2E: SDK round-trip   | Not started |     |
+| TASK-014 | E2E: Full pipeline    | Not started |     |

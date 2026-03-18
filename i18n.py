@@ -18,7 +18,6 @@ Only "en" and "zh" are supported. Unrecognized values fall back to "en".
 """
 
 import os
-from typing import Optional
 
 _locale: str = "en"
 

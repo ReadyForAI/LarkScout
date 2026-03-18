@@ -1,23 +1,25 @@
+import asyncio
+import hashlib
+import json
+import logging
 import os
 import re
-import json
-import time
-import asyncio
 import secrets
-import hashlib
-import logging
+import time
 from collections import OrderedDict
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Literal, Tuple
+from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import Path
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 import numpy as np
+from fastapi import FastAPI, HTTPException
 from PIL import Image
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from pydantic import BaseModel, Field
 
 from i18n import t
 
@@ -37,9 +39,15 @@ SESSION_MAXSIZE = 200
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# ---- Document library (shared with docreader) ----
+_DEFAULT_DOCS_DIR = Path(os.environ.get(
+    "DOCS_DIR",
+    os.path.expanduser("~/.openclaw/subworkspace/shared/docs"),
+))
+
 # ---- Readability.js local file ----
 READABILITY_JS_PATH = Path(os.getenv("READABILITY_JS_PATH", str(BASE_DIR / "readability.js")))
-READABILITY_JS: Optional[str] = None
+READABILITY_JS: str | None = None
 READABILITY_AVAILABLE = False
 
 # ---- YOLO (onnxruntime) ----
@@ -68,11 +76,11 @@ class Session:
     context: BrowserContext
     page: Page
     lang: str
-    last_distill: Optional[Dict[str, Any]] = None
-    action_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
+    last_distill: dict[str, Any] | None = None
+    action_map: dict[str, dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)              # concurrency lock
     # WebMCP: cached tool list
-    webmcp_tools: Optional[List[Dict[str, Any]]] = None
+    webmcp_tools: list[dict[str, Any]] | None = None
     webmcp_available: bool = False
 
 
@@ -82,7 +90,7 @@ class Session:
 # ============================================================
 class SessionManager:
     def __init__(self, ttl: int = SESSION_TTL_SECONDS, maxsize: int = SESSION_MAXSIZE):
-        self._sessions: OrderedDict[str, Tuple[float, Session]] = OrderedDict()
+        self._sessions: OrderedDict[str, tuple[float, Session]] = OrderedDict()
         self._ttl = ttl
         self._maxsize = maxsize
         self._lock = asyncio.Lock()
@@ -90,7 +98,7 @@ class SessionManager:
     def __len__(self):
         return len(self._sessions)
 
-    async def put(self, sid: str, sess: Session):
+    async def put(self, sid: str, sess: Session) -> None:
         async with self._lock:
             # evict oldest
             if len(self._sessions) >= self._maxsize:
@@ -99,7 +107,7 @@ class SessionManager:
                 await self._close_session(old_sess)
             self._sessions[sid] = (time.time(), sess)
 
-    async def get(self, sid: str) -> Optional[Session]:
+    async def get(self, sid: str) -> Session | None:
         async with self._lock:
             item = self._sessions.get(sid)
             if not item:
@@ -115,14 +123,14 @@ class SessionManager:
             self._sessions.move_to_end(sid)
             return sess
 
-    async def remove(self, sid: str):
+    async def remove(self, sid: str) -> None:
         async with self._lock:
             item = self._sessions.pop(sid, None)
             if item:
                 _, sess = item
                 await self._close_session(sess)
 
-    async def cleanup(self):
+    async def cleanup(self) -> None:
         """Periodic cleanup of expired sessions."""
         async with self._lock:
             now = time.time()
@@ -132,7 +140,7 @@ class SessionManager:
                 logger.info("session expired (cleanup): %s", sid)
                 await self._close_session(sess)
 
-    async def close_all(self):
+    async def close_all(self) -> None:
         async with self._lock:
             for sid, (_, sess) in self._sessions.items():
                 await self._close_session(sess)
@@ -156,8 +164,8 @@ class NewSessionRequest(BaseModel):
     lang: str = DEFAULT_LANG
     user_agent: str = DEFAULT_UA
     block_resources: bool = True
-    viewport: Dict[str, int] = Field(default_factory=lambda: {"width": 900, "height": 700})
-    storage_state: Optional[Dict[str, Any]] = None
+    viewport: dict[str, int] = Field(default_factory=lambda: {"width": 900, "height": 700})
+    storage_state: dict[str, Any] | None = None
 
 
 class NewSessionResponse(BaseModel):
@@ -174,7 +182,7 @@ class GotoRequest(BaseModel):
 class GotoResponse(BaseModel):
     session_id: str
     url: str
-    title: Optional[str] = None
+    title: str | None = None
 
 
 class DistillRequest(BaseModel):
@@ -201,7 +209,7 @@ class DistillRequest(BaseModel):
     max_table_rows: int = Field(default=80, ge=10, le=500)
     max_tables: int = Field(default=20, ge=1, le=50)
     # Optional wait_for_selector before distill (SPA-friendly)
-    wait_for_selector: Optional[str] = None
+    wait_for_selector: str | None = None
     wait_for_timeout_ms: int = Field(default=5000, ge=500, le=30000)
 
 
@@ -209,49 +217,49 @@ class ActionDescriptor(BaseModel):
     aid: str
     role: str
     name: str
-    strategy: Dict[str, Any]
-    actions: List[str]
+    strategy: dict[str, Any]
+    actions: list[str]
     confidence: float = 0.8
     source: str = "dom"
 
 
 class Section(BaseModel):
     sid: str
-    h: Optional[str] = None
+    h: str | None = None
     t: str
     type: Literal["text", "table"] = "text"
-    table_meta: Optional[Dict[str, Any]] = None
+    table_meta: dict[str, Any] | None = None
 
 
 class DistillResponse(BaseModel):
     url: str
-    title: Optional[str] = None
+    title: str | None = None
     content_hash: str
-    sections: List[Section]
-    actions: List[ActionDescriptor] = []
-    meta: Dict[str, Any] = {}
+    sections: list[Section]
+    actions: list[ActionDescriptor] = []
+    meta: dict[str, Any] = {}
 
 
 class ReadSectionsRequest(BaseModel):
     session_id: str
-    section_ids: List[str] = Field(min_length=1)
+    section_ids: list[str] = Field(min_length=1)
     max_section_chars: int = Field(default=1800, ge=200, le=8000)
 
 
 class ReadSectionsResponse(BaseModel):
     url: str
-    title: Optional[str]
+    title: str | None
     content_hash: str
-    picked_sections: List[Section]
-    available_section_ids: List[str]
+    picked_sections: list[Section]
+    available_section_ids: list[str]
 
 
 class ActRequest(BaseModel):
     session_id: str
     aid: str
     action: Literal["click", "type", "select", "scroll_into_view", "invoke"]
-    text: Optional[str] = None
-    value: Optional[str] = None
+    text: str | None = None
+    value: str | None = None
     wait_until: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
     timeout_ms: int = 25000
     return_top_sections: bool = True
@@ -261,10 +269,10 @@ class ActRequest(BaseModel):
 class ActResponse(BaseModel):
     url_before: str
     url_after: str
-    title: Optional[str]
-    changed: Dict[str, Any]
-    top_sections: List[Section] = []
-    actions_sample: List[ActionDescriptor] = []
+    title: str | None
+    changed: dict[str, Any]
+    top_sections: list[Section] = []
+    actions_sample: list[ActionDescriptor] = []
 
 
 # scroll / back / forward request models
@@ -283,7 +291,7 @@ class NavigateRequest(BaseModel):
 
 class NavigateResponse(BaseModel):
     url: str
-    title: Optional[str] = None
+    title: str | None = None
 
 
 # close also uses Pydantic Model
@@ -306,9 +314,9 @@ class WebMCPDiscoverRequest(BaseModel):
 class WebMCPToolDescriptor(BaseModel):
     name: str
     description: str
-    input_schema: Optional[Dict[str, Any]] = None
+    input_schema: dict[str, Any] | None = None
     read_only: bool = False
-    auto_submit: Optional[bool] = None
+    auto_submit: bool | None = None
     source: str = "webmcp"  # "webmcp_imperative" | "webmcp_declarative"
 
 
@@ -316,14 +324,14 @@ class WebMCPDiscoverResponse(BaseModel):
     session_id: str
     url: str
     webmcp_available: bool
-    tools: List[WebMCPToolDescriptor] = []
-    errors: List[str] = []
+    tools: list[WebMCPToolDescriptor] = []
+    errors: list[str] = []
 
 
 class WebMCPInvokeRequest(BaseModel):
     session_id: str
     tool_name: str
-    params: Dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
     timeout_ms: int = 30000
 
 
@@ -331,16 +339,35 @@ class WebMCPInvokeResponse(BaseModel):
     session_id: str
     tool_name: str
     success: bool
-    result: Optional[Any] = None
-    error: Optional[str] = None
+    result: Any | None = None
+    error: str | None = None
     url_before: str
     url_after: str
+
+
+class CaptureRequest(BaseModel):
+    """Request body for POST /capture (one-shot web capture)."""
+
+    url: str
+    tags: list[str] = []
+    extract_tables: bool = True
+    lang: str = DEFAULT_LANG
+    timeout_ms: int = 25000
+
+
+class CaptureResponse(BaseModel):
+    """Response from POST /capture."""
+
+    doc_id: str
+    digest: str
+    section_count: int
+    table_count: int
 
 
 # ============================================================
 # Utilities
 # ============================================================
-def _aid(payload: Dict[str, Any]) -> str:
+def _aid(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return "a" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
@@ -377,7 +404,7 @@ def _normalize(s: str) -> str:
     return s.strip()
 
 
-def _make_stable_sid(heading: Optional[str], text: str) -> str:
+def _make_stable_sid(heading: str | None, text: str) -> str:
     h = (heading or "").strip().lower()
     t = re.sub(r"\s+", " ", (text or "").strip()).lower()
     anchor = t[:400]
@@ -385,7 +412,7 @@ def _make_stable_sid(heading: Optional[str], text: str) -> str:
     return "s_" + hashlib.sha1(raw).hexdigest()[:10]
 
 
-def _sections_diff(old_sections: List[Dict[str, Any]], new_sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _sections_diff(old_sections: list[dict[str, Any]], new_sections: list[dict[str, Any]]) -> dict[str, Any]:
     old_map = {s["sid"]: _hash_text(s["t"]) for s in old_sections}
     new_map = {s["sid"]: _hash_text(s["t"]) for s in new_sections}
 
@@ -399,7 +426,7 @@ def _sections_diff(old_sections: List[Dict[str, Any]], new_sections: List[Dict[s
     return {"added_sids": added, "removed_sids": removed, "changed_sids": changed}
 
 
-def _actions_diff(old_actions: List[Dict[str, Any]], new_actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _actions_diff(old_actions: list[dict[str, Any]], new_actions: list[dict[str, Any]]) -> dict[str, Any]:
     old_set = {a["aid"] for a in old_actions}   # ✅ IMPROVED
     new_set = {a["aid"] for a in new_actions}
     return {
@@ -408,7 +435,7 @@ def _actions_diff(old_actions: List[Dict[str, Any]], new_actions: List[Dict[str,
     }
 
 
-def _pick_action_methods(role: str) -> List[str]:
+def _pick_action_methods(role: str) -> list[str]:
     acts = ["scroll_into_view"]
     if role in ("button", "link", "checkbox", "radio"):
         acts.insert(0, "click")
@@ -419,7 +446,7 @@ def _pick_action_methods(role: str) -> List[str]:
     return acts
 
 
-def _dedup_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _dedup_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     out = []
     for a in actions:
@@ -431,11 +458,11 @@ def _dedup_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _rank_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _rank_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     src_w = {"dom": 0.03, "a11y": 0.02, "vision": 0.01}
     role_w = {"textbox": 0.03, "button": 0.02, "combobox": 0.02, "link": 0.015, "checkbox": 0.01, "radio": 0.01}
 
-    def score(a):
+    def score(a) -> float:
         c = float(a.get("confidence", 0.7))
         c += src_w.get(a.get("source", "dom"), 0.0)
         c += role_w.get(a.get("role", ""), 0.0)
@@ -448,7 +475,7 @@ def _rank_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(actions, key=score, reverse=True)
 
 
-def _trim_action_fields(a: Dict[str, Any], name_max: int, selector_max: int) -> Dict[str, Any]:
+def _trim_action_fields(a: dict[str, Any], name_max: int, selector_max: int) -> dict[str, Any]:
     a = dict(a)
     a["name"] = _smart_truncate(a.get("name") or "", name_max)   # word-boundary truncation
 
@@ -461,14 +488,14 @@ def _trim_action_fields(a: Dict[str, Any], name_max: int, selector_max: int) -> 
     return a
 
 
-def _estimate_meta_chars(meta: Dict[str, Any]) -> int:
+def _estimate_meta_chars(meta: dict[str, Any]) -> int:
     try:
         return len(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
     except Exception:
         return 200
 
 
-def _estimate_action_chars(a: Dict[str, Any]) -> int:
+def _estimate_action_chars(a: dict[str, Any]) -> int:
     role = a.get("role") or ""
     name = a.get("name") or ""
     strat = a.get("strategy") or {}
@@ -477,14 +504,14 @@ def _estimate_action_chars(a: Dict[str, Any]) -> int:
 
 
 def _apply_total_output_budget(
-    sections: List[Dict[str, Any]],
-    actions: List[Dict[str, Any]],
-    meta: Dict[str, Any],
+    sections: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    meta: dict[str, Any],
     total_budget: int,
     min_actions_to_keep: int,
     name_max: int,
     selector_max: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     actions = [_trim_action_fields(a, name_max=name_max, selector_max=selector_max) for a in actions]
 
     meta_chars = _estimate_meta_chars(meta)
@@ -512,7 +539,7 @@ def _apply_total_output_budget(
         return sections, [], meta
 
     ranked = _rank_actions(_dedup_actions(actions))
-    packed: List[Dict[str, Any]] = []
+    packed: list[dict[str, Any]] = []
     used = 0
 
     for a in ranked:
@@ -559,7 +586,7 @@ async def _setup_routing(context: BrowserContext, block_resources: bool):
     if not block_resources:
         return
 
-    async def route_handler(route):
+    async def route_handler(route) -> None:
         req = route.request
         if req.resource_type in _BLOCKED_RESOURCE_TYPES:
             return await route.abort()
@@ -1192,7 +1219,7 @@ def _letterbox(img: Image.Image, new_size: int = 640, color=(114, 114, 114)):
     return arr, r, (pad_w, pad_h)
 
 
-def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
+def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> list[int]:
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = (x2 - x1 + 1) * (y2 - y1 + 1)
     order = scores.argsort()[::-1]
@@ -1238,7 +1265,7 @@ def _decode_yolov8_like(out: np.ndarray, conf_thresh: float):
 
 def yolo_detect_ui_components(
     image_bytes: bytes, conf_thresh: float, iou_thresh: float, max_boxes: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if not YOLO_ENABLED or YOLO_SESSION is None:
         return []
 
@@ -1275,18 +1302,18 @@ def yolo_detect_ui_components(
 # Distill: blocks -> stable sections
 # ============================================================
 def _blocks_to_sections_stable(
-    blocks: List[Dict[str, str]],
+    blocks: list[dict[str, str]],
     max_sections: int,
     max_section_chars: int,
     total_budget: int,
-    tables: Optional[List[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
+    tables: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     # (heading, text, type, table_meta)
-    sections_raw: List[Tuple[Optional[str], str, str, Optional[Dict]]] = []
-    cur_h: Optional[str] = None
-    cur: List[str] = []
+    sections_raw: list[tuple[str | None, str, str, dict | None]] = []
+    cur_h: str | None = None
+    cur: list[str] = []
 
-    def flush():
+    def flush() -> None:
         nonlocal cur_h, cur
         if not cur:
             return
@@ -1328,26 +1355,26 @@ def _blocks_to_sections_stable(
             if not tbl_heading:
                 first_line = tbl_text.split("\n")[0].replace("|", " ").strip()
                 if first_line:
-                    tbl_heading = f"{t("table_prefix")} {_smart_truncate(first_line, 60)}"
+                    tbl_heading = f"{t('table_prefix')} {_smart_truncate(first_line, 60)}"
                 else:
                     tbl_heading = t("table_prefix")
             else:
-                tbl_heading = f"{t("table_prefix")} {tbl_heading}"
+                tbl_heading = f"{t('table_prefix')} {tbl_heading}"
             tbl_text_clipped = _clip(tbl_text, max_section_chars)
             sections_raw.append((tbl_heading, tbl_text_clipped, "table", tbl_meta))
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     used = 0
     seen = set()
 
-    for (h, t, sec_type, tbl_meta) in sections_raw[:max_sections]:
+    for (h, body, sec_type, tbl_meta) in sections_raw[:max_sections]:
         if used >= total_budget:
             break
         remain = total_budget - used
-        if len(t) > remain:
-            t = _clip(t, max(220, remain))
+        if len(body) > remain:
+            body = _clip(body, max(220, remain))
 
-        sid = _make_stable_sid(h, t)
+        sid = _make_stable_sid(h, body)
         if sid in seen:
             sid = sid + "_" + str(len(seen))
         seen.add(sid)
@@ -1355,15 +1382,15 @@ def _blocks_to_sections_stable(
         # Auto-use first sentence as heading when empty
         effective_h = h
         if not effective_h:
-            first_sentence = re.split(r'[.!?。！？\n]', t)[0].strip()
+            first_sentence = re.split(r'[.!?。！？\n]', body)[0].strip()
             if first_sentence and len(first_sentence) > 10:
                 effective_h = _smart_truncate(first_sentence, 80)
 
-        section: Dict[str, Any] = {"sid": sid, "h": effective_h, "t": t, "type": sec_type}
+        section: dict[str, Any] = {"sid": sid, "h": effective_h, "t": body, "type": sec_type}
         if sec_type == "table" and tbl_meta:
             section["table_meta"] = tbl_meta
         out.append(section)
-        used += len(t)
+        used += len(body)
 
     return out
 
@@ -1371,7 +1398,7 @@ def _blocks_to_sections_stable(
 # ============================================================
 # Actions: DOM + A11y + Vision
 # ============================================================
-async def _extract_actions_dom(page: Page, max_actions: int) -> List[Dict[str, Any]]:
+async def _extract_actions_dom(page: Page, max_actions: int) -> list[dict[str, Any]]:
     raw = await page.evaluate(ACTIONS_DOM_JS, max_actions)
     actions = []
     for ra in raw:
@@ -1393,15 +1420,15 @@ async def _extract_actions_dom(page: Page, max_actions: int) -> List[Dict[str, A
     return actions
 
 
-async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict[str, Any]], str]:
+async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict[str, Any]], str]:
     # 1) Preferred: accessibility.snapshot
     try:
         acc = getattr(page, "accessibility", None)
         if acc is not None and hasattr(acc, "snapshot"):
             snap = await acc.snapshot(interesting_only=False)
-            out: List[Tuple[str, str]] = []
+            out: list[tuple[str, str]] = []
 
-            def walk(node):
+            def walk(node) -> None:
                 if not node:
                     return
                 role = (node.get("role") or "").lower()
@@ -1414,7 +1441,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
             walk(snap)
 
             seen = set()
-            uniq: List[Tuple[str, str]] = []
+            uniq: list[tuple[str, str]] = []
             for r, n in out:
                 if (r, n) not in seen:
                     seen.add((r, n))
@@ -1422,7 +1449,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
                     if len(uniq) >= max_actions:
                         break
 
-            actions: List[Dict[str, Any]] = []
+            actions: list[dict[str, Any]] = []
             for role, name in uniq:
                 strategy = {"type": "role", "role": role, "name": name}
                 aid = _aid({"role": role, "name": name, "strategy": strategy})
@@ -1441,7 +1468,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
         return [], "unavailable"
 
     roles = {"button", "link", "textbox", "combobox", "checkbox", "radio"}
-    out2: List[Tuple[str, str]] = []
+    out2: list[tuple[str, str]] = []
     line_re = re.compile(r'^\s*-\s*([A-Za-z0-9_-]+)\s+"(.*)"\s*$', re.M)
 
     for mm in line_re.finditer(snap_text or ""):
@@ -1453,7 +1480,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
             break
 
     seen = set()
-    uniq2: List[Tuple[str, str]] = []
+    uniq2: list[tuple[str, str]] = []
     for r, n in out2:
         if (r, n) not in seen:
             seen.add((r, n))
@@ -1461,7 +1488,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
             if len(uniq2) >= max_actions:
                 break
 
-    actions2: List[Dict[str, Any]] = []
+    actions2: list[dict[str, Any]] = []
     for role, name in uniq2:
         strategy = {"type": "role", "role": role, "name": name}
         aid = _aid({"role": role, "name": name, "strategy": strategy})
@@ -1472,7 +1499,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
     return actions2, "aria_snapshot"
 
 
-async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[str, Any]]:
+async def _extract_actions_vision(page: Page, req: DistillRequest) -> list[dict[str, Any]]:
     if not YOLO_ENABLED or not req.enable_vision_fallback:
         return []
 
@@ -1490,7 +1517,7 @@ async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[
     if not dets:
         return []
 
-    actions: List[Dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
     for d in dets:
         x1, y1, x2, y2 = d["bbox"]
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -1527,7 +1554,7 @@ async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[
 # ============================================================
 # ✅ WebMCP: discover + invoke
 # ============================================================
-async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[str, Any]:
+async def _discover_webmcp_tools(session: Session, force: bool = False) -> dict[str, Any]:
     """Discover WebMCP tools on page (imperative + declarative), cached per session."""
     if not force and session.webmcp_tools is not None:
         return {"available": session.webmcp_available, "tools": session.webmcp_tools, "errors": []}
@@ -1541,20 +1568,20 @@ async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[
         return {"available": False, "tools": [], "errors": [str(e)]}
 
     available = raw.get("available", False)
-    all_tools: List[Dict[str, Any]] = []
+    all_tools: list[dict[str, Any]] = []
 
-    for t in raw.get("imperative_tools", []):
+    for tool in raw.get("imperative_tools", []):
         all_tools.append({
-            "name": t.get("name", ""), "description": t.get("description", ""),
-            "input_schema": t.get("inputSchema"), "read_only": t.get("readOnly", False),
+            "name": tool.get("name", ""), "description": tool.get("description", ""),
+            "input_schema": tool.get("inputSchema"), "read_only": tool.get("readOnly", False),
             "source": "webmcp_imperative",
         })
 
-    for t in raw.get("declarative_tools", []):
+    for tool in raw.get("declarative_tools", []):
         all_tools.append({
-            "name": t.get("name", ""), "description": t.get("description", ""),
-            "input_schema": t.get("inputSchema"), "read_only": t.get("readOnly", False),
-            "auto_submit": t.get("autoSubmit", False), "source": "webmcp_declarative",
+            "name": tool.get("name", ""), "description": tool.get("description", ""),
+            "input_schema": tool.get("inputSchema"), "read_only": tool.get("readOnly", False),
+            "auto_submit": tool.get("autoSubmit", False), "source": "webmcp_declarative",
         })
         if not available:
             available = True
@@ -1565,8 +1592,8 @@ async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[
 
 
 async def _invoke_webmcp_tool(
-    session: Session, tool_name: str, params: Dict[str, Any], timeout_ms: int = 30000
-) -> Dict[str, Any]:
+    session: Session, tool_name: str, params: dict[str, Any], timeout_ms: int = 30000
+) -> dict[str, Any]:
     """Invoke a WebMCP tool (auto-detect imperative vs declarative)."""
     if session.webmcp_tools is None:
         await _discover_webmcp_tools(session)
@@ -1600,7 +1627,7 @@ async def _invoke_webmcp_tool(
 # ============================================================
 # Distill core
 # ============================================================
-async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
+async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
     page = session.page
     url = page.url
     title = None
@@ -1616,9 +1643,9 @@ async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
     if mode == "auto":
         mode = "readability" if READABILITY_AVAILABLE else "simple"
 
-    blocks: List[Dict[str, str]] = []
+    blocks: list[dict[str, str]] = []
     readability_meta = {}
-    extracted_tables: List[Dict[str, Any]] = []
+    extracted_tables: list[dict[str, Any]] = []
 
     if mode == "readability":
         if not READABILITY_AVAILABLE or not READABILITY_JS:
@@ -1674,9 +1701,9 @@ async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
     a11y_attempted = False
     a11y_mode = None
     a11y_error = None
-    webmcp_result: Dict[str, Any] = {"available": False, "tools": [], "errors": []}
+    webmcp_result: dict[str, Any] = {"available": False, "tools": [], "errors": []}
 
-    actions: List[Dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
     if req.include_actions:
         # WebMCP: prefer structured tools (highest confidence)
         webmcp_result = await _discover_webmcp_tools(session)
@@ -1770,7 +1797,7 @@ async def _ensure_session(session_id: str) -> Session:
 # ============================================================
 # Action executor
 # ============================================================
-async def _locate(page: Page, strategy: Dict[str, Any]):
+async def _locate(page: Page, strategy: dict[str, Any]):
     stype = strategy.get("type")
     if stype == "role":
         return page.get_by_role(strategy["role"], name=strategy.get("name") or "").first
@@ -1794,11 +1821,157 @@ async def _maybe_switch_to_new_page(sess: Session):
 # lifespan replaces deprecated on_event
 # ============================================================
 _pw = None
-_browser: Optional[Browser] = None
+_browser: Browser | None = None
+
+
+# ============================================================
+# Document library helpers (shared with docreader)
+# ============================================================
+
+def _get_docs_dir() -> Path:
+    """Return the document library root, creating it if necessary."""
+    d = _DEFAULT_DOCS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _next_web_doc_id(docs_dir: Path) -> str:
+    """Allocate the next WEB-xxx doc ID using a file-based counter."""
+    counter_path = docs_dir / ".web_counter"
+    counter = 1
+    if counter_path.exists():
+        try:
+            counter = int(counter_path.read_text().strip())
+        except ValueError:
+            counter = 1
+    doc_id = f"WEB-{counter:03d}"
+    counter_path.write_text(str(counter + 1))
+    return doc_id
+
+
+def _build_web_digest(title: str | None, sections: list[dict[str, Any]], max_chars: int = 600) -> str:
+    """Build a short digest from page title and section headings/snippets."""
+    parts: list[str] = []
+    if title:
+        parts.append(f"# {title}")
+    for sec in sections:
+        if sec.get("type") == "table":
+            continue
+        h = sec.get("h") or ""
+        snippet = (sec.get("t") or "")[:120]
+        parts.append(f"## {h}\n{snippet}" if h else snippet)
+        if sum(len(p) for p in parts) >= max_chars:
+            break
+    return "\n\n".join(parts)[:max_chars]
+
+
+def _persist_web_capture(
+    doc_id: str,
+    url: str,
+    title: str | None,
+    sections: list[dict[str, Any]],
+    digest: str,
+    tags: list[str],
+    content_hash: str,
+    docs_dir: Path,
+) -> None:
+    """Write a web capture to the document library and update doc-index.json."""
+    doc_dir = docs_dir / doc_id
+    sections_dir = doc_dir / "sections"
+    tables_dir = doc_dir / "tables"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    sections_dir.mkdir(exist_ok=True)
+
+    now_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    text_sections = [s for s in sections if s.get("type") != "table"]
+    table_sections = [s for s in sections if s.get("type") == "table"]
+
+    # digest.md
+    (doc_dir / "digest.md").write_text(
+        f"# {doc_id}: {title or url}\n\n{digest}\n", encoding="utf-8"
+    )
+
+    # sections/
+    for i, sec in enumerate(text_sections, 1):
+        sid = sec.get("sid", f"s_{i:03d}")
+        h = sec.get("h") or ""
+        body = sec.get("t", "")
+        safe_h = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", h).strip().replace(" ", "-")[:40] or "section"
+        fname = f"{i:02d}-{sid}-{safe_h}.md"
+        header = f"## {h}\n\n" if h else ""
+        (sections_dir / fname).write_text(f"{header}{body}\n", encoding="utf-8")
+
+    # tables/
+    if table_sections:
+        tables_dir.mkdir(exist_ok=True)
+        for i, tbl in enumerate(table_sections, 1):
+            h = tbl.get("h") or f"Table {i}"
+            body = tbl.get("t", "")
+            meta = tbl.get("table_meta") or {}
+            meta_comment = f"\n<!-- table_meta: {json.dumps(meta)} -->\n" if meta else ""
+            (tables_dir / f"table-{i:02d}.md").write_text(
+                f"# {h}\n\n{body}\n{meta_comment}", encoding="utf-8"
+            )
+
+    # manifest.json
+    manifest: dict[str, Any] = {
+        "doc_id": doc_id,
+        "filename": title or url,
+        "file_type": "web_capture",
+        "source": "web_capture",
+        "paths": {
+            "digest": "digest.md",
+            "sections_dir": "sections/",
+            **({"tables_dir": "tables/"} if table_sections else {}),
+        },
+        "sections": [
+            {"sid": s.get("sid"), "h": s.get("h"), "char_count": len(s.get("t", "")), "type": s.get("type", "text")}
+            for s in sections
+        ],
+        "provenance": {
+            "source": "web_capture",
+            "source_url": url,
+            "capture_time": now_str,
+            "content_hash": content_hash,
+        },
+    }
+    (doc_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # doc-index.json (v2, shared with docreader)
+    index_path = docs_dir / "doc-index.json"
+    if index_path.exists():
+        try:
+            with open(index_path, encoding="utf-8") as f:
+                index: dict[str, Any] = json.load(f)
+        except Exception:
+            index = {"version": 2, "documents": []}
+    else:
+        index = {"version": 2, "documents": []}
+
+    index["version"] = 2
+    index["documents"] = [d for d in index["documents"] if d.get("id") != doc_id]
+    index["documents"].append({
+        "id": doc_id,
+        "filename": title or url,
+        "file_type": "web_capture",
+        "source": "web_capture",
+        "source_url": url,
+        "sections": len(sections),
+        "tables": len(table_sections),
+        "digest": digest[:200],
+        "digest_path": f"docs/{doc_id}/digest.md",
+        "tags": tags,
+        "created_at": now_str,
+        "content_hash": content_hash,
+    })
+    index["last_updated"] = now_str
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _pw, _browser
     _load_readability_js()
     _init_yolo()
@@ -1819,7 +1992,7 @@ async def lifespan(app: FastAPI):
     )
 
     # background cleanup task
-    async def cleanup_loop():
+    async def cleanup_loop() -> None:
         while True:
             await asyncio.sleep(60)
             try:
@@ -1847,7 +2020,7 @@ app = FastAPI(title="Agent Browser Service (Playwright + WebMCP)", version="0.6.
 # Routes
 # ============================================================
 @app.get("/health")
-async def health():
+async def health() -> dict:
     return {
         "ok": True,
         "sessions": len(sessions),
@@ -1861,7 +2034,7 @@ async def health():
 
 
 @app.post("/session/new", response_model=NewSessionResponse)
-async def new_session(req: NewSessionRequest):
+async def new_session(req: NewSessionRequest) -> NewSessionResponse:
     if not _browser:
         raise HTTPException(500, "browser not ready")
 
@@ -1883,7 +2056,7 @@ async def new_session(req: NewSessionRequest):
 
 
 @app.post("/session/goto", response_model=GotoResponse)
-async def goto(req: GotoRequest):
+async def goto(req: GotoRequest) -> GotoResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         try:
@@ -1902,7 +2075,7 @@ async def goto(req: GotoRequest):
 
 
 @app.post("/session/distill", response_model=DistillResponse)
-async def distill(req: DistillRequest):
+async def distill(req: DistillRequest) -> DistillResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         old = sess.last_distill if req.include_diff else None
@@ -1931,7 +2104,7 @@ async def distill(req: DistillRequest):
 
 
 @app.post("/session/read_sections", response_model=ReadSectionsResponse)
-async def read_sections(req: ReadSectionsRequest):
+async def read_sections(req: ReadSectionsRequest) -> ReadSectionsResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         if not sess.last_distill:
@@ -1956,7 +2129,7 @@ async def read_sections(req: ReadSectionsRequest):
 
 
 @app.post("/session/act", response_model=ActResponse)
-async def act(req: ActRequest):
+async def act(req: ActRequest) -> ActResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         if not sess.last_distill:
@@ -2062,7 +2235,7 @@ async def act(req: ActRequest):
 
 # /session/scroll endpoint
 @app.post("/session/scroll", response_model=NavigateResponse)
-async def scroll(req: ScrollRequest):
+async def scroll(req: ScrollRequest) -> NavigateResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         delta = req.pixels if req.direction == "down" else -req.pixels
@@ -2081,7 +2254,7 @@ async def scroll(req: ScrollRequest):
 
 # /session/navigate endpoint (back / forward)
 @app.post("/session/navigate", response_model=NavigateResponse)
-async def navigate(req: NavigateRequest):
+async def navigate(req: NavigateRequest) -> NavigateResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         try:
@@ -2102,7 +2275,7 @@ async def navigate(req: NavigateRequest):
 
 # WebMCP: discover page-exposed tools
 @app.post("/session/webmcp_discover", response_model=WebMCPDiscoverResponse)
-async def webmcp_discover(req: WebMCPDiscoverRequest):
+async def webmcp_discover(req: WebMCPDiscoverRequest) -> WebMCPDiscoverResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         result = await _discover_webmcp_tools(sess, force=req.force_refresh)
@@ -2127,7 +2300,7 @@ async def webmcp_discover(req: WebMCPDiscoverRequest):
 
 # WebMCP: invoke tool directly (bypass DOM)
 @app.post("/session/webmcp_invoke", response_model=WebMCPInvokeResponse)
-async def webmcp_invoke(req: WebMCPInvokeRequest):
+async def webmcp_invoke(req: WebMCPInvokeRequest) -> WebMCPInvokeResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         url_before = sess.page.url
@@ -2146,7 +2319,7 @@ async def webmcp_invoke(req: WebMCPInvokeRequest):
 
 
 @app.post("/session/export_storage_state")
-async def export_storage_state(req: ExportStorageRequest):
+async def export_storage_state(req: ExportStorageRequest) -> dict:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         state = await sess.context.storage_state()
@@ -2155,6 +2328,71 @@ async def export_storage_state(req: ExportStorageRequest):
 
 # Pydantic model instead of Dict[str, Any]
 @app.post("/session/close")
-async def close_session(req: CloseSessionRequest):
+async def close_session(req: CloseSessionRequest) -> dict:
     await sessions.remove(req.session_id)
     return {"ok": True}
+
+
+@app.post("/capture", response_model=CaptureResponse)
+async def capture(req: CaptureRequest) -> CaptureResponse:
+    """One-shot web capture: navigate to URL, distill, persist to document library, return doc_id.
+
+    Internally runs: session/new → goto → distill → persist → session/close.
+    The session is always closed, even on error.
+    """
+    if not _browser:
+        raise HTTPException(500, "browser not ready")
+
+    context = await _browser.new_context(
+        user_agent=DEFAULT_UA,
+        locale=req.lang,
+        viewport={"width": 900, "height": 700},
+    )
+    await _setup_routing(context, block_resources=True)
+    page = await context.new_page()
+    sid = "s_" + secrets.token_hex(8)
+    sess = Session(context=context, page=page, lang=req.lang)
+    await sessions.put(sid, sess)
+
+    try:
+        try:
+            await sess.page.goto(req.url, wait_until="domcontentloaded", timeout=req.timeout_ms)
+        except Exception as e:
+            raise HTTPException(502, f"capture goto failed: {e}")
+
+        sess.webmcp_tools = None
+        sess.webmcp_available = False
+
+        distill_req = DistillRequest(
+            session_id=sid,
+            include_actions=False,
+            include_diff=False,
+            extract_tables=req.extract_tables,
+        )
+        try:
+            out = await _distill(sess, distill_req)
+        except Exception as e:
+            raise HTTPException(500, f"capture distill failed: {e}")
+
+        url = out["url"]
+        title = out.get("title")
+        sections: list[dict[str, Any]] = out["sections"]
+        content_hash: str = out["content_hash"]
+        table_sections = [s for s in sections if s.get("type") == "table"]
+
+        digest = _build_web_digest(title, sections)
+        docs_dir = _get_docs_dir()
+        doc_id = _next_web_doc_id(docs_dir)
+        _persist_web_capture(
+            doc_id=doc_id, url=url, title=title, sections=sections,
+            digest=digest, tags=req.tags, content_hash=content_hash, docs_dir=docs_dir,
+        )
+
+        return CaptureResponse(
+            doc_id=doc_id,
+            digest=digest,
+            section_count=len(sections),
+            table_count=len(table_sections),
+        )
+    finally:
+        await sessions.remove(sid)
