@@ -181,3 +181,4 @@ out/
 site/
 _site/
 .docusaurus/
+echo "docs/larkscout_opensource_design.md" >> .gitignore
