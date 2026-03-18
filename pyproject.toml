@@ -29,7 +29,7 @@ Repository = "https://github.com/ReadyForAI/LarkScout"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["larkscout*", "services*"]
+include = ["larkscout*", "services*", "providers*"]
 
 [tool.ruff]
 target-version = "py311"

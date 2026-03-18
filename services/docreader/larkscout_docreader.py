@@ -68,69 +68,22 @@ class ParsedDocument:
 
 
 # ═══════════════════════════════════════════
-# Gemini API wrapper
+# LLM provider wrapper
 # ═══════════════════════════════════════════
-
-_client = None
-_model_name = "gemini-2.5-flash"
-
-
-def _init_gemini():
-    """Lazy-init Gemini client."""
-    global _client
-    if _client is not None:
-        return
-
-    try:
-        from google import genai
-    except ImportError:
-        raise RuntimeError(t("gemini_not_installed"))
-
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError(t("gemini_key_missing"))
-
-    _client = genai.Client(api_key=api_key)
 
 
 def gemini_ocr(image_bytes: bytes, page_num: int) -> str:
-    """OCR a single page image via Gemini Vision."""
-    _init_gemini()
-    import PIL.Image
+    """OCR a single page image via the active LLM provider."""
+    from providers import get_provider
 
-    img = PIL.Image.open(io.BytesIO(image_bytes))
-    ocr_prompt = prompt("ocr")
-
-    try:
-        response = _client.models.generate_content(
-            model=_model_name,
-            contents=[ocr_prompt, img],
-        )
-        return response.text.strip()
-    except Exception as e:
-        logger.warning(f"OCR failed for page {page_num}: {e}")
-        return t("ocr_failed", page=page_num)
+    return get_provider().ocr(image_bytes, page_num)
 
 
-def gemini_summarize(text: str, prompt: str, max_retries: int = 2) -> str:
-    """Generate summary via Gemini Flash."""
-    _init_gemini()
-    full_prompt = f"{prompt}\n\n---\n\n{text}"
+def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
+    """Generate summary via the active LLM provider."""
+    from providers import get_provider
 
-    for attempt in range(max_retries + 1):
-        try:
-            response = _client.models.generate_content(
-                model=_model_name,
-                contents=full_prompt,
-            )
-            return response.text.strip()
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Summary retry ({attempt + 1}/{max_retries}): {e}")
-                time.sleep(2 ** attempt)
-            else:
-                logger.error(f"Summary generation failed: {e}")
-                return t("summary_failed")
+    return get_provider().summarize(text, summarize_prompt, max_retries=max_retries)
 
 
 # ═══════════════════════════════════════════
