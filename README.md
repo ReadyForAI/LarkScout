@@ -84,15 +84,50 @@ docker compose up
 
 All endpoints are served on port **9898**.
 
+### Core
+
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Service health + version |
-| `POST` | `/web/capture` | Capture a URL → doc_id |
+| `GET` | `/health` | Aggregated health check for all services |
 | `GET` | `/web/health` | Browser sub-app health |
-| `POST` | `/doc/parse` | Upload and parse a document |
-| `GET` | `/doc/health` | DocReader sub-app health |
+| `GET` | `/doc/health` | DocReader sub-app health (includes `docs_dir`) |
+| `POST` | `/web/capture` | Capture a URL and persist it to the document library |
+| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, XLSX, CSV) |
 
-Full API reference: see `skills/larkscout-browser-SKILL.md` and `skills/larkscout-docreader-SKILL.md`.
+### Browser Session API
+
+Stateful browser sessions for multi-step web automation.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/web/session/new` | Open a new Playwright browser session |
+| `POST` | `/web/session/goto` | Navigate the session to a URL |
+| `POST` | `/web/session/distill` | Extract structured content from the current page |
+| `POST` | `/web/session/read_sections` | Retrieve specific sections by ID from the last distill |
+| `POST` | `/web/session/act` | Click, type, select, or scroll an interactive element |
+| `POST` | `/web/session/scroll` | Scroll the page up or down by a pixel amount |
+| `POST` | `/web/session/navigate` | Go back or forward in the browser history |
+| `POST` | `/web/session/webmcp_discover` | Discover WebMCP tools exposed by the current page |
+| `POST` | `/web/session/webmcp_invoke` | Invoke a WebMCP tool by name |
+| `POST` | `/web/session/export_storage_state` | Export cookies and local storage for session reuse |
+| `POST` | `/web/session/close` | Close the session and release browser resources |
+
+### Document Library API
+
+Access documents stored by `/web/capture` and `/doc/parse`.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/doc/library/search` | Search by keyword, tag, and/or file type |
+| `GET` | `/doc/library/{doc_id}/digest` | Short summary (~200 tokens) |
+| `GET` | `/doc/library/{doc_id}/brief` | Extended summary (~1500 tokens) |
+| `GET` | `/doc/library/{doc_id}/full` | Full document text |
+| `GET` | `/doc/library/{doc_id}/sections` | List all sections with metadata |
+| `GET` | `/doc/library/{doc_id}/section/{sid}` | Full text of a single section |
+| `GET` | `/doc/library/{doc_id}/table/{table_id}` | Markdown table with column statistics |
+| `GET` | `/doc/library/{doc_id}/manifest` | Provenance metadata (source, timestamps, content hash) |
+
+Full API reference: see [`skills/larkscout-browser-SKILL.md`](skills/larkscout-browser-SKILL.md) and [`skills/larkscout-docreader-SKILL.md`](skills/larkscout-docreader-SKILL.md).
 
 ## Configuration
 
