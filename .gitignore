@@ -182,3 +182,5 @@ site/
 _site/
 .docusaurus/
 docs/larkscout_opensource_design.md
+ROADMAP.md
+ROADMAP_internal.md
