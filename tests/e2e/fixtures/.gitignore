@@ -1,0 +1,5 @@
+# Generated fixture files — regenerate with: python generate_fixtures.py
+*.pdf
+*.docx
+*.xlsx
+*.csv
