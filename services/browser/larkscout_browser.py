@@ -1,23 +1,23 @@
+import asyncio
+import hashlib
+import json
+import logging
 import os
 import re
-import json
-import time
-import asyncio
 import secrets
-import hashlib
-import logging
+import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Literal, Tuple
 from io import BytesIO
+from pathlib import Path
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 import numpy as np
+from fastapi import FastAPI, HTTPException
 from PIL import Image
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from pydantic import BaseModel, Field
 
 from i18n import t
 
@@ -39,7 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ---- Readability.js local file ----
 READABILITY_JS_PATH = Path(os.getenv("READABILITY_JS_PATH", str(BASE_DIR / "readability.js")))
-READABILITY_JS: Optional[str] = None
+READABILITY_JS: str | None = None
 READABILITY_AVAILABLE = False
 
 # ---- YOLO (onnxruntime) ----
@@ -68,11 +68,11 @@ class Session:
     context: BrowserContext
     page: Page
     lang: str
-    last_distill: Optional[Dict[str, Any]] = None
-    action_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
+    last_distill: dict[str, Any] | None = None
+    action_map: dict[str, dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)              # concurrency lock
     # WebMCP: cached tool list
-    webmcp_tools: Optional[List[Dict[str, Any]]] = None
+    webmcp_tools: list[dict[str, Any]] | None = None
     webmcp_available: bool = False
 
 
@@ -82,7 +82,7 @@ class Session:
 # ============================================================
 class SessionManager:
     def __init__(self, ttl: int = SESSION_TTL_SECONDS, maxsize: int = SESSION_MAXSIZE):
-        self._sessions: OrderedDict[str, Tuple[float, Session]] = OrderedDict()
+        self._sessions: OrderedDict[str, tuple[float, Session]] = OrderedDict()
         self._ttl = ttl
         self._maxsize = maxsize
         self._lock = asyncio.Lock()
@@ -99,7 +99,7 @@ class SessionManager:
                 await self._close_session(old_sess)
             self._sessions[sid] = (time.time(), sess)
 
-    async def get(self, sid: str) -> Optional[Session]:
+    async def get(self, sid: str) -> Session | None:
         async with self._lock:
             item = self._sessions.get(sid)
             if not item:
@@ -156,8 +156,8 @@ class NewSessionRequest(BaseModel):
     lang: str = DEFAULT_LANG
     user_agent: str = DEFAULT_UA
     block_resources: bool = True
-    viewport: Dict[str, int] = Field(default_factory=lambda: {"width": 900, "height": 700})
-    storage_state: Optional[Dict[str, Any]] = None
+    viewport: dict[str, int] = Field(default_factory=lambda: {"width": 900, "height": 700})
+    storage_state: dict[str, Any] | None = None
 
 
 class NewSessionResponse(BaseModel):
@@ -174,7 +174,7 @@ class GotoRequest(BaseModel):
 class GotoResponse(BaseModel):
     session_id: str
     url: str
-    title: Optional[str] = None
+    title: str | None = None
 
 
 class DistillRequest(BaseModel):
@@ -201,7 +201,7 @@ class DistillRequest(BaseModel):
     max_table_rows: int = Field(default=80, ge=10, le=500)
     max_tables: int = Field(default=20, ge=1, le=50)
     # Optional wait_for_selector before distill (SPA-friendly)
-    wait_for_selector: Optional[str] = None
+    wait_for_selector: str | None = None
     wait_for_timeout_ms: int = Field(default=5000, ge=500, le=30000)
 
 
@@ -209,49 +209,49 @@ class ActionDescriptor(BaseModel):
     aid: str
     role: str
     name: str
-    strategy: Dict[str, Any]
-    actions: List[str]
+    strategy: dict[str, Any]
+    actions: list[str]
     confidence: float = 0.8
     source: str = "dom"
 
 
 class Section(BaseModel):
     sid: str
-    h: Optional[str] = None
+    h: str | None = None
     t: str
     type: Literal["text", "table"] = "text"
-    table_meta: Optional[Dict[str, Any]] = None
+    table_meta: dict[str, Any] | None = None
 
 
 class DistillResponse(BaseModel):
     url: str
-    title: Optional[str] = None
+    title: str | None = None
     content_hash: str
-    sections: List[Section]
-    actions: List[ActionDescriptor] = []
-    meta: Dict[str, Any] = {}
+    sections: list[Section]
+    actions: list[ActionDescriptor] = []
+    meta: dict[str, Any] = {}
 
 
 class ReadSectionsRequest(BaseModel):
     session_id: str
-    section_ids: List[str] = Field(min_length=1)
+    section_ids: list[str] = Field(min_length=1)
     max_section_chars: int = Field(default=1800, ge=200, le=8000)
 
 
 class ReadSectionsResponse(BaseModel):
     url: str
-    title: Optional[str]
+    title: str | None
     content_hash: str
-    picked_sections: List[Section]
-    available_section_ids: List[str]
+    picked_sections: list[Section]
+    available_section_ids: list[str]
 
 
 class ActRequest(BaseModel):
     session_id: str
     aid: str
     action: Literal["click", "type", "select", "scroll_into_view", "invoke"]
-    text: Optional[str] = None
-    value: Optional[str] = None
+    text: str | None = None
+    value: str | None = None
     wait_until: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
     timeout_ms: int = 25000
     return_top_sections: bool = True
@@ -261,10 +261,10 @@ class ActRequest(BaseModel):
 class ActResponse(BaseModel):
     url_before: str
     url_after: str
-    title: Optional[str]
-    changed: Dict[str, Any]
-    top_sections: List[Section] = []
-    actions_sample: List[ActionDescriptor] = []
+    title: str | None
+    changed: dict[str, Any]
+    top_sections: list[Section] = []
+    actions_sample: list[ActionDescriptor] = []
 
 
 # scroll / back / forward request models
@@ -283,7 +283,7 @@ class NavigateRequest(BaseModel):
 
 class NavigateResponse(BaseModel):
     url: str
-    title: Optional[str] = None
+    title: str | None = None
 
 
 # close also uses Pydantic Model
@@ -306,9 +306,9 @@ class WebMCPDiscoverRequest(BaseModel):
 class WebMCPToolDescriptor(BaseModel):
     name: str
     description: str
-    input_schema: Optional[Dict[str, Any]] = None
+    input_schema: dict[str, Any] | None = None
     read_only: bool = False
-    auto_submit: Optional[bool] = None
+    auto_submit: bool | None = None
     source: str = "webmcp"  # "webmcp_imperative" | "webmcp_declarative"
 
 
@@ -316,14 +316,14 @@ class WebMCPDiscoverResponse(BaseModel):
     session_id: str
     url: str
     webmcp_available: bool
-    tools: List[WebMCPToolDescriptor] = []
-    errors: List[str] = []
+    tools: list[WebMCPToolDescriptor] = []
+    errors: list[str] = []
 
 
 class WebMCPInvokeRequest(BaseModel):
     session_id: str
     tool_name: str
-    params: Dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
     timeout_ms: int = 30000
 
 
@@ -331,8 +331,8 @@ class WebMCPInvokeResponse(BaseModel):
     session_id: str
     tool_name: str
     success: bool
-    result: Optional[Any] = None
-    error: Optional[str] = None
+    result: Any | None = None
+    error: str | None = None
     url_before: str
     url_after: str
 
@@ -340,7 +340,7 @@ class WebMCPInvokeResponse(BaseModel):
 # ============================================================
 # Utilities
 # ============================================================
-def _aid(payload: Dict[str, Any]) -> str:
+def _aid(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return "a" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
@@ -377,7 +377,7 @@ def _normalize(s: str) -> str:
     return s.strip()
 
 
-def _make_stable_sid(heading: Optional[str], text: str) -> str:
+def _make_stable_sid(heading: str | None, text: str) -> str:
     h = (heading or "").strip().lower()
     t = re.sub(r"\s+", " ", (text or "").strip()).lower()
     anchor = t[:400]
@@ -385,7 +385,7 @@ def _make_stable_sid(heading: Optional[str], text: str) -> str:
     return "s_" + hashlib.sha1(raw).hexdigest()[:10]
 
 
-def _sections_diff(old_sections: List[Dict[str, Any]], new_sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _sections_diff(old_sections: list[dict[str, Any]], new_sections: list[dict[str, Any]]) -> dict[str, Any]:
     old_map = {s["sid"]: _hash_text(s["t"]) for s in old_sections}
     new_map = {s["sid"]: _hash_text(s["t"]) for s in new_sections}
 
@@ -399,7 +399,7 @@ def _sections_diff(old_sections: List[Dict[str, Any]], new_sections: List[Dict[s
     return {"added_sids": added, "removed_sids": removed, "changed_sids": changed}
 
 
-def _actions_diff(old_actions: List[Dict[str, Any]], new_actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _actions_diff(old_actions: list[dict[str, Any]], new_actions: list[dict[str, Any]]) -> dict[str, Any]:
     old_set = {a["aid"] for a in old_actions}   # ✅ IMPROVED
     new_set = {a["aid"] for a in new_actions}
     return {
@@ -408,7 +408,7 @@ def _actions_diff(old_actions: List[Dict[str, Any]], new_actions: List[Dict[str,
     }
 
 
-def _pick_action_methods(role: str) -> List[str]:
+def _pick_action_methods(role: str) -> list[str]:
     acts = ["scroll_into_view"]
     if role in ("button", "link", "checkbox", "radio"):
         acts.insert(0, "click")
@@ -419,7 +419,7 @@ def _pick_action_methods(role: str) -> List[str]:
     return acts
 
 
-def _dedup_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _dedup_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     out = []
     for a in actions:
@@ -431,7 +431,7 @@ def _dedup_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _rank_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _rank_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     src_w = {"dom": 0.03, "a11y": 0.02, "vision": 0.01}
     role_w = {"textbox": 0.03, "button": 0.02, "combobox": 0.02, "link": 0.015, "checkbox": 0.01, "radio": 0.01}
 
@@ -448,7 +448,7 @@ def _rank_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(actions, key=score, reverse=True)
 
 
-def _trim_action_fields(a: Dict[str, Any], name_max: int, selector_max: int) -> Dict[str, Any]:
+def _trim_action_fields(a: dict[str, Any], name_max: int, selector_max: int) -> dict[str, Any]:
     a = dict(a)
     a["name"] = _smart_truncate(a.get("name") or "", name_max)   # word-boundary truncation
 
@@ -461,14 +461,14 @@ def _trim_action_fields(a: Dict[str, Any], name_max: int, selector_max: int) -> 
     return a
 
 
-def _estimate_meta_chars(meta: Dict[str, Any]) -> int:
+def _estimate_meta_chars(meta: dict[str, Any]) -> int:
     try:
         return len(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
     except Exception:
         return 200
 
 
-def _estimate_action_chars(a: Dict[str, Any]) -> int:
+def _estimate_action_chars(a: dict[str, Any]) -> int:
     role = a.get("role") or ""
     name = a.get("name") or ""
     strat = a.get("strategy") or {}
@@ -477,14 +477,14 @@ def _estimate_action_chars(a: Dict[str, Any]) -> int:
 
 
 def _apply_total_output_budget(
-    sections: List[Dict[str, Any]],
-    actions: List[Dict[str, Any]],
-    meta: Dict[str, Any],
+    sections: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    meta: dict[str, Any],
     total_budget: int,
     min_actions_to_keep: int,
     name_max: int,
     selector_max: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     actions = [_trim_action_fields(a, name_max=name_max, selector_max=selector_max) for a in actions]
 
     meta_chars = _estimate_meta_chars(meta)
@@ -512,7 +512,7 @@ def _apply_total_output_budget(
         return sections, [], meta
 
     ranked = _rank_actions(_dedup_actions(actions))
-    packed: List[Dict[str, Any]] = []
+    packed: list[dict[str, Any]] = []
     used = 0
 
     for a in ranked:
@@ -1192,7 +1192,7 @@ def _letterbox(img: Image.Image, new_size: int = 640, color=(114, 114, 114)):
     return arr, r, (pad_w, pad_h)
 
 
-def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
+def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> list[int]:
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = (x2 - x1 + 1) * (y2 - y1 + 1)
     order = scores.argsort()[::-1]
@@ -1238,7 +1238,7 @@ def _decode_yolov8_like(out: np.ndarray, conf_thresh: float):
 
 def yolo_detect_ui_components(
     image_bytes: bytes, conf_thresh: float, iou_thresh: float, max_boxes: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if not YOLO_ENABLED or YOLO_SESSION is None:
         return []
 
@@ -1275,16 +1275,16 @@ def yolo_detect_ui_components(
 # Distill: blocks -> stable sections
 # ============================================================
 def _blocks_to_sections_stable(
-    blocks: List[Dict[str, str]],
+    blocks: list[dict[str, str]],
     max_sections: int,
     max_section_chars: int,
     total_budget: int,
-    tables: Optional[List[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
+    tables: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     # (heading, text, type, table_meta)
-    sections_raw: List[Tuple[Optional[str], str, str, Optional[Dict]]] = []
-    cur_h: Optional[str] = None
-    cur: List[str] = []
+    sections_raw: list[tuple[str | None, str, str, dict | None]] = []
+    cur_h: str | None = None
+    cur: list[str] = []
 
     def flush():
         nonlocal cur_h, cur
@@ -1328,26 +1328,26 @@ def _blocks_to_sections_stable(
             if not tbl_heading:
                 first_line = tbl_text.split("\n")[0].replace("|", " ").strip()
                 if first_line:
-                    tbl_heading = f"{t("table_prefix")} {_smart_truncate(first_line, 60)}"
+                    tbl_heading = f"{t('table_prefix')} {_smart_truncate(first_line, 60)}"
                 else:
                     tbl_heading = t("table_prefix")
             else:
-                tbl_heading = f"{t("table_prefix")} {tbl_heading}"
+                tbl_heading = f"{t('table_prefix')} {tbl_heading}"
             tbl_text_clipped = _clip(tbl_text, max_section_chars)
             sections_raw.append((tbl_heading, tbl_text_clipped, "table", tbl_meta))
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     used = 0
     seen = set()
 
-    for (h, t, sec_type, tbl_meta) in sections_raw[:max_sections]:
+    for (h, body, sec_type, tbl_meta) in sections_raw[:max_sections]:
         if used >= total_budget:
             break
         remain = total_budget - used
-        if len(t) > remain:
-            t = _clip(t, max(220, remain))
+        if len(body) > remain:
+            body = _clip(body, max(220, remain))
 
-        sid = _make_stable_sid(h, t)
+        sid = _make_stable_sid(h, body)
         if sid in seen:
             sid = sid + "_" + str(len(seen))
         seen.add(sid)
@@ -1355,15 +1355,15 @@ def _blocks_to_sections_stable(
         # Auto-use first sentence as heading when empty
         effective_h = h
         if not effective_h:
-            first_sentence = re.split(r'[.!?。！？\n]', t)[0].strip()
+            first_sentence = re.split(r'[.!?。！？\n]', body)[0].strip()
             if first_sentence and len(first_sentence) > 10:
                 effective_h = _smart_truncate(first_sentence, 80)
 
-        section: Dict[str, Any] = {"sid": sid, "h": effective_h, "t": t, "type": sec_type}
+        section: dict[str, Any] = {"sid": sid, "h": effective_h, "t": body, "type": sec_type}
         if sec_type == "table" and tbl_meta:
             section["table_meta"] = tbl_meta
         out.append(section)
-        used += len(t)
+        used += len(body)
 
     return out
 
@@ -1371,7 +1371,7 @@ def _blocks_to_sections_stable(
 # ============================================================
 # Actions: DOM + A11y + Vision
 # ============================================================
-async def _extract_actions_dom(page: Page, max_actions: int) -> List[Dict[str, Any]]:
+async def _extract_actions_dom(page: Page, max_actions: int) -> list[dict[str, Any]]:
     raw = await page.evaluate(ACTIONS_DOM_JS, max_actions)
     actions = []
     for ra in raw:
@@ -1393,13 +1393,13 @@ async def _extract_actions_dom(page: Page, max_actions: int) -> List[Dict[str, A
     return actions
 
 
-async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict[str, Any]], str]:
+async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict[str, Any]], str]:
     # 1) Preferred: accessibility.snapshot
     try:
         acc = getattr(page, "accessibility", None)
         if acc is not None and hasattr(acc, "snapshot"):
             snap = await acc.snapshot(interesting_only=False)
-            out: List[Tuple[str, str]] = []
+            out: list[tuple[str, str]] = []
 
             def walk(node):
                 if not node:
@@ -1414,7 +1414,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
             walk(snap)
 
             seen = set()
-            uniq: List[Tuple[str, str]] = []
+            uniq: list[tuple[str, str]] = []
             for r, n in out:
                 if (r, n) not in seen:
                     seen.add((r, n))
@@ -1422,7 +1422,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
                     if len(uniq) >= max_actions:
                         break
 
-            actions: List[Dict[str, Any]] = []
+            actions: list[dict[str, Any]] = []
             for role, name in uniq:
                 strategy = {"type": "role", "role": role, "name": name}
                 aid = _aid({"role": role, "name": name, "strategy": strategy})
@@ -1441,7 +1441,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
         return [], "unavailable"
 
     roles = {"button", "link", "textbox", "combobox", "checkbox", "radio"}
-    out2: List[Tuple[str, str]] = []
+    out2: list[tuple[str, str]] = []
     line_re = re.compile(r'^\s*-\s*([A-Za-z0-9_-]+)\s+"(.*)"\s*$', re.M)
 
     for mm in line_re.finditer(snap_text or ""):
@@ -1453,7 +1453,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
             break
 
     seen = set()
-    uniq2: List[Tuple[str, str]] = []
+    uniq2: list[tuple[str, str]] = []
     for r, n in out2:
         if (r, n) not in seen:
             seen.add((r, n))
@@ -1461,7 +1461,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
             if len(uniq2) >= max_actions:
                 break
 
-    actions2: List[Dict[str, Any]] = []
+    actions2: list[dict[str, Any]] = []
     for role, name in uniq2:
         strategy = {"type": "role", "role": role, "name": name}
         aid = _aid({"role": role, "name": name, "strategy": strategy})
@@ -1472,7 +1472,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict
     return actions2, "aria_snapshot"
 
 
-async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[str, Any]]:
+async def _extract_actions_vision(page: Page, req: DistillRequest) -> list[dict[str, Any]]:
     if not YOLO_ENABLED or not req.enable_vision_fallback:
         return []
 
@@ -1490,7 +1490,7 @@ async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[
     if not dets:
         return []
 
-    actions: List[Dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
     for d in dets:
         x1, y1, x2, y2 = d["bbox"]
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -1527,7 +1527,7 @@ async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[
 # ============================================================
 # ✅ WebMCP: discover + invoke
 # ============================================================
-async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[str, Any]:
+async def _discover_webmcp_tools(session: Session, force: bool = False) -> dict[str, Any]:
     """Discover WebMCP tools on page (imperative + declarative), cached per session."""
     if not force and session.webmcp_tools is not None:
         return {"available": session.webmcp_available, "tools": session.webmcp_tools, "errors": []}
@@ -1541,20 +1541,20 @@ async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[
         return {"available": False, "tools": [], "errors": [str(e)]}
 
     available = raw.get("available", False)
-    all_tools: List[Dict[str, Any]] = []
+    all_tools: list[dict[str, Any]] = []
 
-    for t in raw.get("imperative_tools", []):
+    for tool in raw.get("imperative_tools", []):
         all_tools.append({
-            "name": t.get("name", ""), "description": t.get("description", ""),
-            "input_schema": t.get("inputSchema"), "read_only": t.get("readOnly", False),
+            "name": tool.get("name", ""), "description": tool.get("description", ""),
+            "input_schema": tool.get("inputSchema"), "read_only": tool.get("readOnly", False),
             "source": "webmcp_imperative",
         })
 
-    for t in raw.get("declarative_tools", []):
+    for tool in raw.get("declarative_tools", []):
         all_tools.append({
-            "name": t.get("name", ""), "description": t.get("description", ""),
-            "input_schema": t.get("inputSchema"), "read_only": t.get("readOnly", False),
-            "auto_submit": t.get("autoSubmit", False), "source": "webmcp_declarative",
+            "name": tool.get("name", ""), "description": tool.get("description", ""),
+            "input_schema": tool.get("inputSchema"), "read_only": tool.get("readOnly", False),
+            "auto_submit": tool.get("autoSubmit", False), "source": "webmcp_declarative",
         })
         if not available:
             available = True
@@ -1565,8 +1565,8 @@ async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[
 
 
 async def _invoke_webmcp_tool(
-    session: Session, tool_name: str, params: Dict[str, Any], timeout_ms: int = 30000
-) -> Dict[str, Any]:
+    session: Session, tool_name: str, params: dict[str, Any], timeout_ms: int = 30000
+) -> dict[str, Any]:
     """Invoke a WebMCP tool (auto-detect imperative vs declarative)."""
     if session.webmcp_tools is None:
         await _discover_webmcp_tools(session)
@@ -1600,7 +1600,7 @@ async def _invoke_webmcp_tool(
 # ============================================================
 # Distill core
 # ============================================================
-async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
+async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
     page = session.page
     url = page.url
     title = None
@@ -1616,9 +1616,9 @@ async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
     if mode == "auto":
         mode = "readability" if READABILITY_AVAILABLE else "simple"
 
-    blocks: List[Dict[str, str]] = []
+    blocks: list[dict[str, str]] = []
     readability_meta = {}
-    extracted_tables: List[Dict[str, Any]] = []
+    extracted_tables: list[dict[str, Any]] = []
 
     if mode == "readability":
         if not READABILITY_AVAILABLE or not READABILITY_JS:
@@ -1674,9 +1674,9 @@ async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
     a11y_attempted = False
     a11y_mode = None
     a11y_error = None
-    webmcp_result: Dict[str, Any] = {"available": False, "tools": [], "errors": []}
+    webmcp_result: dict[str, Any] = {"available": False, "tools": [], "errors": []}
 
-    actions: List[Dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
     if req.include_actions:
         # WebMCP: prefer structured tools (highest confidence)
         webmcp_result = await _discover_webmcp_tools(session)
@@ -1770,7 +1770,7 @@ async def _ensure_session(session_id: str) -> Session:
 # ============================================================
 # Action executor
 # ============================================================
-async def _locate(page: Page, strategy: Dict[str, Any]):
+async def _locate(page: Page, strategy: dict[str, Any]):
     stype = strategy.get("type")
     if stype == "role":
         return page.get_by_role(strategy["role"], name=strategy.get("name") or "").first
@@ -1794,7 +1794,7 @@ async def _maybe_switch_to_new_page(sess: Session):
 # lifespan replaces deprecated on_event
 # ============================================================
 _pw = None
-_browser: Optional[Browser] = None
+_browser: Browser | None = None
 
 
 @asynccontextmanager

@@ -15,14 +15,14 @@ import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from i18n import t, prompt, tmpl, init_locale
+from i18n import init_locale, prompt, t, tmpl
 
 init_locale()
 
@@ -707,8 +707,8 @@ def _compress_sections_for_brief(sections: list[Section]) -> str:
 # ═══════════════════════════════════════════
 
 def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, output_dir: Path,
-                 tags: Optional[List[str]] = None, source: str = "upload",
-                 original_path: Optional[str] = None):
+                 tags: list[str] | None = None, source: str = "upload",
+                 original_path: str | None = None):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
     tables_dir = doc_dir / "tables"
@@ -723,7 +723,7 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
         "section_count": len(parsed.sections),
         "ocr_page_count": parsed.ocr_page_count,
         "table_count": parsed.table_count,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sections": [
             {"index": sec.index, "sid": sec.sid, "title": sec.title,
              "page_range": sec.page_range, "char_count": len(sec.text)}
@@ -796,7 +796,7 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
 
 
 def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: Path,
-                              tags: Optional[List[str]] = None, source: str = "upload"):
+                              tags: list[str] | None = None, source: str = "upload"):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
     doc_dir.mkdir(parents=True, exist_ok=True)
@@ -806,7 +806,7 @@ def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: P
         "doc_id": doc_id, "filename": parsed.filename, "file_type": parsed.file_type,
         "total_pages": parsed.total_pages, "section_count": len(parsed.sections),
         "ocr_page_count": parsed.ocr_page_count, "table_count": parsed.table_count,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sections": [
             {"index": sec.index, "sid": sec.sid, "title": sec.title,
              "page_range": sec.page_range, "char_count": len(sec.text)}
@@ -846,15 +846,15 @@ def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: P
 # ═══════════════════════════════════════════
 
 def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
-                      tags: Optional[List[str]] = None,
+                      tags: list[str] | None = None,
                       source: str = "upload",
-                      source_url: Optional[str] = None,
-                      content_hash: Optional[str] = None):
+                      source_url: str | None = None,
+                      content_hash: str | None = None):
     """Update doc-index.json (v2 format with source/tags/content_hash)."""
     index_path = docs_dir / "doc-index.json"
     if index_path.exists():
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
+            with open(index_path, encoding="utf-8") as f:
                 index = json.load(f)
         except (json.JSONDecodeError, Exception):
             index = {"version": 2, "documents": []}
@@ -879,7 +879,7 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
         entry["source_url"] = source_url
 
     index["documents"].append(entry)
-    index["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    index["last_updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_json(index_path, index)
 
 
@@ -961,11 +961,11 @@ class SectionInfo(BaseModel):
 class ManifestResponse(BaseModel):
     doc_id: str
     filename: str
-    file_type: Optional[str] = None
-    source: Optional[str] = None
-    paths: Dict[str, str]
-    sections: List[Dict[str, Any]]
-    provenance: Optional[Dict[str, Any]] = None
+    file_type: str | None = None
+    source: str | None = None
+    paths: dict[str, str]
+    sections: list[dict[str, Any]]
+    provenance: dict[str, Any] | None = None
 
 
 class SearchResult(BaseModel):
@@ -973,14 +973,14 @@ class SearchResult(BaseModel):
     filename: str
     file_type: str
     digest: str
-    tags: List[str] = []
+    tags: list[str] = []
     source: str = "upload"
-    created_at: Optional[str] = None
+    created_at: str | None = None
     score: float = 1.0
 
 
 class SearchResponse(BaseModel):
-    results: List[SearchResult]
+    results: list[SearchResult]
     total: int
 
 
@@ -1002,15 +1002,15 @@ async def health():
 @app.post("/parse", response_model=ParseResponse)
 async def api_parse_doc(
     file: UploadFile = File(...),
-    doc_id: Optional[str] = Form(None),
+    doc_id: str | None = Form(None),
     generate_summary: bool = Form(True),
     force_ocr: bool = Form(False),
-    ocr_pages: Optional[str] = Form(None),
+    ocr_pages: str | None = Form(None),
     extract_tables: bool = Form(True),
     max_tables_per_page: int = Form(3),
     concurrency: int = Form(3),
-    tags: Optional[str] = Form(None),  # JSON array string: '["Q3","financial"]'
-    metadata: Optional[str] = Form(None),  # JSON object string
+    tags: str | None = Form(None),  # JSON array string: '["Q3","financial"]'
+    metadata: str | None = Form(None),  # JSON object string
 ):
     """Parse uploaded document (PDF/DOCX), return structured result."""
     docs_dir = _get_docs_dir()
@@ -1023,7 +1023,7 @@ async def api_parse_doc(
         raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
     # Parse tags
-    parsed_tags: List[str] = []
+    parsed_tags: list[str] = []
     if tags:
         try:
             parsed_tags = json.loads(tags)
@@ -1102,9 +1102,9 @@ async def api_parse_doc(
 
 @app.get("/library/search", response_model=SearchResponse)
 async def library_search(
-    q: Optional[str] = None,
-    tags: Optional[str] = None,
-    file_type: Optional[str] = None,
+    q: str | None = None,
+    tags: str | None = None,
+    file_type: str | None = None,
     limit: int = 20,
 ):
     """Search document library."""
