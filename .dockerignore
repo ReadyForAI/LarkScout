@@ -1,0 +1,38 @@
+# Version control
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv
+venv
+env
+
+# Test artifacts
+.pytest_cache
+.ruff_cache
+htmlcov
+.coverage
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea
+.vscode
+
+# Runtime data (mounted as a volume)
+docs/
+
+# CI / dev-only config
+.github
+.claude
+
+# Documentation (not needed at runtime)
+*.md
