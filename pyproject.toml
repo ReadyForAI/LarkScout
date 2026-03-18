@@ -49,3 +49,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v"
+markers = [
+    "live: requires a running LarkScout server (localhost:9898) and network access",
+    "live_llm: requires a running server AND a configured LLM API key",
+]
