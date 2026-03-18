@@ -110,7 +110,7 @@ Response example:
 {
   "ok": true,
   "version": "3.0.0",
-  "docs_dir": "/home/user/.openclaw/subworkspace/shared/docs",
+  "docs_dir": "/home/user/.larkscout/docs",
   "supported_formats": ["pdf", "docx"]
 }
 ```
