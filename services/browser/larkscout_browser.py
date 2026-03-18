@@ -605,7 +605,7 @@ async def _setup_routing(context: BrowserContext, block_resources: bool):
 # ============================================================
 # Added text density detection for div/section/td (better SPA scraping)
 DISTILL_SIMPLE_JS = r"""
-(extractTables, maxTableRows) => {
+([extractTables, maxTableRows]) => {
   function visible(el) {
     const style = window.getComputedStyle(el);
     if (!style) return false;
@@ -773,7 +773,7 @@ READABILITY_EVAL = r"""
 
 # Standalone table extraction JS for Readability mode (Readability strips tables)
 EXTRACT_TABLES_JS = r"""
-(maxTableRows, maxTables) => {
+([maxTableRows, maxTables]) => {
   function visible(el) {
     const style = window.getComputedStyle(el);
     if (!style) return false;
@@ -1675,13 +1675,13 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
                 if req.extract_tables:
                     try:
                         extracted_tables = await page.evaluate(
-                            EXTRACT_TABLES_JS, req.max_table_rows, req.max_tables
+                            EXTRACT_TABLES_JS, [req.max_table_rows, req.max_tables]
                         ) or []
                     except Exception:
                         extracted_tables = []
 
     if mode == "simple":
-        dist = await page.evaluate(DISTILL_SIMPLE_JS, req.extract_tables, req.max_table_rows)
+        dist = await page.evaluate(DISTILL_SIMPLE_JS, [req.extract_tables, req.max_table_rows])
         blocks = dist.get("blocks") or []
         extracted_tables = dist.get("tables") or []
         url = dist.get("url") or page.url
