@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel, Field as PydField
+from pydantic import BaseModel
 
 from i18n import t, prompt, tmpl, init_locale
 
@@ -999,7 +999,7 @@ async def health():
     }
 
 
-@app.post("/doc/parse", response_model=ParseResponse)
+@app.post("/parse", response_model=ParseResponse)
 async def api_parse_doc(
     file: UploadFile = File(...),
     doc_id: Optional[str] = Form(None),
