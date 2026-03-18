@@ -1,0 +1,2160 @@
+import os
+import re
+import json
+import time
+import asyncio
+import secrets
+import hashlib
+import logging
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Literal, Tuple
+from io import BytesIO
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import numpy as np
+from PIL import Image
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+
+from i18n import t
+
+logger = logging.getLogger("larkscout_browser")
+
+# ============================================================
+# Config
+# ============================================================
+DEFAULT_UA = os.getenv(
+    "UA",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+)
+DEFAULT_LANG = "en-US"
+SESSION_TTL_SECONDS = 30 * 60  # 30 min idle
+SESSION_MAXSIZE = 200
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# ---- Readability.js local file ----
+READABILITY_JS_PATH = Path(os.getenv("READABILITY_JS_PATH", str(BASE_DIR / "readability.js")))
+READABILITY_JS: Optional[str] = None
+READABILITY_AVAILABLE = False
+
+# ---- YOLO (onnxruntime) ----
+YOLO_ONNX_PATH = os.getenv("YOLO_ONNX_PATH", "")
+YOLO_INPUT_SIZE = int(os.getenv("YOLO_INPUT_SIZE", "640"))
+YOLO_CLASS_MAP_JSON = os.getenv(
+    "YOLO_CLASS_MAP_JSON",
+    '{"0":"button","1":"textbox","2":"checkbox","3":"link","4":"combobox"}',
+)
+try:
+    YOLO_CLASS_MAP = {int(k): v for k, v in json.loads(YOLO_CLASS_MAP_JSON).items()}
+except Exception:
+    YOLO_CLASS_MAP = {0: "button", 1: "textbox"}
+
+YOLO_ENABLED = False
+YOLO_SESSION = None
+YOLO_INPUT_NAME = None
+YOLO_OUTPUT_NAMES = None
+
+
+# ============================================================
+# Session object
+# ============================================================
+@dataclass
+class Session:
+    context: BrowserContext
+    page: Page
+    lang: str
+    last_distill: Optional[Dict[str, Any]] = None
+    action_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)              # concurrency lock
+    # WebMCP: cached tool list
+    webmcp_tools: Optional[List[Dict[str, Any]]] = None
+    webmcp_available: bool = False
+
+
+# ============================================================
+# SessionManager with expiry callbacks,
+#    replaces TTLCache to fix resource leak on expired sessions
+# ============================================================
+class SessionManager:
+    def __init__(self, ttl: int = SESSION_TTL_SECONDS, maxsize: int = SESSION_MAXSIZE):
+        self._sessions: OrderedDict[str, Tuple[float, Session]] = OrderedDict()
+        self._ttl = ttl
+        self._maxsize = maxsize
+        self._lock = asyncio.Lock()
+
+    def __len__(self):
+        return len(self._sessions)
+
+    async def put(self, sid: str, sess: Session):
+        async with self._lock:
+            # evict oldest
+            if len(self._sessions) >= self._maxsize:
+                old_sid, (_, old_sess) = self._sessions.popitem(last=False)
+                logger.info("session evicted (maxsize): %s", old_sid)
+                await self._close_session(old_sess)
+            self._sessions[sid] = (time.time(), sess)
+
+    async def get(self, sid: str) -> Optional[Session]:
+        async with self._lock:
+            item = self._sessions.get(sid)
+            if not item:
+                return None
+            ts, sess = item
+            if time.time() - ts > self._ttl:
+                del self._sessions[sid]
+                logger.info("session expired on access: %s", sid)
+                await self._close_session(sess)
+                return None
+            # refresh timestamp & move to end
+            self._sessions[sid] = (time.time(), sess)
+            self._sessions.move_to_end(sid)
+            return sess
+
+    async def remove(self, sid: str):
+        async with self._lock:
+            item = self._sessions.pop(sid, None)
+            if item:
+                _, sess = item
+                await self._close_session(sess)
+
+    async def cleanup(self):
+        """Periodic cleanup of expired sessions."""
+        async with self._lock:
+            now = time.time()
+            expired = [sid for sid, (ts, _) in self._sessions.items() if now - ts > self._ttl]
+            for sid in expired:
+                _, sess = self._sessions.pop(sid)
+                logger.info("session expired (cleanup): %s", sid)
+                await self._close_session(sess)
+
+    async def close_all(self):
+        async with self._lock:
+            for sid, (_, sess) in self._sessions.items():
+                await self._close_session(sess)
+            self._sessions.clear()
+
+    @staticmethod
+    async def _close_session(sess: Session):
+        try:
+            await sess.context.close()
+        except Exception:
+            pass
+
+
+sessions = SessionManager()
+
+
+# ============================================================
+# Models
+# ============================================================
+class NewSessionRequest(BaseModel):
+    lang: str = DEFAULT_LANG
+    user_agent: str = DEFAULT_UA
+    block_resources: bool = True
+    viewport: Dict[str, int] = Field(default_factory=lambda: {"width": 900, "height": 700})
+    storage_state: Optional[Dict[str, Any]] = None
+
+
+class NewSessionResponse(BaseModel):
+    session_id: str
+
+
+class GotoRequest(BaseModel):
+    session_id: str
+    url: str
+    wait_until: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
+    timeout_ms: int = 25000
+
+
+class GotoResponse(BaseModel):
+    session_id: str
+    url: str
+    title: Optional[str] = None
+
+
+class DistillRequest(BaseModel):
+    session_id: str
+    distill_mode: Literal["simple", "readability", "auto"] = "auto"
+    max_sections: int = Field(default=30, ge=1, le=60)
+    max_section_chars: int = Field(default=1800, ge=200, le=8000)
+    total_text_budget_chars: int = Field(default=12000, ge=1000, le=60000)
+    include_actions: bool = True
+    max_actions: int = Field(default=60, ge=1, le=250)
+    total_output_budget_chars: int = Field(default=18000, ge=2000, le=120000)
+    min_actions_to_keep: int = Field(default=8, ge=0, le=50)
+    max_action_name_chars: int = Field(default=80, ge=10, le=200)
+    max_selector_chars: int = Field(default=120, ge=20, le=500)
+    include_diff: bool = True
+    min_actions_before_fallback: int = Field(default=8, ge=0, le=200)
+    enable_a11y_fallback: bool = True
+    enable_vision_fallback: bool = False
+    vision_max_boxes: int = Field(default=12, ge=0, le=50)
+    vision_conf_thresh: float = Field(default=0.35, ge=0.0, le=1.0)
+    vision_iou_thresh: float = Field(default=0.45, ge=0.0, le=1.0)
+    # Table extraction params
+    extract_tables: bool = True
+    max_table_rows: int = Field(default=80, ge=10, le=500)
+    max_tables: int = Field(default=20, ge=1, le=50)
+    # Optional wait_for_selector before distill (SPA-friendly)
+    wait_for_selector: Optional[str] = None
+    wait_for_timeout_ms: int = Field(default=5000, ge=500, le=30000)
+
+
+class ActionDescriptor(BaseModel):
+    aid: str
+    role: str
+    name: str
+    strategy: Dict[str, Any]
+    actions: List[str]
+    confidence: float = 0.8
+    source: str = "dom"
+
+
+class Section(BaseModel):
+    sid: str
+    h: Optional[str] = None
+    t: str
+    type: Literal["text", "table"] = "text"
+    table_meta: Optional[Dict[str, Any]] = None
+
+
+class DistillResponse(BaseModel):
+    url: str
+    title: Optional[str] = None
+    content_hash: str
+    sections: List[Section]
+    actions: List[ActionDescriptor] = []
+    meta: Dict[str, Any] = {}
+
+
+class ReadSectionsRequest(BaseModel):
+    session_id: str
+    section_ids: List[str] = Field(min_length=1)
+    max_section_chars: int = Field(default=1800, ge=200, le=8000)
+
+
+class ReadSectionsResponse(BaseModel):
+    url: str
+    title: Optional[str]
+    content_hash: str
+    picked_sections: List[Section]
+    available_section_ids: List[str]
+
+
+class ActRequest(BaseModel):
+    session_id: str
+    aid: str
+    action: Literal["click", "type", "select", "scroll_into_view", "invoke"]
+    text: Optional[str] = None
+    value: Optional[str] = None
+    wait_until: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
+    timeout_ms: int = 25000
+    return_top_sections: bool = True
+    top_k_sections: int = Field(default=3, ge=1, le=10)
+
+
+class ActResponse(BaseModel):
+    url_before: str
+    url_after: str
+    title: Optional[str]
+    changed: Dict[str, Any]
+    top_sections: List[Section] = []
+    actions_sample: List[ActionDescriptor] = []
+
+
+# scroll / back / forward request models
+class ScrollRequest(BaseModel):
+    session_id: str
+    direction: Literal["up", "down"] = "down"
+    pixels: int = Field(default=600, ge=50, le=5000)
+
+
+class NavigateRequest(BaseModel):
+    session_id: str
+    direction: Literal["back", "forward"] = "back"
+    wait_until: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
+    timeout_ms: int = 15000
+
+
+class NavigateResponse(BaseModel):
+    url: str
+    title: Optional[str] = None
+
+
+# close also uses Pydantic Model
+class CloseSessionRequest(BaseModel):
+    session_id: str
+
+
+class ExportStorageRequest(BaseModel):
+    session_id: str
+
+
+# ============================================================
+# ✅ WebMCP Models
+# ============================================================
+class WebMCPDiscoverRequest(BaseModel):
+    session_id: str
+    force_refresh: bool = False
+
+
+class WebMCPToolDescriptor(BaseModel):
+    name: str
+    description: str
+    input_schema: Optional[Dict[str, Any]] = None
+    read_only: bool = False
+    auto_submit: Optional[bool] = None
+    source: str = "webmcp"  # "webmcp_imperative" | "webmcp_declarative"
+
+
+class WebMCPDiscoverResponse(BaseModel):
+    session_id: str
+    url: str
+    webmcp_available: bool
+    tools: List[WebMCPToolDescriptor] = []
+    errors: List[str] = []
+
+
+class WebMCPInvokeRequest(BaseModel):
+    session_id: str
+    tool_name: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    timeout_ms: int = 30000
+
+
+class WebMCPInvokeResponse(BaseModel):
+    session_id: str
+    tool_name: str
+    success: bool
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    url_before: str
+    url_after: str
+
+
+# ============================================================
+# Utilities
+# ============================================================
+def _aid(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return "a" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+
+def _hash_text(s: str) -> str:
+    return "sha256:" + hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _clip(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    cut = s[:max_chars]
+    last = cut.rfind("\n\n")
+    if last > max_chars * 0.6:
+        cut = cut[:last]
+    return cut.strip()
+
+
+# Word-boundary truncation
+def _smart_truncate(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    cut = s[:max_chars]
+    last_space = cut.rfind(" ")
+    if last_space > max_chars * 0.6:
+        cut = cut[:last_space]
+    return cut.rstrip() + "…"
+
+
+def _normalize(s: str) -> str:
+    s = re.sub(r"\r\n|\r", "\n", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _make_stable_sid(heading: Optional[str], text: str) -> str:
+    h = (heading or "").strip().lower()
+    t = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    anchor = t[:400]
+    raw = (h + "\n" + anchor).encode("utf-8", errors="ignore")
+    return "s_" + hashlib.sha1(raw).hexdigest()[:10]
+
+
+def _sections_diff(old_sections: List[Dict[str, Any]], new_sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+    old_map = {s["sid"]: _hash_text(s["t"]) for s in old_sections}
+    new_map = {s["sid"]: _hash_text(s["t"]) for s in new_sections}
+
+    old_sids = set(old_map)
+    new_sids = set(new_map)
+
+    added = sorted(new_sids - old_sids)       # set comprehension
+    removed = sorted(old_sids - new_sids)
+    changed = sorted(sid for sid in (old_sids & new_sids) if old_map[sid] != new_map[sid])
+
+    return {"added_sids": added, "removed_sids": removed, "changed_sids": changed}
+
+
+def _actions_diff(old_actions: List[Dict[str, Any]], new_actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    old_set = {a["aid"] for a in old_actions}   # ✅ IMPROVED
+    new_set = {a["aid"] for a in new_actions}
+    return {
+        "actions_added": sorted(new_set - old_set),
+        "actions_removed": sorted(old_set - new_set),
+    }
+
+
+def _pick_action_methods(role: str) -> List[str]:
+    acts = ["scroll_into_view"]
+    if role in ("button", "link", "checkbox", "radio"):
+        acts.insert(0, "click")
+    if role == "textbox":
+        acts.insert(0, "type")
+    if role == "combobox":
+        acts.insert(0, "select")
+    return acts
+
+
+def _dedup_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for a in actions:
+        key = (a.get("role", ""), a.get("name", ""), json.dumps(a.get("strategy", {}), sort_keys=True))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+
+
+def _rank_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    src_w = {"dom": 0.03, "a11y": 0.02, "vision": 0.01}
+    role_w = {"textbox": 0.03, "button": 0.02, "combobox": 0.02, "link": 0.015, "checkbox": 0.01, "radio": 0.01}
+
+    def score(a):
+        c = float(a.get("confidence", 0.7))
+        c += src_w.get(a.get("source", "dom"), 0.0)
+        c += role_w.get(a.get("role", ""), 0.0)
+        if (a.get("name") or "").strip():
+            c += 0.02
+        if (a.get("strategy") or {}).get("type") == "role":
+            c += 0.01
+        return c
+
+    return sorted(actions, key=score, reverse=True)
+
+
+def _trim_action_fields(a: Dict[str, Any], name_max: int, selector_max: int) -> Dict[str, Any]:
+    a = dict(a)
+    a["name"] = _smart_truncate(a.get("name") or "", name_max)   # word-boundary truncation
+
+    strat = dict(a.get("strategy") or {})
+    if strat.get("type") == "css":
+        strat["selector"] = (strat.get("selector") or "")[:selector_max]
+    elif strat.get("type") == "role":
+        strat["name"] = _smart_truncate(strat.get("name") or "", name_max)
+    a["strategy"] = strat
+    return a
+
+
+def _estimate_meta_chars(meta: Dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        return 200
+
+
+def _estimate_action_chars(a: Dict[str, Any]) -> int:
+    role = a.get("role") or ""
+    name = a.get("name") or ""
+    strat = a.get("strategy") or {}
+    sel = strat.get("selector") or strat.get("name") or ""
+    return 40 + len(role) + len(name) + len(sel) + len(a.get("source", ""))
+
+
+def _apply_total_output_budget(
+    sections: List[Dict[str, Any]],
+    actions: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+    total_budget: int,
+    min_actions_to_keep: int,
+    name_max: int,
+    selector_max: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    actions = [_trim_action_fields(a, name_max=name_max, selector_max=selector_max) for a in actions]
+
+    meta_chars = _estimate_meta_chars(meta)
+    sec_chars = sum(len(s.get("t") or "") + len(s.get("h") or "") for s in sections)
+
+    overhead = 200
+    remaining = total_budget - (meta_chars + sec_chars + overhead)
+
+    if remaining < 0:
+        need = -remaining
+        for i in range(len(sections) - 1, -1, -1):
+            t = sections[i].get("t") or ""
+            if len(t) <= 220:
+                continue
+            cut = min(need, len(t) - 220)
+            sections[i]["t"] = t[: max(220, len(t) - cut)]
+            need -= cut
+            if need <= 0:
+                break
+
+        sec_chars = sum(len(s.get("t") or "") + len(s.get("h") or "") for s in sections)
+        remaining = total_budget - (meta_chars + sec_chars + overhead)
+
+    if remaining <= 0 or not actions:
+        return sections, [], meta
+
+    ranked = _rank_actions(_dedup_actions(actions))
+    packed: List[Dict[str, Any]] = []
+    used = 0
+
+    for a in ranked:
+        if len(packed) >= min_actions_to_keep:
+            break
+        size = _estimate_action_chars(a)
+        if used + size <= remaining:
+            packed.append(a)
+            used += size
+        else:
+            b = dict(a)
+            strat = dict(b.get("strategy") or {})
+            if strat.get("type") == "css":
+                strat["selector"] = (strat.get("selector") or "")[:40]
+                b["strategy"] = strat
+            b["name"] = _smart_truncate(b.get("name") or "", 40)
+            size2 = _estimate_action_chars(b)
+            if used + size2 <= remaining:
+                packed.append(b)
+                used += size2
+
+    for a in ranked[len(packed):]:
+        size = _estimate_action_chars(a)
+        if used + size > remaining:
+            continue
+        packed.append(a)
+        used += size
+
+    return sections, packed, meta
+
+
+# ============================================================
+# Routing: block resources
+# ============================================================
+_BLOCKED_KEYWORDS = frozenset([
+    "doubleclick", "googletagmanager", "google-analytics",
+    "facebook.com/tr", "segment.com",
+])
+
+_BLOCKED_RESOURCE_TYPES = frozenset(["image", "media", "font"])
+
+
+async def _setup_routing(context: BrowserContext, block_resources: bool):
+    if not block_resources:
+        return
+
+    async def route_handler(route):
+        req = route.request
+        if req.resource_type in _BLOCKED_RESOURCE_TYPES:
+            return await route.abort()
+
+        url_lower = req.url.lower()
+        if any(x in url_lower for x in _BLOCKED_KEYWORDS):
+            return await route.abort()
+
+        return await route.continue_()
+
+    await context.route("**/*", route_handler)
+
+
+# ============================================================
+# Distiller JS
+# ============================================================
+# Added text density detection for div/section/td (better SPA scraping)
+DISTILL_SIMPLE_JS = r"""
+(extractTables, maxTableRows) => {
+  function visible(el) {
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.visibility === "hidden" || style.display === "none") return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    return true;
+  }
+
+  const candidates = [
+    document.querySelector("article"),
+    document.querySelector("main"),
+    document.querySelector('[role="main"]'),
+    document.body
+  ].filter(Boolean);
+
+  let root = candidates[0];
+  let bestLen = 0;
+  for (const c of candidates) {
+    const t = (c.innerText || "").trim();
+    if (t.length > bestLen) { bestLen = t.length; root = c; }
+  }
+
+  const nodes = root.querySelectorAll("h1,h2,h3,p,li,blockquote,pre,code");
+  const seen = new Set();
+  const blocks = [];
+  for (const n of nodes) {
+    if (!visible(n)) continue;
+    const txt = (n.innerText || "").replace(/\s+/g, " ").trim();
+    if (!txt) continue;
+    if (txt.length < 20 && !["h1","h2","h3"].includes(n.tagName.toLowerCase())) continue;
+    if (seen.has(txt)) continue;
+    seen.add(txt);
+    blocks.push({ tag: n.tagName.toLowerCase(), text: txt });
+    if (blocks.length > 1500) break;
+  }
+
+  if (blocks.length < 10) {
+    const containers = root.querySelectorAll("div, section, td");
+    for (const d of containers) {
+      if (!visible(d)) continue;
+      let directText = "";
+      for (const child of d.childNodes) {
+        if (child.nodeType === 3) { directText += child.textContent; }
+      }
+      directText = directText.replace(/\s+/g, " ").trim();
+      if (directText.length > 80 && !seen.has(directText)) {
+        seen.add(directText);
+        blocks.push({ tag: "p", text: directText });
+      }
+      if (blocks.length > 1500) break;
+    }
+  }
+
+  // Table extraction: <table> → Markdown + numeric column stats
+  const tables = [];
+  if (extractTables) {
+    const tableEls = root.querySelectorAll("table");
+    for (const tbl of tableEls) {
+      if (!visible(tbl)) continue;
+      const capEl = tbl.querySelector("caption");
+      const caption = capEl ? (capEl.innerText || "").replace(/\s+/g, " ").trim() : "";
+      let heading = caption;
+      if (!heading) {
+        let prev = tbl.previousElementSibling;
+        for (let i = 0; i < 3 && prev; i++) {
+          const tag = prev.tagName.toLowerCase();
+          if (["h1","h2","h3","h4","h5","h6"].includes(tag)) {
+            heading = (prev.innerText || "").replace(/\s+/g, " ").trim().slice(0, 120);
+            break;
+          }
+          prev = prev.previousElementSibling;
+        }
+      }
+      const allRows = [];
+      for (const tr of tbl.querySelectorAll("tr")) {
+        const cells = [];
+        for (const cell of tr.querySelectorAll("th, td")) {
+          let txt = (cell.innerText || "").replace(/\s+/g, " ").trim();
+          txt = txt.replace(/\|/g, "¦").replace(/\n/g, " ");
+          cells.push(txt);
+        }
+        if (cells.length > 0) allRows.push({ cells, isHeader: tr.querySelectorAll("th").length > 0 });
+      }
+      if (allRows.length < 1) continue;
+      const totalRows = allRows.length;
+      const totalCols = Math.max(...allRows.map(r => r.cells.length));
+      for (const row of allRows) { while (row.cells.length < totalCols) row.cells.push(""); }
+      const truncated = totalRows > maxTableRows;
+      const displayRows = truncated ? allRows.slice(0, maxTableRows) : allRows;
+      let headerRow = null;
+      let dataRows = displayRows;
+      if (displayRows.length > 0 && displayRows[0].isHeader) {
+        headerRow = displayRows[0].cells;
+        dataRows = displayRows.slice(1);
+      } else if (displayRows.length > 1) {
+        const firstRow = displayRows[0].cells;
+        if (firstRow.every(c => c.length < 30 && c.length > 0)) {
+          headerRow = firstRow;
+          dataRows = displayRows.slice(1);
+        }
+      }
+      let md = "";
+      if (headerRow) {
+        md += "| " + headerRow.join(" | ") + " |\n";
+        md += "| " + headerRow.map(() => "---").join(" | ") + " |\n";
+      } else {
+        const ah = [];
+        for (let i = 0; i < totalCols; i++) ah.push("Col_" + (i + 1));
+        md += "| " + ah.join(" | ") + " |\n";
+        md += "| " + ah.map(() => "---").join(" | ") + " |\n";
+      }
+      for (const row of dataRows) { md += "| " + row.cells.join(" | ") + " |\n"; }
+      if (truncated) { md += "\n[... " + totalRows + " rows total, showing first " + maxTableRows + " ...]"; }
+      const stats = {};
+      if (headerRow && allRows.length > 3) {
+        for (let ci = 0; ci < totalCols; ci++) {
+          const nums = [];
+          for (const row of allRows.slice(1)) {
+            const v = parseFloat(row.cells[ci].replace(/[,$%¥€£]/g, ""));
+            if (!isNaN(v)) nums.push(v);
+          }
+          if (nums.length > allRows.length * 0.5) {
+            const colName = headerRow[ci] || ("Col_" + (ci + 1));
+            const sum = nums.reduce((a, b) => a + b, 0);
+            stats[colName] = { min: Math.min(...nums), max: Math.max(...nums), avg: Math.round(sum / nums.length * 100) / 100, count: nums.length };
+          }
+        }
+      }
+      tables.push({
+        tag: "table", text: md.trim(),
+        table_meta: { rows: totalRows, cols: totalCols, has_header: !!headerRow, truncated, caption: caption || null, heading: heading || null, stats: Object.keys(stats).length > 0 ? stats : null }
+      });
+      if (tables.length >= 20) break;
+    }
+  }
+
+  const title = (document.title || "").trim() || null;
+  const url = location.href;
+  return { title, url, blocks, tables };
+}
+"""
+
+READABILITY_EVAL = r"""
+(maxChars) => {
+  const doc = document.cloneNode(true);
+  doc.querySelectorAll("script, style, noscript, iframe").forEach(n => n.remove());
+  const reader = new Readability(doc);
+  const parsed = reader.parse();
+  if (!parsed) return null;
+
+  let text = (parsed.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+  if (text.length > maxChars) text = text.slice(0, maxChars);
+
+  return {
+    title: parsed.title || document.title || null,
+    byline: parsed.byline || null,
+    excerpt: parsed.excerpt || null,
+    siteName: parsed.siteName || null,
+    url: location.href,
+    text
+  };
+}
+"""
+
+# Standalone table extraction JS for Readability mode (Readability strips tables)
+EXTRACT_TABLES_JS = r"""
+(maxTableRows, maxTables) => {
+  function visible(el) {
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.visibility === "hidden" || style.display === "none") return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    return true;
+  }
+  const tables = [];
+  const tableEls = document.querySelectorAll("table");
+  for (const tbl of tableEls) {
+    if (!visible(tbl)) continue;
+    const capEl = tbl.querySelector("caption");
+    const caption = capEl ? (capEl.innerText || "").replace(/\s+/g, " ").trim() : "";
+    let heading = caption;
+    if (!heading) {
+      let prev = tbl.previousElementSibling;
+      for (let i = 0; i < 3 && prev; i++) {
+        const tag = prev.tagName.toLowerCase();
+        if (["h1","h2","h3","h4","h5","h6"].includes(tag)) {
+          heading = (prev.innerText || "").replace(/\s+/g, " ").trim().slice(0, 120);
+          break;
+        }
+        prev = prev.previousElementSibling;
+      }
+    }
+    const allRows = [];
+    for (const tr of tbl.querySelectorAll("tr")) {
+      const cells = [];
+      for (const cell of tr.querySelectorAll("th, td")) {
+        let txt = (cell.innerText || "").replace(/\s+/g, " ").trim();
+        txt = txt.replace(/\|/g, "¦").replace(/\n/g, " ");
+        cells.push(txt);
+      }
+      if (cells.length > 0) allRows.push({ cells, isHeader: tr.querySelectorAll("th").length > 0 });
+    }
+    if (allRows.length < 1) continue;
+    const totalRows = allRows.length;
+    const totalCols = Math.max(...allRows.map(r => r.cells.length));
+    for (const row of allRows) { while (row.cells.length < totalCols) row.cells.push(""); }
+    const truncated = totalRows > maxTableRows;
+    const displayRows = truncated ? allRows.slice(0, maxTableRows) : allRows;
+    let headerRow = null;
+    let dataRows = displayRows;
+    if (displayRows.length > 0 && displayRows[0].isHeader) {
+      headerRow = displayRows[0].cells;
+      dataRows = displayRows.slice(1);
+    } else if (displayRows.length > 1) {
+      const firstRow = displayRows[0].cells;
+      if (firstRow.every(c => c.length < 30 && c.length > 0)) {
+        headerRow = firstRow;
+        dataRows = displayRows.slice(1);
+      }
+    }
+    let md = "";
+    if (headerRow) {
+      md += "| " + headerRow.join(" | ") + " |\n";
+      md += "| " + headerRow.map(() => "---").join(" | ") + " |\n";
+    } else {
+      const ah = [];
+      for (let i = 0; i < totalCols; i++) ah.push("Col_" + (i + 1));
+      md += "| " + ah.join(" | ") + " |\n";
+      md += "| " + ah.map(() => "---").join(" | ") + " |\n";
+    }
+    for (const row of dataRows) { md += "| " + row.cells.join(" | ") + " |\n"; }
+    if (truncated) { md += "\n[... " + totalRows + " rows total, showing first " + maxTableRows + " ...]"; }
+    const stats = {};
+    if (headerRow && allRows.length > 3) {
+      for (let ci = 0; ci < totalCols; ci++) {
+        const nums = [];
+        for (const row of allRows.slice(1)) {
+          const v = parseFloat(row.cells[ci].replace(/[,$%¥€£]/g, ""));
+          if (!isNaN(v)) nums.push(v);
+        }
+        if (nums.length > allRows.length * 0.5) {
+          const colName = headerRow[ci] || ("Col_" + (ci + 1));
+          const sum = nums.reduce((a, b) => a + b, 0);
+          stats[colName] = { min: Math.min(...nums), max: Math.max(...nums), avg: Math.round(sum / nums.length * 100) / 100, count: nums.length };
+        }
+      }
+    }
+    tables.push({
+      tag: "table", text: md.trim(),
+      table_meta: { rows: totalRows, cols: totalCols, has_header: !!headerRow, truncated, caption: caption || null, heading: heading || null, stats: Object.keys(stats).length > 0 ? stats : null }
+    });
+    if (tables.length >= maxTables) break;
+  }
+  return tables;
+}
+"""
+
+ACTIONS_DOM_JS = r"""
+(maxActions) => {
+  function visible(el) {
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.visibility === "hidden" || style.display === "none") return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    return true;
+  }
+
+  function getName(el) {
+    const aria = el.getAttribute("aria-label");
+    if (aria && aria.trim()) return aria.trim().slice(0, 200);
+    const title = el.getAttribute("title");
+    if (title && title.trim()) return title.trim().slice(0, 200);
+    const ph = el.getAttribute("placeholder");
+    if (ph && ph.trim()) return ph.trim().slice(0, 200);
+    const txt = (el.innerText || "").replace(/\s+/g, " ").trim();
+    if (txt) return txt.slice(0, 200);
+    if (el.value && typeof el.value === "string") return el.value.slice(0, 200);
+    return "";
+  }
+
+  function roleOf(el) {
+    const r = (el.getAttribute("role") || "").toLowerCase().trim();
+    if (r) return r;
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (tag === "a") return "link";
+    if (tag === "button") return "button";
+    if (tag === "input") {
+      if (["button","submit","reset"].includes(type)) return "button";
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      return "textbox";
+    }
+    if (tag === "textarea") return "textbox";
+    if (tag === "select") return "combobox";
+    return "generic";
+  }
+
+  function cssPath(el) {
+    const id = el.getAttribute("id");
+    if (id && /^[A-Za-z][A-Za-z0-9\-_:.]{1,60}$/.test(id)) return `#${CSS.escape(id)}`;
+    const dt = el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-qa");
+    if (dt && dt.length < 80) return `${el.tagName.toLowerCase()}[data-testid="${dt}"]`;
+    const aria = el.getAttribute("aria-label");
+    if (aria && aria.length < 80) return `${el.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g,'\\"')}"]`;
+
+    let p = el;
+    let parts = [];
+    for (let i=0;i<4 && p && p.nodeType===1 && p !== document.body;i++) {
+      const tag = p.tagName.toLowerCase();
+      const parent = p.parentElement;
+      if (!parent) break;
+      const siblings = Array.from(parent.children).filter(x => x.tagName === p.tagName);
+      const idx = siblings.indexOf(p) + 1;
+      parts.unshift(`${tag}:nth-of-type(${idx})`);
+      p = parent;
+    }
+    return parts.length ? parts.join(" > ") : el.tagName.toLowerCase();
+  }
+
+  const selector = [
+    "button", "a[href]", "input", "textarea", "select",
+    "[role='button']", "[role='link']", "[role='textbox']",
+    "[role='combobox']", "[onclick]", "[tabindex]"
+  ].join(",");
+
+  const all = Array.from(document.querySelectorAll(selector));
+  const out = [];
+
+  for (const el of all) {
+    if (!visible(el)) continue;
+    const role = roleOf(el);
+    if (role === "generic") continue;
+
+    const name = getName(el);
+    const tag = el.tagName.toLowerCase();
+    const isInputLike = ["input","textarea","select"].includes(tag) || ["textbox","combobox"].includes(role);
+    if (!name && !isInputLike) continue;
+
+    const actions = [];
+    if (["button","link","checkbox","radio","menuitem","tab"].includes(role)) actions.push("click");
+    if (role === "textbox") actions.push("type");
+    if (role === "combobox") actions.push("select");
+    actions.push("scroll_into_view");
+
+    out.push({ role, name, strategy: { css: cssPath(el) }, actions });
+    if (out.length >= maxActions) break;
+  }
+  return out;
+}
+"""
+
+MAP_BOX_TO_ELEMENT = r"""
+(cx, cy) => {
+  const el = document.elementFromPoint(cx, cy);
+  if (!el) return null;
+
+  const interactive = el.closest(
+    "button, a[href], input, textarea, select, [role='button'], [role='link'], [role='textbox'], [role='combobox'], [tabindex]"
+  );
+  const target = interactive || el;
+
+  function nameOf(x) {
+    const aria = x.getAttribute("aria-label");
+    if (aria && aria.trim()) return aria.trim().slice(0,200);
+    const title = x.getAttribute("title");
+    if (title && title.trim()) return title.trim().slice(0,200);
+    const ph = x.getAttribute("placeholder");
+    if (ph && ph.trim()) return ph.trim().slice(0,200);
+    const txt = (x.innerText || "").replace(/\s+/g, " ").trim();
+    if (txt) return txt.slice(0,200);
+    return "";
+  }
+
+  function roleOf(x) {
+    const r = (x.getAttribute("role") || "").toLowerCase().trim();
+    if (r) return r;
+    const tag = x.tagName.toLowerCase();
+    const type = (x.getAttribute("type") || "").toLowerCase();
+    if (tag === "a") return "link";
+    if (tag === "button") return "button";
+    if (tag === "input") {
+      if (["button","submit","reset"].includes(type)) return "button";
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      return "textbox";
+    }
+    if (tag === "textarea") return "textbox";
+    if (tag === "select") return "combobox";
+    return tag;
+  }
+
+  function cssPath(x) {
+    const id = x.getAttribute("id");
+    if (id && /^[A-Za-z][A-Za-z0-9\-_:.]{1,60}$/.test(id)) return `#${CSS.escape(id)}`;
+    const dt = x.getAttribute("data-testid") || x.getAttribute("data-test") || x.getAttribute("data-qa");
+    if (dt && dt.length < 80) return `${x.tagName.toLowerCase()}[data-testid="${dt}"]`;
+    const aria = x.getAttribute("aria-label");
+    if (aria && aria.length < 80) return `${x.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g,'\\"')}"]`;
+    return x.tagName.toLowerCase();
+  }
+
+  return { role: roleOf(target), name: nameOf(target), css: cssPath(target) };
+}
+"""
+
+
+# ============================================================
+# ✅ WebMCP Discovery + Invocation JS
+# ============================================================
+WEBMCP_DISCOVER_JS = r"""
+() => {
+  const result = {
+    available: false,
+    imperative_tools: [],
+    declarative_tools: [],
+    errors: []
+  };
+
+  // ---- 1. Imperative API: navigator.modelContext ----
+  try {
+    const mc = navigator.modelContext;
+    if (mc) {
+      result.available = true;
+      // Chrome 146+ exposes getTools() or .tools property
+      let tools = [];
+      if (typeof mc.getTools === 'function') {
+        tools = mc.getTools();
+      } else if (mc.tools && Array.isArray(mc.tools)) {
+        tools = mc.tools;
+      }
+      for (const t of tools) {
+        result.imperative_tools.push({
+          name: t.name || "",
+          description: t.description || "",
+          inputSchema: t.inputSchema || null,
+          readOnly: !!(t.annotations && t.annotations.readOnlyHint),
+          source: "webmcp_imperative"
+        });
+      }
+    }
+  } catch(e) {
+    result.errors.push("imperative: " + e.message);
+  }
+
+  // ---- 2. Declarative API: form[toolname] ----
+  try {
+    const forms = document.querySelectorAll("form[toolname]");
+    for (const form of forms) {
+      const toolName = form.getAttribute("toolname") || "";
+      const toolDesc = form.getAttribute("tooldescription") || "";
+      const autoSubmit = form.hasAttribute("toolautosubmit");
+      if (!toolName) continue;
+
+      const properties = {};
+      const required = [];
+      const fields = form.querySelectorAll("input, textarea, select");
+      for (const f of fields) {
+        const name = f.getAttribute("name");
+        if (!name) continue;
+        const paramDesc = f.getAttribute("toolparamdescription") || "";
+        const tag = f.tagName.toLowerCase();
+        const type = (f.getAttribute("type") || "text").toLowerCase();
+        let fieldType = "string";
+        if (type === "number" || type === "range") fieldType = "number";
+        if (type === "checkbox") fieldType = "boolean";
+        const prop = { type: fieldType };
+        if (paramDesc) prop.description = paramDesc;
+        if (f.getAttribute("placeholder")) {
+          prop.description = (prop.description ? prop.description + " " : "") + "(e.g. " + f.getAttribute("placeholder") + ")";
+        }
+        if (tag === "select") {
+          const opts = Array.from(f.querySelectorAll("option")).map(o => o.value).filter(v => v);
+          if (opts.length > 0) prop.enum = opts;
+        }
+        properties[name] = prop;
+        if (f.hasAttribute("required")) required.push(name);
+      }
+
+      result.declarative_tools.push({
+        name: toolName,
+        description: toolDesc,
+        inputSchema: { type: "object", properties, required },
+        autoSubmit,
+        readOnly: false,
+        source: "webmcp_declarative"
+      });
+    }
+  } catch(e) {
+    result.errors.push("declarative: " + e.message);
+  }
+
+  return result;
+}
+"""
+
+WEBMCP_INVOKE_IMPERATIVE_JS = r"""
+async (toolName, params) => {
+  const mc = navigator.modelContext;
+  if (!mc) throw new Error("modelContext not available");
+
+  // Prefer invokeTool if browser exposes it
+  if (typeof mc.invokeTool === 'function') {
+    const result = await mc.invokeTool(toolName, params);
+    return { success: true, result };
+  }
+
+  // Fallback: find tool's execute callback
+  let tool = null;
+  if (typeof mc.getTools === 'function') {
+    tool = mc.getTools().find(t => t.name === toolName);
+  } else if (mc.tools && Array.isArray(mc.tools)) {
+    tool = mc.tools.find(t => t.name === toolName);
+  }
+  if (!tool) throw new Error("tool not found: " + toolName);
+  if (typeof tool.execute !== 'function') throw new Error("tool has no execute: " + toolName);
+
+  const result = await tool.execute(params);
+  return { success: true, result };
+}
+"""
+
+WEBMCP_INVOKE_DECLARATIVE_JS = r"""
+async (toolName, params, autoSubmit) => {
+  const form = document.querySelector('form[toolname="' + toolName + '"]');
+  if (!form) throw new Error("form not found: " + toolName);
+
+  // Fill form fields
+  for (const [key, value] of Object.entries(params)) {
+    const field = form.querySelector('[name="' + key + '"]');
+    if (!field) continue;
+    const tag = field.tagName.toLowerCase();
+    const type = (field.getAttribute("type") || "text").toLowerCase();
+
+    if (tag === "select") {
+      field.value = value;
+      field.dispatchEvent(new Event("change", { bubbles: true }));
+    } else if (type === "checkbox") {
+      field.checked = !!value;
+      field.dispatchEvent(new Event("change", { bubbles: true }));
+    } else if (type === "radio") {
+      const radio = form.querySelector('[name="' + key + '"][value="' + value + '"]');
+      if (radio) { radio.checked = true; radio.dispatchEvent(new Event("change", { bubbles: true })); }
+    } else {
+      field.value = value;
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+      field.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }
+
+  if (autoSubmit) {
+    form.requestSubmit();
+    await new Promise(r => setTimeout(r, 500));
+    return { success: true, submitted: true };
+  }
+
+  return { success: true, submitted: false, message: "Fields populated. autoSubmit not enabled." };
+}
+"""
+
+
+# ============================================================
+# Readability loader
+# ============================================================
+def _load_readability_js():
+    global READABILITY_JS, READABILITY_AVAILABLE
+    try:
+        READABILITY_JS = READABILITY_JS_PATH.read_text(encoding="utf-8")
+        READABILITY_AVAILABLE = True
+    except Exception:
+        READABILITY_JS = None
+        READABILITY_AVAILABLE = False
+
+
+# ============================================================
+# YOLO init + decode helpers (onnxruntime)
+# ============================================================
+def _init_yolo():
+    global YOLO_ENABLED, YOLO_SESSION, YOLO_INPUT_NAME, YOLO_OUTPUT_NAMES
+    if not YOLO_ONNX_PATH:
+        YOLO_ENABLED = False
+        return
+    try:
+        import onnxruntime as ort
+        YOLO_SESSION = ort.InferenceSession(YOLO_ONNX_PATH, providers=["CPUExecutionProvider"])
+        YOLO_INPUT_NAME = YOLO_SESSION.get_inputs()[0].name
+        YOLO_OUTPUT_NAMES = [o.name for o in YOLO_SESSION.get_outputs()]
+        YOLO_ENABLED = True
+    except Exception:
+        YOLO_ENABLED = False
+        YOLO_SESSION = None
+
+
+def _letterbox(img: Image.Image, new_size: int = 640, color=(114, 114, 114)):
+    w, h = img.size
+    r = min(new_size / w, new_size / h)
+    nw, nh = int(round(w * r)), int(round(h * r))
+    img_resized = img.resize((nw, nh), Image.BILINEAR)
+
+    canvas = Image.new("RGB", (new_size, new_size), color)
+    pad_w = (new_size - nw) // 2
+    pad_h = (new_size - nh) // 2
+    canvas.paste(img_resized, (pad_w, pad_h))
+
+    arr = np.asarray(canvas).astype(np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    arr = np.expand_dims(arr, 0)
+    return arr, r, (pad_w, pad_h)
+
+
+def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+        inds = np.where(iou <= iou_thresh)[0]
+        order = order[inds + 1]
+
+    return keep
+
+
+def _decode_yolov8_like(out: np.ndarray, conf_thresh: float):
+    if out.ndim == 3:
+        out = out[0]
+    pred = out.T
+    boxes = pred[:, :4]
+    cls_scores = pred[:, 4:]
+    class_ids = np.argmax(cls_scores, axis=1)
+    scores = cls_scores[np.arange(cls_scores.shape[0]), class_ids]
+
+    mask = scores >= conf_thresh
+    boxes, scores, class_ids = boxes[mask], scores[mask], class_ids[mask]
+
+    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+    return xyxy, scores, class_ids
+
+
+def yolo_detect_ui_components(
+    image_bytes: bytes, conf_thresh: float, iou_thresh: float, max_boxes: int,
+) -> List[Dict[str, Any]]:
+    if not YOLO_ENABLED or YOLO_SESSION is None:
+        return []
+
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    inp, ratio, (pad_w, pad_h) = _letterbox(img, YOLO_INPUT_SIZE)
+
+    outputs = YOLO_SESSION.run(YOLO_OUTPUT_NAMES, {YOLO_INPUT_NAME: inp})
+    xyxy, scores, class_ids = _decode_yolov8_like(outputs[0], conf_thresh=conf_thresh)
+    if xyxy.size == 0:
+        return []
+
+    keep = _nms_xyxy(xyxy, scores, iou_thresh=iou_thresh)[:max_boxes]
+
+    w0, h0 = img.size
+    dets = []
+    for i in keep:
+        x1, y1, x2, y2 = xyxy[i]
+        x1 = float(np.clip((x1 - pad_w) / ratio, 0, w0 - 1))
+        y1 = float(np.clip((y1 - pad_h) / ratio, 0, h0 - 1))
+        x2 = float(np.clip((x2 - pad_w) / ratio, 0, w0 - 1))
+        y2 = float(np.clip((y2 - pad_h) / ratio, 0, h0 - 1))
+
+        cid = int(class_ids[i])
+        dets.append({
+            "bbox": [x1, y1, x2, y2],
+            "class_id": cid,
+            "type": YOLO_CLASS_MAP.get(cid, f"class_{cid}"),
+            "score": float(scores[i]),
+        })
+    return dets
+
+
+# ============================================================
+# Distill: blocks -> stable sections
+# ============================================================
+def _blocks_to_sections_stable(
+    blocks: List[Dict[str, str]],
+    max_sections: int,
+    max_section_chars: int,
+    total_budget: int,
+    tables: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    # (heading, text, type, table_meta)
+    sections_raw: List[Tuple[Optional[str], str, str, Optional[Dict]]] = []
+    cur_h: Optional[str] = None
+    cur: List[str] = []
+
+    def flush():
+        nonlocal cur_h, cur
+        if not cur:
+            return
+        txt = _normalize("\n\n".join(cur))
+        if not txt:
+            cur = []
+            return
+        txt = _clip(txt, max_section_chars)
+        sections_raw.append((cur_h, txt, "text", None))
+        cur = []
+
+    for b in blocks:
+        tag = b.get("tag")
+        text = (b.get("text") or "").strip()
+        if not text:
+            continue
+        if tag in ("h1", "h2", "h3"):
+            flush()
+            cur_h = text[:120]
+            continue
+        cur.append(text)
+        if len(cur) > 40:
+            flush()
+            cur_h = None
+        if len(sections_raw) >= max_sections:
+            break
+    flush()
+
+    # Tables appended as separate sections after text sections
+    if tables:
+        for tbl in tables:
+            if len(sections_raw) >= max_sections:
+                break
+            tbl_text = (tbl.get("text") or "").strip()
+            if not tbl_text:
+                continue
+            tbl_meta = tbl.get("table_meta") or {}
+            tbl_heading = tbl_meta.get("heading") or tbl_meta.get("caption") or None
+            if not tbl_heading:
+                first_line = tbl_text.split("\n")[0].replace("|", " ").strip()
+                if first_line:
+                    tbl_heading = f"{t("table_prefix")} {_smart_truncate(first_line, 60)}"
+                else:
+                    tbl_heading = t("table_prefix")
+            else:
+                tbl_heading = f"{t("table_prefix")} {tbl_heading}"
+            tbl_text_clipped = _clip(tbl_text, max_section_chars)
+            sections_raw.append((tbl_heading, tbl_text_clipped, "table", tbl_meta))
+
+    out: List[Dict[str, Any]] = []
+    used = 0
+    seen = set()
+
+    for (h, t, sec_type, tbl_meta) in sections_raw[:max_sections]:
+        if used >= total_budget:
+            break
+        remain = total_budget - used
+        if len(t) > remain:
+            t = _clip(t, max(220, remain))
+
+        sid = _make_stable_sid(h, t)
+        if sid in seen:
+            sid = sid + "_" + str(len(seen))
+        seen.add(sid)
+
+        # Auto-use first sentence as heading when empty
+        effective_h = h
+        if not effective_h:
+            first_sentence = re.split(r'[.!?。！？\n]', t)[0].strip()
+            if first_sentence and len(first_sentence) > 10:
+                effective_h = _smart_truncate(first_sentence, 80)
+
+        section: Dict[str, Any] = {"sid": sid, "h": effective_h, "t": t, "type": sec_type}
+        if sec_type == "table" and tbl_meta:
+            section["table_meta"] = tbl_meta
+        out.append(section)
+        used += len(t)
+
+    return out
+
+
+# ============================================================
+# Actions: DOM + A11y + Vision
+# ============================================================
+async def _extract_actions_dom(page: Page, max_actions: int) -> List[Dict[str, Any]]:
+    raw = await page.evaluate(ACTIONS_DOM_JS, max_actions)
+    actions = []
+    for ra in raw:
+        role = (ra.get("role") or "").strip()
+        name = (ra.get("name") or "").strip()
+        css = (ra.get("strategy") or {}).get("css") or ""
+        acts = ra.get("actions") or _pick_action_methods(role)
+
+        if name and role in ("button", "link", "checkbox", "radio", "textbox", "combobox"):
+            strategy = {"type": "role", "role": role, "name": name}
+        else:
+            strategy = {"type": "css", "selector": css}
+
+        aid = _aid({"role": role, "name": name, "strategy": strategy})
+        actions.append({
+            "aid": aid, "role": role, "name": name, "strategy": strategy,
+            "actions": acts, "confidence": 0.8, "source": "dom",
+        })
+    return actions
+
+
+async def _extract_actions_a11y(page: Page, max_actions: int) -> Tuple[List[Dict[str, Any]], str]:
+    # 1) Preferred: accessibility.snapshot
+    try:
+        acc = getattr(page, "accessibility", None)
+        if acc is not None and hasattr(acc, "snapshot"):
+            snap = await acc.snapshot(interesting_only=False)
+            out: List[Tuple[str, str]] = []
+
+            def walk(node):
+                if not node:
+                    return
+                role = (node.get("role") or "").lower()
+                name = (node.get("name") or "").strip()
+                if role in ("button", "link", "textbox", "combobox", "checkbox", "radio") and name:
+                    out.append((role, name))
+                for ch in node.get("children") or []:
+                    walk(ch)
+
+            walk(snap)
+
+            seen = set()
+            uniq: List[Tuple[str, str]] = []
+            for r, n in out:
+                if (r, n) not in seen:
+                    seen.add((r, n))
+                    uniq.append((r, n))
+                    if len(uniq) >= max_actions:
+                        break
+
+            actions: List[Dict[str, Any]] = []
+            for role, name in uniq:
+                strategy = {"type": "role", "role": role, "name": name}
+                aid = _aid({"role": role, "name": name, "strategy": strategy})
+                actions.append({
+                    "aid": aid, "role": role, "name": name, "strategy": strategy,
+                    "actions": _pick_action_methods(role), "confidence": 0.85, "source": "a11y",
+                })
+            return actions, "accessibility.snapshot"
+    except Exception:
+        pass
+
+    # 2) Fallback: aria snapshot
+    try:
+        snap_text = await page.locator("body").aria_snapshot()
+    except Exception:
+        return [], "unavailable"
+
+    roles = {"button", "link", "textbox", "combobox", "checkbox", "radio"}
+    out2: List[Tuple[str, str]] = []
+    line_re = re.compile(r'^\s*-\s*([A-Za-z0-9_-]+)\s+"(.*)"\s*$', re.M)
+
+    for mm in line_re.finditer(snap_text or ""):
+        role = (mm.group(1) or "").strip().lower()
+        name = (mm.group(2) or "").strip()
+        if role in roles and name:
+            out2.append((role, name.replace(r'\"', '"')))
+        if len(out2) >= max_actions * 3:
+            break
+
+    seen = set()
+    uniq2: List[Tuple[str, str]] = []
+    for r, n in out2:
+        if (r, n) not in seen:
+            seen.add((r, n))
+            uniq2.append((r, n))
+            if len(uniq2) >= max_actions:
+                break
+
+    actions2: List[Dict[str, Any]] = []
+    for role, name in uniq2:
+        strategy = {"type": "role", "role": role, "name": name}
+        aid = _aid({"role": role, "name": name, "strategy": strategy})
+        actions2.append({
+            "aid": aid, "role": role, "name": name, "strategy": strategy,
+            "actions": _pick_action_methods(role), "confidence": 0.82, "source": "a11y",
+        })
+    return actions2, "aria_snapshot"
+
+
+async def _extract_actions_vision(page: Page, req: DistillRequest) -> List[Dict[str, Any]]:
+    if not YOLO_ENABLED or not req.enable_vision_fallback:
+        return []
+
+    try:
+        img_bytes = await page.screenshot(full_page=False)
+    except Exception:
+        return []
+
+    dets = yolo_detect_ui_components(
+        image_bytes=img_bytes,
+        conf_thresh=req.vision_conf_thresh,
+        iou_thresh=req.vision_iou_thresh,
+        max_boxes=req.vision_max_boxes,
+    )
+    if not dets:
+        return []
+
+    actions: List[Dict[str, Any]] = []
+    for d in dets:
+        x1, y1, x2, y2 = d["bbox"]
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+        info = await page.evaluate(MAP_BOX_TO_ELEMENT, cx, cy)
+        if not info:
+            continue
+
+        role = (info.get("role") or "").strip().lower()
+        name = (info.get("name") or "").strip()
+        css = (info.get("css") or "").strip()
+
+        if d.get("type") == "textbox" and role in ("div", "span", "generic", ""):
+            role = "textbox"
+        if not role:
+            role = "button"
+
+        if name and role in ("button", "link", "checkbox", "radio", "textbox", "combobox"):
+            strategy = {"type": "role", "role": role, "name": name}
+        else:
+            if not css:
+                continue
+            strategy = {"type": "css", "selector": css}
+
+        aid = _aid({"role": role, "name": name, "strategy": strategy})
+        actions.append({
+            "aid": aid, "role": role, "name": name, "strategy": strategy,
+            "actions": _pick_action_methods(role),
+            "confidence": float(d.get("score", 0.6)), "source": "vision",
+        })
+    return actions
+
+
+# ============================================================
+# ✅ WebMCP: discover + invoke
+# ============================================================
+async def _discover_webmcp_tools(session: Session, force: bool = False) -> Dict[str, Any]:
+    """Discover WebMCP tools on page (imperative + declarative), cached per session."""
+    if not force and session.webmcp_tools is not None:
+        return {"available": session.webmcp_available, "tools": session.webmcp_tools, "errors": []}
+
+    try:
+        raw = await session.page.evaluate(WEBMCP_DISCOVER_JS)
+    except Exception as e:
+        logger.warning("webmcp discover failed: %s", e)
+        session.webmcp_available = False
+        session.webmcp_tools = []
+        return {"available": False, "tools": [], "errors": [str(e)]}
+
+    available = raw.get("available", False)
+    all_tools: List[Dict[str, Any]] = []
+
+    for t in raw.get("imperative_tools", []):
+        all_tools.append({
+            "name": t.get("name", ""), "description": t.get("description", ""),
+            "input_schema": t.get("inputSchema"), "read_only": t.get("readOnly", False),
+            "source": "webmcp_imperative",
+        })
+
+    for t in raw.get("declarative_tools", []):
+        all_tools.append({
+            "name": t.get("name", ""), "description": t.get("description", ""),
+            "input_schema": t.get("inputSchema"), "read_only": t.get("readOnly", False),
+            "auto_submit": t.get("autoSubmit", False), "source": "webmcp_declarative",
+        })
+        if not available:
+            available = True
+
+    session.webmcp_available = available
+    session.webmcp_tools = all_tools
+    return {"available": available, "tools": all_tools, "errors": raw.get("errors", [])}
+
+
+async def _invoke_webmcp_tool(
+    session: Session, tool_name: str, params: Dict[str, Any], timeout_ms: int = 30000
+) -> Dict[str, Any]:
+    """Invoke a WebMCP tool (auto-detect imperative vs declarative)."""
+    if session.webmcp_tools is None:
+        await _discover_webmcp_tools(session)
+
+    tool = next((t for t in (session.webmcp_tools or []) if t["name"] == tool_name), None)
+    if not tool:
+        return {"success": False, "error": f"tool not found: {tool_name}"}
+
+    url_before = session.page.url
+    try:
+        if tool["source"] == "webmcp_imperative":
+            result = await session.page.evaluate(WEBMCP_INVOKE_IMPERATIVE_JS, tool_name, params)
+        elif tool["source"] == "webmcp_declarative":
+            auto_submit = tool.get("auto_submit", False)
+            result = await session.page.evaluate(WEBMCP_INVOKE_DECLARATIVE_JS, tool_name, params, auto_submit)
+        else:
+            return {"success": False, "error": f"unknown source: {tool['source']}"}
+
+        try:
+            await session.page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 5000))
+        except Exception:
+            pass
+        await _maybe_switch_to_new_page(session)
+
+        return {"success": True, "result": result, "url_before": url_before, "url_after": session.page.url}
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {e}",
+                "url_before": url_before, "url_after": session.page.url}
+
+
+# ============================================================
+# Distill core
+# ============================================================
+async def _distill(session: Session, req: DistillRequest) -> Dict[str, Any]:
+    page = session.page
+    url = page.url
+    title = None
+
+    # optional wait_for_selector (SPA-friendly)
+    if req.wait_for_selector:
+        try:
+            await page.wait_for_selector(req.wait_for_selector, timeout=req.wait_for_timeout_ms)
+        except Exception:
+            pass  # best-effort, continue on timeout
+
+    mode = req.distill_mode
+    if mode == "auto":
+        mode = "readability" if READABILITY_AVAILABLE else "simple"
+
+    blocks: List[Dict[str, str]] = []
+    readability_meta = {}
+    extracted_tables: List[Dict[str, Any]] = []
+
+    if mode == "readability":
+        if not READABILITY_AVAILABLE or not READABILITY_JS:
+            mode = "simple"
+        else:
+            # avoid re-injecting Readability.js
+            already = await page.evaluate("typeof Readability !== 'undefined'")
+            if not already:
+                await page.add_script_tag(content=READABILITY_JS)
+
+            data = await page.evaluate(READABILITY_EVAL, 40000)
+            if not data or not (data.get("text") or "").strip():
+                mode = "simple"
+            else:
+                title = data.get("title") or await page.title()
+                url = data.get("url") or page.url
+                readability_meta = {
+                    "byline": data.get("byline"),
+                    "excerpt": data.get("excerpt"),
+                    "siteName": data.get("siteName"),
+                }
+                paras = [p.strip() for p in (data.get("text") or "").split("\n\n") if p.strip()]
+                for p in paras[:2000]:
+                    blocks.append({"tag": "p", "text": p})
+
+                # Table extraction: Readability strips <table>, extract from original DOM
+                if req.extract_tables:
+                    try:
+                        extracted_tables = await page.evaluate(
+                            EXTRACT_TABLES_JS, req.max_table_rows, req.max_tables
+                        ) or []
+                    except Exception:
+                        extracted_tables = []
+
+    if mode == "simple":
+        dist = await page.evaluate(DISTILL_SIMPLE_JS, req.extract_tables, req.max_table_rows)
+        blocks = dist.get("blocks") or []
+        extracted_tables = dist.get("tables") or []
+        url = dist.get("url") or page.url
+        title = dist.get("title") or await page.title()
+
+    sections = _blocks_to_sections_stable(
+        blocks=blocks,
+        max_sections=req.max_sections,
+        max_section_chars=req.max_section_chars,
+        total_budget=req.total_text_budget_chars,
+        tables=extracted_tables if req.extract_tables else None,
+    )
+
+    joined = "\n\n".join(s["t"] for s in sections)
+    content_hash = _hash_text((title or "") + "\n" + (url or "") + "\n" + joined)
+
+    a11y_attempted = False
+    a11y_mode = None
+    a11y_error = None
+    webmcp_result: Dict[str, Any] = {"available": False, "tools": [], "errors": []}
+
+    actions: List[Dict[str, Any]] = []
+    if req.include_actions:
+        # WebMCP: prefer structured tools (highest confidence)
+        webmcp_result = await _discover_webmcp_tools(session)
+        for wt in webmcp_result.get("tools", []):
+            aid = _aid({"webmcp": wt["name"], "source": wt["source"]})
+            actions.append({
+                "aid": aid, "role": "webmcp_tool",
+                "name": f"[WebMCP] {wt['name']}: {(wt.get('description') or '')[:80]}",
+                "strategy": {
+                    "type": "webmcp", "tool_name": wt["name"],
+                    "source": wt["source"], "input_schema": wt.get("input_schema"),
+                },
+                "actions": ["invoke"],
+                "confidence": 0.95,
+                "source": wt["source"],
+            })
+
+        # Original DOM extraction
+        actions.extend(await _extract_actions_dom(page, max_actions=req.max_actions))
+
+        if req.enable_a11y_fallback and len(actions) < req.min_actions_before_fallback:
+            a11y_attempted = True
+            try:
+                a11y_actions, a11y_mode = await _extract_actions_a11y(page, max_actions=req.max_actions)
+                actions.extend(a11y_actions)
+            except Exception as e:
+                a11y_error = f"{type(e).__name__}: {e}"
+
+        if req.enable_vision_fallback and len(actions) < req.min_actions_before_fallback:
+            actions.extend(await _extract_actions_vision(page, req))
+
+        actions = _dedup_actions(actions)
+
+    # Table stats
+    table_sections = [s for s in sections if s.get("type") == "table"]
+
+    meta = {
+        "mode": mode,
+        "readability_available": READABILITY_AVAILABLE,
+        "yolo_enabled": YOLO_ENABLED,
+        "a11y": {
+            "attempted": a11y_attempted, "mode": a11y_mode,
+            "error": (a11y_error[:200] if a11y_error else None),
+        },
+        # WebMCP: meta info
+        "webmcp": {
+            "available": webmcp_result.get("available", False),
+            "tools_count": len(webmcp_result.get("tools", [])),
+            "errors": webmcp_result.get("errors", []),
+        },
+        "blocks_count": len(blocks),
+        "sections_count": len(sections),
+        "table_sections_count": len(table_sections),
+        "tables_extracted": len(extracted_tables),
+        "actions_count_raw": len(actions),
+        "readability": readability_meta,
+    }
+
+    sections, actions, meta = _apply_total_output_budget(
+        sections=sections, actions=actions, meta=meta,
+        total_budget=req.total_output_budget_chars,
+        min_actions_to_keep=req.min_actions_to_keep,
+        name_max=req.max_action_name_chars,
+        selector_max=req.max_selector_chars,
+    )
+
+    meta["actions_count"] = len(actions)
+    meta["sections_count"] = len(sections)
+    meta["budget"] = {
+        "total_output_budget_chars": req.total_output_budget_chars,
+        "total_text_budget_chars": req.total_text_budget_chars,
+        "max_actions": req.max_actions,
+        "min_actions_to_keep": req.min_actions_to_keep,
+    }
+
+    session.last_distill = {
+        "url": url, "title": title, "content_hash": content_hash,
+        "sections": sections, "actions": actions, "meta": meta,
+    }
+    session.action_map = {a["aid"]: a for a in actions}
+    return session.last_distill
+
+
+async def _ensure_session(session_id: str) -> Session:
+    sess = await sessions.get(session_id)
+    if not sess:
+        raise HTTPException(404, "session not found or expired")
+    return sess
+
+
+# ============================================================
+# Action executor
+# ============================================================
+async def _locate(page: Page, strategy: Dict[str, Any]):
+    stype = strategy.get("type")
+    if stype == "role":
+        return page.get_by_role(strategy["role"], name=strategy.get("name") or "").first
+    if stype == "css":
+        sel = strategy.get("selector") or ""
+        if not sel:
+            raise RuntimeError("empty css selector")
+        return page.locator(sel).first
+    raise RuntimeError(f"unknown strategy type: {stype}")
+
+
+# detect popup/new tab, switch to latest page
+async def _maybe_switch_to_new_page(sess: Session):
+    pages = sess.context.pages
+    if len(pages) > 1 and pages[-1] != sess.page:
+        sess.page = pages[-1]
+        logger.info("switched to new tab: %s", sess.page.url)
+
+
+# ============================================================
+# lifespan replaces deprecated on_event
+# ============================================================
+_pw = None
+_browser: Optional[Browser] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pw, _browser
+    _load_readability_js()
+    _init_yolo()
+
+    _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-extensions",
+            # WebMCP: enable Chrome 146+ WebMCP features
+            "--enable-features=WebMCP",
+        ],
+    )
+
+    # background cleanup task
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await sessions.cleanup()
+            except Exception:
+                logger.exception("cleanup error")
+
+    cleanup_task = asyncio.create_task(cleanup_loop())
+
+    yield  # ---- app running ----
+
+    cleanup_task.cancel()
+    await sessions.close_all()
+
+    if _browser:
+        await _browser.close()
+    if _pw:
+        await _pw.stop()
+
+
+app = FastAPI(title="Agent Browser Service (Playwright + WebMCP)", version="0.6.0", lifespan=lifespan)
+
+
+# ============================================================
+# Routes
+# ============================================================
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "sessions": len(sessions),
+        "readability_available": READABILITY_AVAILABLE,
+        "readability_js_path": str(READABILITY_JS_PATH),
+        "yolo_enabled": YOLO_ENABLED,
+        "yolo_onnx_path": YOLO_ONNX_PATH,
+        "yolo_input_size": YOLO_INPUT_SIZE,
+        "webmcp_support": True,  # ✅ WebMCP
+    }
+
+
+@app.post("/session/new", response_model=NewSessionResponse)
+async def new_session(req: NewSessionRequest):
+    if not _browser:
+        raise HTTPException(500, "browser not ready")
+
+    context = await _browser.new_context(
+        user_agent=req.user_agent,
+        locale=req.lang,
+        viewport=req.viewport,
+        storage_state=req.storage_state,
+        extra_http_headers={"Accept-Language": f"{req.lang},en;q=0.9"},
+    )
+    await _setup_routing(context, req.block_resources)
+    page = await context.new_page()
+
+    # secrets.token_hex replaces sha1(time) to avoid collision
+    sid = "s_" + secrets.token_hex(8)
+    sess = Session(context=context, page=page, lang=req.lang)
+    await sessions.put(sid, sess)
+    return NewSessionResponse(session_id=sid)
+
+
+@app.post("/session/goto", response_model=GotoResponse)
+async def goto(req: GotoRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:  # concurrency lock
+        try:
+            await sess.page.goto(req.url, wait_until=req.wait_until, timeout=req.timeout_ms)
+        except Exception as e:
+            raise HTTPException(502, f"goto failed: {e}")
+        # WebMCP: new page needs tool re-discovery
+        sess.webmcp_tools = None
+        sess.webmcp_available = False
+        title = None
+        try:
+            title = await sess.page.title()
+        except Exception:
+            pass
+        return GotoResponse(session_id=req.session_id, url=sess.page.url, title=title)
+
+
+@app.post("/session/distill", response_model=DistillResponse)
+async def distill(req: DistillRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:  # concurrency lock
+        old = sess.last_distill if req.include_diff else None
+
+        try:
+            out = await _distill(sess, req)
+        except Exception as e:
+            raise HTTPException(500, f"distill failed: {e}")
+
+        if req.include_diff and old:
+            out["meta"]["diff"] = {
+                "url_changed": old.get("url") != out.get("url"),
+                "hash_changed": old.get("content_hash") != out.get("content_hash"),
+                **_sections_diff(old.get("sections", []), out.get("sections", [])),
+                **_actions_diff(old.get("actions", []), out.get("actions", [])),
+            }
+        elif req.include_diff and not old:
+            out["meta"]["diff"] = {"note": "no_previous_snapshot"}
+
+        return DistillResponse(
+            url=out["url"], title=out["title"], content_hash=out["content_hash"],
+            sections=[Section(**s) for s in out["sections"]],
+            actions=[ActionDescriptor(**a) for a in out["actions"]] if req.include_actions else [],
+            meta=out["meta"],
+        )
+
+
+@app.post("/session/read_sections", response_model=ReadSectionsResponse)
+async def read_sections(req: ReadSectionsRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:  # concurrency lock
+        if not sess.last_distill:
+            await _distill(sess, DistillRequest(session_id=req.session_id, include_actions=False))
+
+        out = sess.last_distill
+        sec_map = {s["sid"]: s for s in out["sections"]}
+        picked = []
+        for sid in req.section_ids:
+            s = sec_map.get(sid)
+            if not s:
+                continue
+            picked.append({"sid": sid, "h": s.get("h"), "t": _clip(s.get("t", ""), req.max_section_chars)})
+
+        avail = [s["sid"] for s in out["sections"][:60]]
+
+        return ReadSectionsResponse(
+            url=out["url"], title=out["title"], content_hash=out["content_hash"],
+            picked_sections=[Section(**s) for s in picked],
+            available_section_ids=avail,
+        )
+
+
+@app.post("/session/act", response_model=ActResponse)
+async def act(req: ActRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:  # concurrency lock
+        if not sess.last_distill:
+            await _distill(sess, DistillRequest(session_id=req.session_id))
+
+        before = sess.last_distill
+        before_url = sess.page.url
+        before_hash = before["content_hash"]
+        before_sections = before["sections"]
+        before_actions_n = len(before["actions"])
+
+        ad = (sess.action_map or {}).get(req.aid)
+        if not ad:
+            await _distill(sess, DistillRequest(session_id=req.session_id))
+            ad = (sess.action_map or {}).get(req.aid)
+        if not ad:
+            raise HTTPException(404, "aid not found")
+
+        try:
+            # WebMCP: route to invoke instead of DOM action
+            if ad.get("strategy", {}).get("type") == "webmcp":
+                tool_name = ad["strategy"]["tool_name"]
+                params = {}
+                if req.text:
+                    try:
+                        params = json.loads(req.text)
+                    except Exception:
+                        params = {"input": req.text}
+                invoke_result = await _invoke_webmcp_tool(sess, tool_name, params, timeout_ms=req.timeout_ms)
+                if not invoke_result.get("success"):
+                    raise HTTPException(500, f"webmcp invoke failed: {invoke_result.get('error')}")
+            else:
+                # Original DOM action path
+                locator = await _locate(sess.page, ad["strategy"])
+
+                # best-effort wait for element visibility
+                try:
+                    await locator.wait_for(state="visible", timeout=3000)
+                except Exception:
+                    pass
+
+                if req.action == "click":
+                    await locator.click(timeout=req.timeout_ms)
+                elif req.action == "type":
+                    if req.text is None:
+                        raise HTTPException(422, "type requires text")
+                    await locator.fill(req.text, timeout=req.timeout_ms)
+                elif req.action == "select":
+                    if req.value is None:
+                        raise HTTPException(422, "select requires value")
+                    await locator.select_option(req.value, timeout=req.timeout_ms)
+                elif req.action == "scroll_into_view":
+                    await locator.scroll_into_view_if_needed(timeout=req.timeout_ms)
+                else:
+                    raise HTTPException(422, "unknown action")
+
+                try:
+                    await sess.page.wait_for_load_state(req.wait_until, timeout=req.timeout_ms)
+                except Exception:
+                    pass
+
+                # detect popup/new tab
+                await _maybe_switch_to_new_page(sess)
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"act failed: {e}")
+
+        new_out = await _distill(sess, DistillRequest(session_id=req.session_id))
+        after_url = sess.page.url
+        after_hash = new_out["content_hash"]
+        after_sections = new_out["sections"]
+        after_actions_n = len(new_out["actions"])
+
+        sec_diff = _sections_diff(before_sections, after_sections)
+        changed = {
+            "url_changed": before_url != after_url,
+            "hash_changed": before_hash != after_hash,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "sections_before": len(before_sections),
+            "sections_after": len(after_sections),
+            "actions_before": before_actions_n,
+            "actions_after": after_actions_n,
+            **sec_diff,
+        }
+
+        top_sections = [Section(**s) for s in after_sections[:req.top_k_sections]] if req.return_top_sections else []
+        actions_sample = [ActionDescriptor(**a) for a in new_out["actions"][:12]]
+
+        title = None
+        try:
+            title = await sess.page.title()
+        except Exception:
+            title = new_out.get("title")
+
+        return ActResponse(
+            url_before=before_url, url_after=after_url, title=title,
+            changed=changed, top_sections=top_sections, actions_sample=actions_sample,
+        )
+
+
+# /session/scroll endpoint
+@app.post("/session/scroll", response_model=NavigateResponse)
+async def scroll(req: ScrollRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:
+        delta = req.pixels if req.direction == "down" else -req.pixels
+        await sess.page.evaluate(f"window.scrollBy(0, {delta})")
+
+        # wait for possible lazy-load
+        await asyncio.sleep(0.3)
+
+        title = None
+        try:
+            title = await sess.page.title()
+        except Exception:
+            pass
+        return NavigateResponse(url=sess.page.url, title=title)
+
+
+# /session/navigate endpoint (back / forward)
+@app.post("/session/navigate", response_model=NavigateResponse)
+async def navigate(req: NavigateRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:
+        try:
+            if req.direction == "back":
+                await sess.page.go_back(wait_until=req.wait_until, timeout=req.timeout_ms)
+            else:
+                await sess.page.go_forward(wait_until=req.wait_until, timeout=req.timeout_ms)
+        except Exception as e:
+            raise HTTPException(502, f"navigate {req.direction} failed: {e}")
+
+        title = None
+        try:
+            title = await sess.page.title()
+        except Exception:
+            pass
+        return NavigateResponse(url=sess.page.url, title=title)
+
+
+# WebMCP: discover page-exposed tools
+@app.post("/session/webmcp_discover", response_model=WebMCPDiscoverResponse)
+async def webmcp_discover(req: WebMCPDiscoverRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:
+        result = await _discover_webmcp_tools(sess, force=req.force_refresh)
+        return WebMCPDiscoverResponse(
+            session_id=req.session_id,
+            url=sess.page.url,
+            webmcp_available=result.get("available", False),
+            tools=[
+                WebMCPToolDescriptor(
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    input_schema=t.get("input_schema"),
+                    read_only=t.get("read_only", False),
+                    auto_submit=t.get("auto_submit"),
+                    source=t.get("source", "webmcp"),
+                )
+                for t in result.get("tools", [])
+            ],
+            errors=result.get("errors", []),
+        )
+
+
+# WebMCP: invoke tool directly (bypass DOM)
+@app.post("/session/webmcp_invoke", response_model=WebMCPInvokeResponse)
+async def webmcp_invoke(req: WebMCPInvokeRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:
+        url_before = sess.page.url
+        result = await _invoke_webmcp_tool(
+            sess, req.tool_name, req.params, timeout_ms=req.timeout_ms
+        )
+        return WebMCPInvokeResponse(
+            session_id=req.session_id,
+            tool_name=req.tool_name,
+            success=result.get("success", False),
+            result=result.get("result"),
+            error=result.get("error"),
+            url_before=url_before,
+            url_after=sess.page.url,
+        )
+
+
+@app.post("/session/export_storage_state")
+async def export_storage_state(req: ExportStorageRequest):
+    sess = await _ensure_session(req.session_id)
+    async with sess.lock:
+        state = await sess.context.storage_state()
+        return {"storage_state": state}
+
+
+# Pydantic model instead of Dict[str, Any]
+@app.post("/session/close")
+async def close_session(req: CloseSessionRequest):
+    await sessions.remove(req.session_id)
+    return {"ok": True}
