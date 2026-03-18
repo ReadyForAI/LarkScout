@@ -29,7 +29,7 @@ Repository = "https://github.com/ReadyForAI/LarkScout"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["larkscout*", "services*"]
+include = ["larkscout*", "services*", "providers*"]
 
 [tool.ruff]
 target-version = "py311"
@@ -49,3 +49,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v"
+markers = [
+    "live: requires a running LarkScout server (localhost:9898) and network access",
+    "live_llm: requires a running server AND a configured LLM API key",
+]

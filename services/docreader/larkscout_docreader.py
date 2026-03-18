@@ -6,7 +6,6 @@
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
 import os
@@ -68,69 +67,22 @@ class ParsedDocument:
 
 
 # ═══════════════════════════════════════════
-# Gemini API wrapper
+# LLM provider wrapper
 # ═══════════════════════════════════════════
-
-_client = None
-_model_name = "gemini-2.5-flash"
-
-
-def _init_gemini():
-    """Lazy-init Gemini client."""
-    global _client
-    if _client is not None:
-        return
-
-    try:
-        from google import genai
-    except ImportError:
-        raise RuntimeError(t("gemini_not_installed"))
-
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError(t("gemini_key_missing"))
-
-    _client = genai.Client(api_key=api_key)
 
 
 def gemini_ocr(image_bytes: bytes, page_num: int) -> str:
-    """OCR a single page image via Gemini Vision."""
-    _init_gemini()
-    import PIL.Image
+    """OCR a single page image via the active LLM provider."""
+    from providers import get_provider
 
-    img = PIL.Image.open(io.BytesIO(image_bytes))
-    ocr_prompt = prompt("ocr")
-
-    try:
-        response = _client.models.generate_content(
-            model=_model_name,
-            contents=[ocr_prompt, img],
-        )
-        return response.text.strip()
-    except Exception as e:
-        logger.warning(f"OCR failed for page {page_num}: {e}")
-        return t("ocr_failed", page=page_num)
+    return get_provider().ocr(image_bytes, page_num)
 
 
-def gemini_summarize(text: str, prompt: str, max_retries: int = 2) -> str:
-    """Generate summary via Gemini Flash."""
-    _init_gemini()
-    full_prompt = f"{prompt}\n\n---\n\n{text}"
+def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
+    """Generate summary via the active LLM provider."""
+    from providers import get_provider
 
-    for attempt in range(max_retries + 1):
-        try:
-            response = _client.models.generate_content(
-                model=_model_name,
-                contents=full_prompt,
-            )
-            return response.text.strip()
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Summary retry ({attempt + 1}/{max_retries}): {e}")
-                time.sleep(2 ** attempt)
-            else:
-                logger.error(f"Summary generation failed: {e}")
-                return t("summary_failed")
+    return get_provider().summarize(text, summarize_prompt, max_retries=max_retries)
 
 
 # ═══════════════════════════════════════════
@@ -400,6 +352,112 @@ def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
     return ParsedDocument(
         filename=filepath.name, file_type="docx", total_pages=est_pages,
         pages=pages, sections=sections, table_count=table_count,
+    )
+
+
+# ═══════════════════════════════════════════
+# XLSX parsing
+# ═══════════════════════════════════════════
+
+def parse_xlsx(filepath: Path) -> ParsedDocument:
+    """Parse an XLSX workbook; each sheet becomes one section and one Markdown table."""
+    import openpyxl
+
+    logger.info(f"Parsing XLSX: {filepath.name}")
+    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+
+    sections: list[Section] = []
+    pages: list[PageContent] = []
+    table_count = 0
+
+    for idx, sheet_name in enumerate(wb.sheetnames, 1):
+        ws = wb[sheet_name]
+        rows: list[list[str]] = []
+        for row in ws.iter_rows(values_only=True):
+            str_row = [str(cell) if cell is not None else "" for cell in row]
+            if any(c.strip() for c in str_row):
+                rows.append(str_row)
+
+        if not rows:
+            continue
+
+        md_table = _rows_to_markdown(rows)
+        page = PageContent(page_num=idx, text=md_table, tables=[md_table] if md_table else [])
+        pages.append(page)
+
+        if md_table:
+            table_count += 1
+
+        sid = _section_sid(sheet_name, md_table)
+        sections.append(Section(
+            index=idx,
+            title=sheet_name,
+            level=1,
+            text=md_table,
+            page_range=f"sheet {idx}",
+            sid=sid,
+        ))
+
+    wb.close()
+
+    logger.info(f"XLSX parse complete: {len(sections)} sheets, {table_count} tables")
+    return ParsedDocument(
+        filename=filepath.name,
+        file_type="xlsx",
+        total_pages=max(len(pages), 1),
+        pages=pages,
+        sections=sections,
+        table_count=table_count,
+    )
+
+
+# ═══════════════════════════════════════════
+# CSV parsing
+# ═══════════════════════════════════════════
+
+def parse_csv(filepath: Path) -> ParsedDocument:
+    """Parse a CSV file; the entire file becomes one section and one Markdown table."""
+    import csv
+
+    logger.info(f"Parsing CSV: {filepath.name}")
+
+    # Try UTF-8-with-BOM first (common Excel export), fall back to latin-1
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(filepath, newline="", encoding=encoding) as f:
+                reader = csv.reader(f)
+                rows: list[list[str]] = [
+                    row for row in reader if any(cell.strip() for cell in row)
+                ]
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        rows = []
+
+    md_table = _rows_to_markdown(rows) if rows else ""
+    page = PageContent(page_num=1, text=md_table, tables=[md_table] if md_table else [])
+
+    stem = filepath.stem
+    sid = _section_sid(stem, md_table)
+    section = Section(
+        index=1,
+        title=stem,
+        level=1,
+        text=md_table,
+        page_range="sheet 1",
+        sid=sid,
+    )
+
+    table_count = 1 if md_table else 0
+    logger.info(f"CSV parse complete: {len(rows)} rows, {table_count} tables")
+    return ParsedDocument(
+        filename=filepath.name,
+        file_type="csv",
+        total_pages=1,
+        pages=[page],
+        sections=[section] if md_table else [],
+        table_count=table_count,
     )
 
 
@@ -995,7 +1053,7 @@ async def health():
         "ok": True,
         "version": "3.0.0",
         "docs_dir": str(_get_docs_dir()),
-        "supported_formats": ["pdf", "docx"],
+        "supported_formats": ["pdf", "docx", "xlsx", "csv"],
     }
 
 
@@ -1019,7 +1077,7 @@ async def api_parse_doc(
     # Check format
     filename = file.filename or "unknown"
     suffix = Path(filename).suffix.lower()
-    if suffix not in (".pdf", ".docx"):
+    if suffix not in (".pdf", ".docx", ".xlsx", ".csv"):
         raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
     # Parse tags
@@ -1051,10 +1109,14 @@ async def api_parse_doc(
                 max_tables_per_page=max_tables_per_page,
                 concurrency=concurrency, cache_dir=docs_dir / d_id,
             ))
-        else:
+        elif suffix == ".docx":
             parsed = await loop.run_in_executor(None, lambda: parse_word(
                 tmp_path, extract_tables=extract_tables,
             ))
+        elif suffix == ".xlsx":
+            parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
+        else:  # .csv
+            parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
     except Exception as e:
         raise HTTPException(500, t("parse_failed", err=str(e)))
     finally:

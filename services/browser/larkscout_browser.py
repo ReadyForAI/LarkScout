@@ -7,8 +7,10 @@ import re
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -36,6 +38,12 @@ SESSION_TTL_SECONDS = 30 * 60  # 30 min idle
 SESSION_MAXSIZE = 200
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# ---- Document library (shared with docreader) ----
+_DEFAULT_DOCS_DIR = Path(os.environ.get(
+    "DOCS_DIR",
+    os.path.expanduser("~/.openclaw/subworkspace/shared/docs"),
+))
 
 # ---- Readability.js local file ----
 READABILITY_JS_PATH = Path(os.getenv("READABILITY_JS_PATH", str(BASE_DIR / "readability.js")))
@@ -90,7 +98,7 @@ class SessionManager:
     def __len__(self):
         return len(self._sessions)
 
-    async def put(self, sid: str, sess: Session):
+    async def put(self, sid: str, sess: Session) -> None:
         async with self._lock:
             # evict oldest
             if len(self._sessions) >= self._maxsize:
@@ -115,14 +123,14 @@ class SessionManager:
             self._sessions.move_to_end(sid)
             return sess
 
-    async def remove(self, sid: str):
+    async def remove(self, sid: str) -> None:
         async with self._lock:
             item = self._sessions.pop(sid, None)
             if item:
                 _, sess = item
                 await self._close_session(sess)
 
-    async def cleanup(self):
+    async def cleanup(self) -> None:
         """Periodic cleanup of expired sessions."""
         async with self._lock:
             now = time.time()
@@ -132,7 +140,7 @@ class SessionManager:
                 logger.info("session expired (cleanup): %s", sid)
                 await self._close_session(sess)
 
-    async def close_all(self):
+    async def close_all(self) -> None:
         async with self._lock:
             for sid, (_, sess) in self._sessions.items():
                 await self._close_session(sess)
@@ -337,6 +345,25 @@ class WebMCPInvokeResponse(BaseModel):
     url_after: str
 
 
+class CaptureRequest(BaseModel):
+    """Request body for POST /capture (one-shot web capture)."""
+
+    url: str
+    tags: list[str] = []
+    extract_tables: bool = True
+    lang: str = DEFAULT_LANG
+    timeout_ms: int = 25000
+
+
+class CaptureResponse(BaseModel):
+    """Response from POST /capture."""
+
+    doc_id: str
+    digest: str
+    section_count: int
+    table_count: int
+
+
 # ============================================================
 # Utilities
 # ============================================================
@@ -435,7 +462,7 @@ def _rank_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     src_w = {"dom": 0.03, "a11y": 0.02, "vision": 0.01}
     role_w = {"textbox": 0.03, "button": 0.02, "combobox": 0.02, "link": 0.015, "checkbox": 0.01, "radio": 0.01}
 
-    def score(a):
+    def score(a) -> float:
         c = float(a.get("confidence", 0.7))
         c += src_w.get(a.get("source", "dom"), 0.0)
         c += role_w.get(a.get("role", ""), 0.0)
@@ -559,7 +586,7 @@ async def _setup_routing(context: BrowserContext, block_resources: bool):
     if not block_resources:
         return
 
-    async def route_handler(route):
+    async def route_handler(route) -> None:
         req = route.request
         if req.resource_type in _BLOCKED_RESOURCE_TYPES:
             return await route.abort()
@@ -1286,7 +1313,7 @@ def _blocks_to_sections_stable(
     cur_h: str | None = None
     cur: list[str] = []
 
-    def flush():
+    def flush() -> None:
         nonlocal cur_h, cur
         if not cur:
             return
@@ -1401,7 +1428,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict
             snap = await acc.snapshot(interesting_only=False)
             out: list[tuple[str, str]] = []
 
-            def walk(node):
+            def walk(node) -> None:
                 if not node:
                     return
                 role = (node.get("role") or "").lower()
@@ -1797,8 +1824,154 @@ _pw = None
 _browser: Browser | None = None
 
 
+# ============================================================
+# Document library helpers (shared with docreader)
+# ============================================================
+
+def _get_docs_dir() -> Path:
+    """Return the document library root, creating it if necessary."""
+    d = _DEFAULT_DOCS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _next_web_doc_id(docs_dir: Path) -> str:
+    """Allocate the next WEB-xxx doc ID using a file-based counter."""
+    counter_path = docs_dir / ".web_counter"
+    counter = 1
+    if counter_path.exists():
+        try:
+            counter = int(counter_path.read_text().strip())
+        except ValueError:
+            counter = 1
+    doc_id = f"WEB-{counter:03d}"
+    counter_path.write_text(str(counter + 1))
+    return doc_id
+
+
+def _build_web_digest(title: str | None, sections: list[dict[str, Any]], max_chars: int = 600) -> str:
+    """Build a short digest from page title and section headings/snippets."""
+    parts: list[str] = []
+    if title:
+        parts.append(f"# {title}")
+    for sec in sections:
+        if sec.get("type") == "table":
+            continue
+        h = sec.get("h") or ""
+        snippet = (sec.get("t") or "")[:120]
+        parts.append(f"## {h}\n{snippet}" if h else snippet)
+        if sum(len(p) for p in parts) >= max_chars:
+            break
+    return "\n\n".join(parts)[:max_chars]
+
+
+def _persist_web_capture(
+    doc_id: str,
+    url: str,
+    title: str | None,
+    sections: list[dict[str, Any]],
+    digest: str,
+    tags: list[str],
+    content_hash: str,
+    docs_dir: Path,
+) -> None:
+    """Write a web capture to the document library and update doc-index.json."""
+    doc_dir = docs_dir / doc_id
+    sections_dir = doc_dir / "sections"
+    tables_dir = doc_dir / "tables"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    sections_dir.mkdir(exist_ok=True)
+
+    now_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    text_sections = [s for s in sections if s.get("type") != "table"]
+    table_sections = [s for s in sections if s.get("type") == "table"]
+
+    # digest.md
+    (doc_dir / "digest.md").write_text(
+        f"# {doc_id}: {title or url}\n\n{digest}\n", encoding="utf-8"
+    )
+
+    # sections/
+    for i, sec in enumerate(text_sections, 1):
+        sid = sec.get("sid", f"s_{i:03d}")
+        h = sec.get("h") or ""
+        body = sec.get("t", "")
+        safe_h = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", h).strip().replace(" ", "-")[:40] or "section"
+        fname = f"{i:02d}-{sid}-{safe_h}.md"
+        header = f"## {h}\n\n" if h else ""
+        (sections_dir / fname).write_text(f"{header}{body}\n", encoding="utf-8")
+
+    # tables/
+    if table_sections:
+        tables_dir.mkdir(exist_ok=True)
+        for i, tbl in enumerate(table_sections, 1):
+            h = tbl.get("h") or f"Table {i}"
+            body = tbl.get("t", "")
+            meta = tbl.get("table_meta") or {}
+            meta_comment = f"\n<!-- table_meta: {json.dumps(meta)} -->\n" if meta else ""
+            (tables_dir / f"table-{i:02d}.md").write_text(
+                f"# {h}\n\n{body}\n{meta_comment}", encoding="utf-8"
+            )
+
+    # manifest.json
+    manifest: dict[str, Any] = {
+        "doc_id": doc_id,
+        "filename": title or url,
+        "file_type": "web_capture",
+        "source": "web_capture",
+        "paths": {
+            "digest": "digest.md",
+            "sections_dir": "sections/",
+            **({"tables_dir": "tables/"} if table_sections else {}),
+        },
+        "sections": [
+            {"sid": s.get("sid"), "h": s.get("h"), "char_count": len(s.get("t", "")), "type": s.get("type", "text")}
+            for s in sections
+        ],
+        "provenance": {
+            "source": "web_capture",
+            "source_url": url,
+            "capture_time": now_str,
+            "content_hash": content_hash,
+        },
+    }
+    (doc_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # doc-index.json (v2, shared with docreader)
+    index_path = docs_dir / "doc-index.json"
+    if index_path.exists():
+        try:
+            with open(index_path, encoding="utf-8") as f:
+                index: dict[str, Any] = json.load(f)
+        except Exception:
+            index = {"version": 2, "documents": []}
+    else:
+        index = {"version": 2, "documents": []}
+
+    index["version"] = 2
+    index["documents"] = [d for d in index["documents"] if d.get("id") != doc_id]
+    index["documents"].append({
+        "id": doc_id,
+        "filename": title or url,
+        "file_type": "web_capture",
+        "source": "web_capture",
+        "source_url": url,
+        "sections": len(sections),
+        "tables": len(table_sections),
+        "digest": digest[:200],
+        "digest_path": f"docs/{doc_id}/digest.md",
+        "tags": tags,
+        "created_at": now_str,
+        "content_hash": content_hash,
+    })
+    index["last_updated"] = now_str
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _pw, _browser
     _load_readability_js()
     _init_yolo()
@@ -1819,7 +1992,7 @@ async def lifespan(app: FastAPI):
     )
 
     # background cleanup task
-    async def cleanup_loop():
+    async def cleanup_loop() -> None:
         while True:
             await asyncio.sleep(60)
             try:
@@ -1847,7 +2020,7 @@ app = FastAPI(title="Agent Browser Service (Playwright + WebMCP)", version="0.6.
 # Routes
 # ============================================================
 @app.get("/health")
-async def health():
+async def health() -> dict:
     return {
         "ok": True,
         "sessions": len(sessions),
@@ -1861,7 +2034,7 @@ async def health():
 
 
 @app.post("/session/new", response_model=NewSessionResponse)
-async def new_session(req: NewSessionRequest):
+async def new_session(req: NewSessionRequest) -> NewSessionResponse:
     if not _browser:
         raise HTTPException(500, "browser not ready")
 
@@ -1883,7 +2056,7 @@ async def new_session(req: NewSessionRequest):
 
 
 @app.post("/session/goto", response_model=GotoResponse)
-async def goto(req: GotoRequest):
+async def goto(req: GotoRequest) -> GotoResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         try:
@@ -1902,7 +2075,7 @@ async def goto(req: GotoRequest):
 
 
 @app.post("/session/distill", response_model=DistillResponse)
-async def distill(req: DistillRequest):
+async def distill(req: DistillRequest) -> DistillResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         old = sess.last_distill if req.include_diff else None
@@ -1931,7 +2104,7 @@ async def distill(req: DistillRequest):
 
 
 @app.post("/session/read_sections", response_model=ReadSectionsResponse)
-async def read_sections(req: ReadSectionsRequest):
+async def read_sections(req: ReadSectionsRequest) -> ReadSectionsResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         if not sess.last_distill:
@@ -1956,7 +2129,7 @@ async def read_sections(req: ReadSectionsRequest):
 
 
 @app.post("/session/act", response_model=ActResponse)
-async def act(req: ActRequest):
+async def act(req: ActRequest) -> ActResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         if not sess.last_distill:
@@ -2062,7 +2235,7 @@ async def act(req: ActRequest):
 
 # /session/scroll endpoint
 @app.post("/session/scroll", response_model=NavigateResponse)
-async def scroll(req: ScrollRequest):
+async def scroll(req: ScrollRequest) -> NavigateResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         delta = req.pixels if req.direction == "down" else -req.pixels
@@ -2081,7 +2254,7 @@ async def scroll(req: ScrollRequest):
 
 # /session/navigate endpoint (back / forward)
 @app.post("/session/navigate", response_model=NavigateResponse)
-async def navigate(req: NavigateRequest):
+async def navigate(req: NavigateRequest) -> NavigateResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         try:
@@ -2102,7 +2275,7 @@ async def navigate(req: NavigateRequest):
 
 # WebMCP: discover page-exposed tools
 @app.post("/session/webmcp_discover", response_model=WebMCPDiscoverResponse)
-async def webmcp_discover(req: WebMCPDiscoverRequest):
+async def webmcp_discover(req: WebMCPDiscoverRequest) -> WebMCPDiscoverResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         result = await _discover_webmcp_tools(sess, force=req.force_refresh)
@@ -2127,7 +2300,7 @@ async def webmcp_discover(req: WebMCPDiscoverRequest):
 
 # WebMCP: invoke tool directly (bypass DOM)
 @app.post("/session/webmcp_invoke", response_model=WebMCPInvokeResponse)
-async def webmcp_invoke(req: WebMCPInvokeRequest):
+async def webmcp_invoke(req: WebMCPInvokeRequest) -> WebMCPInvokeResponse:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         url_before = sess.page.url
@@ -2146,7 +2319,7 @@ async def webmcp_invoke(req: WebMCPInvokeRequest):
 
 
 @app.post("/session/export_storage_state")
-async def export_storage_state(req: ExportStorageRequest):
+async def export_storage_state(req: ExportStorageRequest) -> dict:
     sess = await _ensure_session(req.session_id)
     async with sess.lock:
         state = await sess.context.storage_state()
@@ -2155,6 +2328,71 @@ async def export_storage_state(req: ExportStorageRequest):
 
 # Pydantic model instead of Dict[str, Any]
 @app.post("/session/close")
-async def close_session(req: CloseSessionRequest):
+async def close_session(req: CloseSessionRequest) -> dict:
     await sessions.remove(req.session_id)
     return {"ok": True}
+
+
+@app.post("/capture", response_model=CaptureResponse)
+async def capture(req: CaptureRequest) -> CaptureResponse:
+    """One-shot web capture: navigate to URL, distill, persist to document library, return doc_id.
+
+    Internally runs: session/new → goto → distill → persist → session/close.
+    The session is always closed, even on error.
+    """
+    if not _browser:
+        raise HTTPException(500, "browser not ready")
+
+    context = await _browser.new_context(
+        user_agent=DEFAULT_UA,
+        locale=req.lang,
+        viewport={"width": 900, "height": 700},
+    )
+    await _setup_routing(context, block_resources=True)
+    page = await context.new_page()
+    sid = "s_" + secrets.token_hex(8)
+    sess = Session(context=context, page=page, lang=req.lang)
+    await sessions.put(sid, sess)
+
+    try:
+        try:
+            await sess.page.goto(req.url, wait_until="domcontentloaded", timeout=req.timeout_ms)
+        except Exception as e:
+            raise HTTPException(502, f"capture goto failed: {e}")
+
+        sess.webmcp_tools = None
+        sess.webmcp_available = False
+
+        distill_req = DistillRequest(
+            session_id=sid,
+            include_actions=False,
+            include_diff=False,
+            extract_tables=req.extract_tables,
+        )
+        try:
+            out = await _distill(sess, distill_req)
+        except Exception as e:
+            raise HTTPException(500, f"capture distill failed: {e}")
+
+        url = out["url"]
+        title = out.get("title")
+        sections: list[dict[str, Any]] = out["sections"]
+        content_hash: str = out["content_hash"]
+        table_sections = [s for s in sections if s.get("type") == "table"]
+
+        digest = _build_web_digest(title, sections)
+        docs_dir = _get_docs_dir()
+        doc_id = _next_web_doc_id(docs_dir)
+        _persist_web_capture(
+            doc_id=doc_id, url=url, title=title, sections=sections,
+            digest=digest, tags=req.tags, content_hash=content_hash, docs_dir=docs_dir,
+        )
+
+        return CaptureResponse(
+            doc_id=doc_id,
+            digest=digest,
+            section_count=len(sections),
+            table_count=len(table_sections),
+        )
+    finally:
+        await sessions.remove(sid)
