@@ -15,6 +15,8 @@ Final API surface (single port 9898):
 
 import os
 import sys
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -29,10 +31,19 @@ sys.path.insert(0, str(_ROOT / "services" / "docreader"))
 from larkscout_browser import app as browser_app  # noqa: E402
 from larkscout_docreader import app as doc_app  # noqa: E402
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Start sub-application lifespans (browser Playwright init, etc.)."""
+    async with browser_app.router.lifespan_context(browser_app):
+        yield
+
+
 app = FastAPI(
     title="LarkScout",
     version="0.1.0",
     description="Open-source data collection and document parsing platform by ReadyForAI.",
+    lifespan=lifespan,
 )
 
 
