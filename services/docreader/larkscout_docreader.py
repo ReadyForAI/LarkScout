@@ -980,14 +980,14 @@ def _next_doc_id(docs_dir: Path) -> str:
 # HTTP API（FastAPI）
 # ═══════════════════════════════════════════
 
-DEFAULT_DOCS_DIR = Path(os.environ.get(
-    "DOCS_DIR",
-    os.path.expanduser("~/.openclaw/subworkspace/shared/docs"),
+DOCS_DIR = Path(os.environ.get(
+    "LARKSCOUT_DOCS_DIR",
+    os.path.expanduser("~/.larkscout/docs"),
 ))
 
 
 def _get_docs_dir() -> Path:
-    d = DEFAULT_DOCS_DIR
+    d = DOCS_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1182,9 +1182,10 @@ async def library_search(
 
     documents = index.get("documents", [])
 
-    # Filter
+    # Filter — accept "web" as an alias for "web_capture"
     if file_type:
-        documents = [d for d in documents if d.get("file_type") == file_type]
+        _ft = "web_capture" if file_type == "web" else file_type
+        documents = [d for d in documents if d.get("file_type") == _ft]
 
     if tags:
         tag_list = [t.strip() for t in tags.split(",")]
@@ -1319,8 +1320,8 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8090"))
 
-    DEFAULT_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
     logger.info(f"LarkScout DocReader API v3.0 starting: {host}:{port}")
-    logger.info(f"Docs directory: {DEFAULT_DOCS_DIR}")
+    logger.info(f"Docs directory: {DOCS_DIR}")
 
     uvicorn.run(app, host=host, port=port)

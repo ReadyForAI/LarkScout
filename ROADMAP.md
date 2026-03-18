@@ -581,19 +581,78 @@ verify: ruff check tests/e2e/
 
 **Depends on:** TASK-010, TASK-011, TASK-012, TASK-013
 
+### TASK-015: Default Docs Directory Migration
+
+**Goal:** Replace OpenClaw legacy path with LarkScout's own default, configurable via environment variable.
+
+**Scope:**
+
+- Default docs directory: `~/.larkscout/docs` (was `~/.openclaw/subworkspace/shared/docs`)
+- Environment variable `LARKSCOUT_DOCS_DIR` overrides the default
+- Update `larkscout_docreader.py` — replace hardcoded/config path
+- Update `larkscout_browser.py` — web capture output path should use the same directory
+- Update `larkscout_server.py` — pass docs_dir to both sub-apps if needed
+- Auto-create directory if it doesn't exist on startup
+- Update CLAUDE.md and SKILL files if they reference the old path
+- Do NOT migrate existing data — just change the default going forward
+
+**AC:**
+
+```bash
+# AC-1: Old path not referenced in any Python file
+verify: ! grep -r "openclaw" services/ larkscout_server.py --include="*.py"
+
+# AC-2: Default path is ~/.larkscout/docs
+verify: python -c "
+import os, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'services/docreader')
+# Should not need LARKSCOUT_DOCS_DIR to get a valid default
+os.environ.pop('LARKSCOUT_DOCS_DIR', None)
+from larkscout_docreader import DOCS_DIR
+assert '.larkscout/docs' in str(DOCS_DIR), f'Expected .larkscout/docs, got {DOCS_DIR}'
+"
+
+# AC-3: Env var override works
+verify: LARKSCOUT_DOCS_DIR=/tmp/test-docs python -c "
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'services/docreader')
+from larkscout_docreader import DOCS_DIR
+assert str(DOCS_DIR) == '/tmp/test-docs', f'Expected /tmp/test-docs, got {DOCS_DIR}'
+"
+
+# AC-4: Health endpoint shows new path
+verify: timeout 5 bash -c 'python larkscout_server.py &
+  PID=$!; sleep 2;
+  RESP=$(curl -s http://127.0.0.1:9898/doc/health);
+  kill $PID;
+  echo "$RESP" | python -c "import sys,json; d=json.load(sys.stdin)[\"docs_dir\"]; assert \"openclaw\" not in d and \"larkscout\" in d, d"'
+
+# AC-5: Lint passes
+verify: ruff check services/ larkscout_server.py
+```
+
+**Depends on:** TASK-001
+
+```
+
+
 ---
 
 ## Task Dependency Graph
 
 ```
+
 Phase 0-3 (completed)
 ├── TASK-001 → TASK-002 → TASK-003
-│   ├── TASK-004 ─── TASK-010 (web capture e2e) ──┐
-│   ├── TASK-005 ─── TASK-011 (doc parse e2e) ────┤
-│   ├── TASK-006                                   ├── TASK-014 (full pipeline)
-│   ├── TASK-007 → TASK-008                        │
-│   └── TASK-009 ─── TASK-013 (SDK e2e) ──────────┤
-│                    TASK-012 (search e2e) ─────────┘
+│ ├── TASK-004 ─── TASK-010 (web capture e2e) ──┐
+│ ├── TASK-005 ─── TASK-011 (doc parse e2e) ────┤
+│ ├── TASK-006 ├── TASK-014 (full pipeline)
+│ ├── TASK-007 → TASK-008 │
+│ └── TASK-009 ─── TASK-013 (SDK e2e) ──────────┤
+│ TASK-012 (search e2e) ─────────┘
+
 ```
 
 ---
@@ -616,3 +675,5 @@ Phase 0-3 (completed)
 | TASK-012 | E2E: Cross search     | Not started |     |
 | TASK-013 | E2E: SDK round-trip   | Not started |     |
 | TASK-014 | E2E: Full pipeline    | Not started |     |
+| TASK-015 | Docs directory migration | Not started |      |
+```
