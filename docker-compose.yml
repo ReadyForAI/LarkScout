@@ -6,8 +6,9 @@ services:
     ports:
       - "9898:9898"
     volumes:
-      - ./docs:/app/docs  # volume: docs/ persisted outside the container
+      - larkscout-docs:/root/.larkscout/docs
     environment:
+      LARKSCOUT_DOCS_DIR: /root/.larkscout/docs
       # LLM provider (default: gemini)
       LARKSCOUT_LLM_PROVIDER: ${LARKSCOUT_LLM_PROVIDER:-gemini}
       # Gemini / Google AI credentials
@@ -18,3 +19,6 @@ services:
       LARKSCOUT_LLM_BASE_URL: ${LARKSCOUT_LLM_BASE_URL:-https://api.openai.com/v1}
       LARKSCOUT_LLM_MODEL: ${LARKSCOUT_LLM_MODEL:-}
     restart: unless-stopped
+
+volumes:
+  larkscout-docs:
