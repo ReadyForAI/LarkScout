@@ -982,7 +982,7 @@ def _next_doc_id(docs_dir: Path) -> str:
 
 DEFAULT_DOCS_DIR = Path(os.environ.get(
     "DOCS_DIR",
-    os.path.expanduser("~/.openclaw/subworkspace/shared/docs"),
+    os.path.expanduser("~/.larkscout/docs"),
 ))
 
 

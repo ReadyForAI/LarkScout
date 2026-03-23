@@ -42,7 +42,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # ---- Document library (shared with docreader) ----
 _DEFAULT_DOCS_DIR = Path(os.environ.get(
     "DOCS_DIR",
-    os.path.expanduser("~/.openclaw/subworkspace/shared/docs"),
+    os.path.expanduser("~/.larkscout/docs"),
 ))
 
 # ---- Readability.js local file ----
