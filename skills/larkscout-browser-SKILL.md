@@ -35,12 +35,12 @@ Use for: information gathering, research, competitive analysis, news/blog extrac
 
 ## 2. Service Dependency
 
-- External service: LarkScout Browser Service (FastAPI + Playwright) v3 (WebMCP)
+- External service: LarkScout Browser Service (FastAPI + Playwright)
 - Base URL: `http://127.0.0.1:9898/web/`
 
 ---
 
-## 3. WebMCP Overview (v3)
+## 3. WebMCP Overview
 
 ### 3.1 What Is WebMCP
 
@@ -75,7 +75,7 @@ Traditional Agents browse by "screenshot + guess DOM" to manipulate elements. We
 1. `POST /web/session/new` — create session
 2. `POST /web/session/goto` — open URL
 3. `POST /web/session/distill` — get skeleton: sections + actions (incl. WebMCP tools) + meta.diff
-4. **v3:** If `meta.webmcp.available=true`, prefer WebMCP tools (see §4.6)
+4. If `meta.webmcp.available=true`, prefer WebMCP tools (see §4.6)
 5. Need detailed reading: only call `POST /web/session/read_sections` for a few sids
 6. Need interaction: use `POST /web/session/act` to execute actions, then preferentially read `changed_sids`
 7. Need pagination / load more: use `POST /web/session/scroll` down, then `distill` for new content
@@ -125,11 +125,11 @@ Traditional Agents browse by "screenshot + guess DOM" to manipulate elements. We
 
 - Simple mode automatically detects direct text within div/section (text density detection), extracting content even without standard p/li tags
 
-### 4.6 WebMCP-First (Structured Tool Priority) (v3)
+### 4.6 WebMCP-First (Structured Tool Priority)
 
-**This is the most important new strategy in v3.** When a page supports WebMCP, always prefer structured tools over DOM operations.
+**This is the most important new strategy.** When a page supports WebMCP, always prefer structured tools over DOM operations.
 
-### 4.7 Table-First (Table Data Priority) (v3)
+### 4.7 Table-First (Table Data Priority)
 
 **When the task goal is data collection / price comparison / metric extraction, prioritize table sections.**
 
@@ -214,7 +214,7 @@ Verifies:
 - Service is online
 - Readability availability
 - YOLO enabled status
-- **v3:** `webmcp_support` field (always `true`, indicating server-side WebMCP support)
+- `webmcp_support` field (always `true`, indicating server-side WebMCP support)
 
 ### 5.2 Create Session
 
@@ -262,7 +262,7 @@ Recommendations:
 
 - Default `wait_until=domcontentloaded` (more stable and faster)
 - Use `load` for complex sites; avoid `networkidle` (tends to time out)
-- **v3:** After `goto`, WebMCP cache is automatically cleared — new pages require tool re-discovery (triggered automatically during distill or webmcp_discover)
+- After `goto`, WebMCP cache is automatically cleared — new pages require tool re-discovery (triggered automatically during distill or webmcp_discover)
 
 ### 5.4 Semantic Distillation (Core)
 
@@ -310,23 +310,23 @@ Key response fields:
   - `h`: Heading or auto-generated first-sentence summary; **table sections are prefixed with `[Table]`**
   - `t`: Paragraph body text; **table sections contain Markdown table text**
   - `sid`: Stable ID (hash based on heading + first 400 chars of text)
-  - **v3:** `type`: `"text"` or `"table"` — Agent uses this to distinguish text paragraphs from tables
-  - **v3:** `table_meta`: Only present when `type="table"` — contains row/col counts, header detection, truncation status, numeric statistics
-- `actions[]`: Executable actions (aid), **v3 now includes WebMCP tools**
+  - `type`: `"text"` or `"table"` — Agent uses this to distinguish text paragraphs from tables
+  - `table_meta`: Only present when `type="table"` — contains row/col counts, header detection, truncation status, numeric statistics
+- `actions[]`: Executable actions (aid), **now includes WebMCP tools**
 - `meta.diff`: Changes relative to the previous distill (changed_sids, etc.)
 - `meta.a11y`: A11y fallback status
-- **v3:** `meta.webmcp`: WebMCP tool discovery status
-- **v3:** `meta.tables_extracted`: Total `<table>` elements found on the page
-- **v3:** `meta.table_sections_count`: Number of tables included in sections
+- `meta.webmcp`: WebMCP tool discovery status
+- `meta.tables_extracted`: Total `<table>` elements found on the page
+- `meta.table_sections_count`: Number of tables included in sections
 
 **Caller notes:**
 
 - The body text field is `t` (not `text`), the heading field is `h` (not `heading`)
 - The section `sid` is a stable hash of heading + first 400 chars of body — always use the actual `sid` returned by distill
-- **v3:** Table sections have `type` = `"table"` and `h` prefixed with `[Table]`. Agent can quickly filter all tables via `type == "table"`
-- **v3:** Table section `table_meta.stats` provides numeric column statistical summaries — Agent can get key numbers without reading the full table
+- Table sections have `type` = `"table"` and `h` prefixed with `[Table]`. Agent can quickly filter all tables via `type == "table"`
+- Table section `table_meta.stats` provides numeric column statistical summaries — Agent can get key numbers without reading the full table
 
-**v3 Table Section Format Example:**
+**Table Section Format Example:**
 
 ```json
 {
@@ -365,7 +365,7 @@ Key response fields:
 - **Simple mode**: `DISTILL_SIMPLE_JS` extracts `<table>` alongside text blocks in a single JS call
 - **Readability mode**: Readability.js drops `<table>` tags, so the service runs a separate `EXTRACT_TABLES_JS` on the raw DOM to supplement. **Both modes are transparent to the Agent — no differentiation needed**
 
-**v3 Actions List — WebMCP Entries:**
+**Actions List — WebMCP Entries:**
 
 When a page supports WebMCP, the actions list includes WebMCP tools at the top:
 
@@ -395,7 +395,7 @@ When a page supports WebMCP, the actions list includes WebMCP tools at the top:
 
 **Identifying WebMCP actions:** `strategy.type == "webmcp"` or `role == "webmcp_tool"`
 
-**v3 meta.webmcp Fields:**
+**meta.webmcp Fields:**
 
 ```json
 {
@@ -423,9 +423,9 @@ When a page supports WebMCP, the actions list includes WebMCP tools at the top:
 | `max_action_name_chars`     | Maximum characters for action names (smart truncation at word boundaries)                                                                                   |
 | `max_selector_chars`        | Maximum characters for CSS selectors                                                                                                                        |
 | `include_diff`              | First call: `meta.diff.note = "no_previous_snapshot"`; subsequent: includes `added_sids/removed_sids/changed_sids`                                          |
-| `extract_tables`            | **v3** Whether to extract `<table>` elements as Markdown table sections; default `true`                                                                     |
-| `max_table_rows`            | **v3** Maximum rows to keep per table; default 80. Excess rows are truncated with `table_meta.truncated=true`, but `stats` are computed on the full data    |
-| `max_tables`                | **v3** Maximum tables to extract per page; default 20                                                                                                       |
+| `extract_tables`            |  Whether to extract `<table>` elements as Markdown table sections; default `true`                                                                     |
+| `max_table_rows`            |  Maximum rows to keep per table; default 80. Excess rows are truncated with `table_meta.truncated=true`, but `stats` are computed on the full data    |
+| `max_tables`                |  Maximum tables to extract per page; default 20                                                                                                       |
 | `wait_for_selector`         | Wait for a CSS selector to appear before distilling; useful for SPA pages                                                                                   |
 | `wait_for_timeout_ms`       | Timeout for `wait_for_selector`; default 5000ms; times out silently and proceeds with distill                                                               |
 
@@ -479,7 +479,7 @@ Purpose:
 }
 ```
 
-**v3: WebMCP invoke operation:**
+**WebMCP invoke operation:**
 
 ```json
 {
@@ -510,9 +510,9 @@ Execution strategy:
 - After `act`, don't read the whole page — prioritize `read_sections(changed_sids)`
 - `act` depends on `aid`, which comes from the latest `distill(include_actions=true)`
 - If `aid not found`, re-run `distill` to get the latest actions
-- **v3:** If WebMCP `invoke` fails, fall back to DOM operations (find the corresponding click/type action)
+- If WebMCP `invoke` fails, fall back to DOM operations (find the corresponding click/type action)
 
-### 5.7 WebMCP Tool Discovery (v3)
+### 5.7 WebMCP Tool Discovery
 
 - `POST /web/session/webmcp_discover`
 
@@ -603,7 +603,7 @@ Response example:
 - Get the full `input_schema` to construct correct invocation parameters
 - `distill` already triggers WebMCP discovery automatically — this endpoint usually doesn't need to be called separately
 
-### 5.8 WebMCP Tool Invocation (v3)
+### 5.8 WebMCP Tool Invocation
 
 - `POST /web/session/webmcp_invoke`
 
@@ -737,7 +737,7 @@ Find role=button/link (name contains Search/Go/Submit) → act(click)
 distill → read_sections(changed_sids/added_sids)
 ```
 
-### 6.3 Search / Form Interaction (WebMCP-First) (v3)
+### 6.3 Search / Form Interaction (WebMCP-First)
 
 ```
 distill → check meta.webmcp.available
@@ -789,7 +789,7 @@ If sections are empty or very few: scroll(down) → distill
 Continue with normal flow
 ```
 
-### 6.7 WebMCP Full Interaction Flow (v3)
+### 6.7 WebMCP Full Interaction Flow
 
 Flight search example:
 
@@ -810,7 +810,7 @@ webmcp_invoke("bookFlight", {"flightId":"FL123","passengers":1})
 Booking complete → close
 ```
 
-### 6.8 Web Table Data Collection (v3)
+### 6.8 Web Table Data Collection
 
 For competitive price monitoring, financial report collection, data comparison, etc.:
 
@@ -849,7 +849,7 @@ Option B: need specific rows → scroll to target position → re-distill
 Option C: need full data → prompt user to export CSV/XLSX, hand off to LarkScout DocReader for processing
 ```
 
-### 6.9 LarkScout Document Library Persistence Flow (v3)
+### 6.9 LarkScout Document Library Persistence Flow
 
 Persist collection results (including tables) to the LarkScout document library:
 
@@ -929,7 +929,7 @@ When Agent later searches "Q3 revenue", web tables and Excel tables are discover
 
 ---
 
-## 9. Action Priority and Confidence (v3 Full Chain)
+## 9. Action Priority and Confidence ( Full Chain)
 
 distill's action collection follows this priority order. Agents should prefer actions with higher confidence:
 
@@ -948,5 +948,5 @@ distill's action collection follows this priority order. Agents should prefer ac
 - Do not proactively scrape user privacy, paywalled content, or restricted content
 - When encountering login/CAPTCHA/consent pages: prioritize informing the user and suggest compliant handling (`storage_state` import or manual intervention)
 - Do not provide automated CAPTCHA bypass strategies
-- **v3:** WebMCP tools with `read_only=false` modify state (e.g., placing orders, submitting forms) — Agent should confirm user intent before invoking
-- **v3:** Declarative tools with `auto_submit` automatically submit forms — use cautiously for non-read-only operations
+- WebMCP tools with `read_only=false` modify state (e.g., placing orders, submitting forms) — Agent should confirm user intent before invoking
+- Declarative tools with `auto_submit` automatically submit forms — use cautiously for non-read-only operations
