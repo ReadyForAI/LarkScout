@@ -1,5 +1,9 @@
 # LarkScout
 
+<p align="center">
+  <img src="assets/banner.png" alt="LarkScout Banner" width="100%">
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![CI](https://github.com/ReadyForAI/LarkScout/actions/workflows/ci.yml/badge.svg)](https://github.com/ReadyForAI/LarkScout/actions)
