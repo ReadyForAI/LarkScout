@@ -10,15 +10,20 @@
 
 ## English
 
-Open-source data collection and document parsing platform by [ReadyForAI](https://github.com/ReadyForAI).
+**LarkScout** is an Agent-native data collection and document parsing toolkit by [ReadyForAI](https://github.com/ReadyForAI).
+
+### Why LarkScout?
+
+Most scrapers hand your Agent a wall of raw HTML — expensive to process and mostly noise. LarkScout semantically distills web pages into structured sections and actions, cutting token usage by 90%+ compared to raw HTML. A three-tier loading model (digest → brief → section) lets Agents pull only what they need instead of loading entire documents into context. Diff-first incremental reads mean revisiting a page costs near-zero tokens, and table-aware extraction precomputes statistics so Agents can answer data questions without reading a single row.
 
 ### Features
 
-- **Web capture** — one-shot URL → structured document (Playwright-powered)
+- **Semantic distillation** — web pages → structured sections + interactive actions; 4,000–8,000 chars per distill vs. full HTML
+- **Three-tier loading** — digest (~200 tokens) → brief (~1,500 tokens) → section (on-demand); Agents load only what they need
+- **Diff-first** — `distill` returns only changed sections (`changed_sids`); repeat visits cost near-zero tokens
+- **Table-aware** — auto-extracts tables with precomputed stats (min/max/avg); answer data questions without reading rows
 - **Document parsing** — PDF, DOCX, XLSX, CSV with OCR fallback
-- **Three-tier summaries** — digest (~200 tokens) → brief (~1500 tokens) → section (on-demand)
 - **Multi-LLM support** — Gemini (default), OpenAI, DeepSeek, Ollama, Groq, or any OpenAI-compatible API
-- **Table extraction** — automatic HTML/sheet tables → Markdown with statistics
 - **WebMCP** — Chrome 146+ structured tool discovery (MCP-over-HTTP)
 - **i18n** — English and Chinese (set `LANG=zh`)
 
@@ -27,13 +32,9 @@ Open-source data collection and document parsing platform by [ReadyForAI](https:
 #### Docker (recommended)
 
 ```bash
-# Clone and configure
 git clone https://github.com/ReadyForAI/LarkScout.git
 cd LarkScout
-cp .env.example .env          # add your GEMINI_API_KEY
-
-# Start the service
-docker compose up -d
+GEMINI_API_KEY=your_key_here docker compose up -d
 
 # Check health
 curl http://localhost:9898/health
@@ -145,6 +146,10 @@ LarkScout is configured entirely through environment variables. See the table in
 | `PORT` | `9898` | HTTP listening port |
 | `LANG` | `en` | UI language (`en` or `zh`) |
 
+### For AI Agents
+
+LarkScout is designed to be deployed and operated autonomously by AI Agents. A self-contained deployment prompt (English + Chinese) is available at [`docs/agent-deployment-prompt.md`](docs/agent-deployment-prompt.md) — copy it directly into your Agent's system prompt, no modification needed.
+
 ### Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code conventions, and the PR process.
@@ -157,15 +162,20 @@ MIT — see [LICENSE](LICENSE).
 
 ## 中文
 
-由 [ReadyForAI](https://github.com/ReadyForAI) 开源的数据采集与文档解析平台。
+**LarkScout** 是由 [ReadyForAI](https://github.com/ReadyForAI) 开源的 Agent 原生数据采集与文档解析工具包。
+
+### 为什么选择 LarkScout？
+
+大多数爬虫工具返回原始 HTML——对 LLM 而言噪音极多、token 消耗过高。LarkScout 专为 AI Agent 设计：网页经过语义蒸馏，转化为结构化段落（sections）和可交互元素（actions），相比原始 HTML 节省 90%+ 的 token。三层加载模型（digest → brief → section）让 Agent 按需取用，无需把整篇文档塞进上下文。增量读取（diff-first）机制确保重复访问同一页面时的额外开销接近于零；表格自动预计算统计值，Agent 无需逐行读取即可回答数据问题。
 
 ### 功能特性
 
-- **网页抓取** — 一次调用 URL → 结构化文档（基于 Playwright）
+- **语义蒸馏** — 网页 → 结构化段落 + 可交互元素；每次 distill 仅 4,000–8,000 字符，对比原始 HTML 节省 90%+ token
+- **三层加载** — digest（约 200 token）→ brief（约 1,500 token）→ section（按需）；Agent 只取所需
+- **增量读取** — `distill` 仅返回变化段落（`changed_sids`），重复访问近零 token 开销
+- **表格感知** — 自动提取并预计算统计值（min/max/avg），无需读取原始行即可回答数据问题
 - **文档解析** — 支持 PDF、DOCX、XLSX、CSV，可自动 OCR 兜底
-- **三层摘要** — digest（约 200 token）→ brief（约 1500 token）→ section（按需加载）
 - **多 LLM 支持** — Gemini（默认）、OpenAI、DeepSeek、Ollama、Groq，以及任意 OpenAI 兼容接口
-- **表格提取** — 自动将 HTML/表格文件转为带统计信息的 Markdown
 - **WebMCP** — Chrome 146+ 结构化工具发现（MCP-over-HTTP）
 - **多语言** — 支持中英文（设置 `LANG=zh` 切换为中文）
 
@@ -174,13 +184,9 @@ MIT — see [LICENSE](LICENSE).
 #### Docker（推荐）
 
 ```bash
-# 克隆并配置
 git clone https://github.com/ReadyForAI/LarkScout.git
 cd LarkScout
-cp .env.example .env          # 填入你的 GEMINI_API_KEY
-
-# 启动服务
-docker compose up -d
+GEMINI_API_KEY=your_key_here docker compose up -d
 
 # 检查服务状态
 curl http://localhost:9898/health
@@ -291,6 +297,10 @@ LarkScout 所有配置均通过环境变量管理。LLM 相关配置见上方 **
 |---|---|---|
 | `PORT` | `9898` | HTTP 监听端口 |
 | `LANG` | `en` | 界面语言（`en` 英文 / `zh` 中文） |
+
+### 接入 AI Agent
+
+LarkScout 支持由 AI Agent 自主部署和操作。[`docs/agent-deployment-prompt.md`](docs/agent-deployment-prompt.md) 提供开箱即用的中英双语部署提示词，直接复制到 Agent 的系统提示词中即可使用，无需任何修改。
 
 ### 参与贡献
 
