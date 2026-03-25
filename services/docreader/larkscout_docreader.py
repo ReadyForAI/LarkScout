@@ -871,6 +871,7 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
             {
                 "sid": sec.sid, "index": sec.index, "title": sec.title,
                 "page_range": sec.page_range, "char_count": len(sec.text),
+                "type": "text",
                 "summary_preview": (sec.summary[:120] + "...") if len(sec.summary) > 120 else sec.summary,
                 "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
             }
@@ -878,8 +879,8 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
         ],
         "provenance": {
             "source": source,
-            "original_path": original_path or str(parsed.filename),
-            "upload_time": meta["created_at"],
+            "source_url": original_path or str(parsed.filename),
+            "created_at": meta["created_at"],
             "content_hash": content_hash,
         },
     }
@@ -919,19 +920,32 @@ def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: P
     _write_text(doc_dir / "digest.md", f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{t('summary_pending')}\n")
     _write_text(doc_dir / "brief.md", f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{t('summary_pending')}\n")
 
+    full_text = "\n".join(sec.text for sec in parsed.sections)
+    content_hash = "sha256:" + hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()
+
     manifest = {
         "doc_id": doc_id, "filename": parsed.filename,
+        "file_type": parsed.file_type,
+        "source": source,
         "paths": {"digest": "digest.md", "brief": "brief.md", "full": "full.md", "sections_dir": "sections/"},
         "sections": [
             {"sid": sec.sid, "index": sec.index, "title": sec.title,
              "page_range": sec.page_range, "char_count": len(sec.text),
+             "type": "text",
              "summary_preview": "",
              "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md"}
             for sec in parsed.sections
         ],
+        "provenance": {
+            "source": source,
+            "source_url": str(parsed.filename),
+            "created_at": meta["created_at"],
+            "content_hash": content_hash,
+        },
     }
     _write_json(doc_dir / "manifest.json", manifest)
-    _update_doc_index(output_dir, meta, t("summary_pending"), tags=tags, source=source)
+    _update_doc_index(output_dir, meta, t("summary_pending"), tags=tags, source=source,
+                      content_hash=content_hash)
     logger.info(f"Text extraction complete (no summary): {doc_dir}")
 
 
@@ -959,19 +973,17 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
         index["version"] = 2
         index["documents"] = [d for d in index["documents"] if d.get("id") != meta["doc_id"]]
 
-        entry = {
+        entry: dict[str, Any] = {
             "id": meta["doc_id"], "filename": meta["filename"], "file_type": meta["file_type"],
             "source": source,
+            "source_url": source_url or "",
             "pages": meta["total_pages"], "sections": meta["section_count"],
             "ocr_pages": meta.get("ocr_page_count", 0), "tables": meta.get("table_count", 0),
             "digest": digest[:200], "digest_path": f"docs/{meta['doc_id']}/digest.md",
             "tags": tags or [],
             "created_at": meta["created_at"],
+            "content_hash": content_hash or "",
         }
-        if content_hash:
-            entry["content_hash"] = content_hash
-        if source_url:
-            entry["source_url"] = source_url
 
         index["documents"].append(entry)
         index["last_updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
