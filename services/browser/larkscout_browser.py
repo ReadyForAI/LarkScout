@@ -1902,6 +1902,38 @@ def _build_web_digest(title: str | None, sections: list[dict[str, Any]], max_cha
     return "\n\n".join(parts)[:max_chars]
 
 
+def _safe_heading(h: str | None, max_len: int = 40) -> str:
+    """Sanitize a heading for use in filenames."""
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", h or "").strip().replace(" ", "-")
+    return (safe[:max_len] if len(safe) > max_len else safe) or "section"
+
+
+def _build_manifest_sections(
+    text_sections: list[dict[str, Any]],
+    table_sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build unified manifest section entries for a web capture."""
+    result: list[dict[str, Any]] = []
+    for i, s in enumerate(text_sections, 1):
+        sid = s.get("sid", f"s_{i:03d}")
+        h = s.get("h", "")
+        safe_h = _safe_heading(h)
+        result.append({
+            "sid": sid, "index": i, "title": h,
+            "char_count": len(s.get("t", "")), "type": "text",
+            "file": f"sections/{i:02d}-{sid}-{safe_h}.md",
+        })
+    for i, s in enumerate(table_sections, 1):
+        result.append({
+            "sid": s.get("sid", f"t_{i:03d}"),
+            "index": len(text_sections) + i,
+            "title": s.get("h", f"Table {i}"),
+            "char_count": len(s.get("t", "")), "type": "table",
+            "file": f"tables/table-{i:02d}.md",
+        })
+    return result
+
+
 def _persist_web_capture(
     doc_id: str,
     url: str,
@@ -1961,14 +1993,11 @@ def _persist_web_capture(
             "sections_dir": "sections/",
             **({"tables_dir": "tables/"} if table_sections else {}),
         },
-        "sections": [
-            {"sid": s.get("sid"), "h": s.get("h"), "char_count": len(s.get("t", "")), "type": s.get("type", "text")}
-            for s in sections
-        ],
+        "sections": _build_manifest_sections(text_sections, table_sections),
         "provenance": {
             "source": "web_capture",
             "source_url": url,
-            "capture_time": now_str,
+            "created_at": now_str,
             "content_hash": content_hash,
         },
     }
@@ -1996,7 +2025,9 @@ def _persist_web_capture(
             "file_type": "web_capture",
             "source": "web_capture",
             "source_url": url,
-            "sections": len(sections),
+            "pages": 1,
+            "sections": len(text_sections),
+            "ocr_pages": 0,
             "tables": len(table_sections),
             "digest": digest[:200],
             "digest_path": f"docs/{doc_id}/digest.md",
