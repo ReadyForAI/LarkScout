@@ -54,6 +54,7 @@ class GeminiProvider(LLMProvider):
                 response = self._client.models.generate_content(
                     model=self._model,
                     contents=full_prompt,
+                    config={"http_options": {"timeout": 60_000}},
                 )
                 return response.text.strip()
             except Exception as exc:
@@ -65,7 +66,7 @@ class GeminiProvider(LLMProvider):
                     return "[summary generation failed]"
         return "[summary generation failed]"
 
-    def ocr(self, image_bytes: bytes, page_num: int) -> str:
+    def ocr(self, image_bytes: bytes, page_num: int, max_retries: int = 2) -> str:
         """OCR a single page image via Gemini Vision."""
         self._init()
 
@@ -74,12 +75,19 @@ class GeminiProvider(LLMProvider):
         img = PIL.Image.open(io.BytesIO(image_bytes))
         ocr_prompt = "Extract all text from this image. Return only the extracted text, no commentary."
 
-        try:
-            response = self._client.models.generate_content(
-                model=self._model,
-                contents=[ocr_prompt, img],
-            )
-            return response.text.strip()
-        except Exception as exc:
-            logger.warning("Gemini OCR failed for page %d: %s", page_num, exc)
-            return f"[OCR failed for page {page_num}]"
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._client.models.generate_content(
+                    model=self._model,
+                    contents=[ocr_prompt, img],
+                    config={"http_options": {"timeout": 60_000}},
+                )
+                return response.text.strip()
+            except Exception as exc:
+                if attempt < max_retries:
+                    logger.warning("Gemini OCR retry (%d/%d) for page %d: %s", attempt + 1, max_retries, page_num, exc)
+                    time.sleep(2**attempt)
+                else:
+                    logger.warning("Gemini OCR failed for page %d after %d retries: %s", page_num, max_retries, exc)
+                    return f"[OCR failed for page {page_num}]"
+        return f"[OCR failed for page {page_num}]"
