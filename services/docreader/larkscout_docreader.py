@@ -29,6 +29,13 @@ init_locale()
 logger = logging.getLogger("larkscout_docreader")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 
+# ═══════════════════════════════════════════
+# Config
+# ═══════════════════════════════════════════
+MAX_PARSE_ROWS = int(os.environ.get("LARKSCOUT_MAX_PARSE_ROWS", "100000"))
+_MAX_CONCURRENT_PARSE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_PARSE", "5"))
+_parse_sem = asyncio.Semaphore(_MAX_CONCURRENT_PARSE)
+
 
 # ═══════════════════════════════════════════
 # Data structures
@@ -65,6 +72,7 @@ class ParsedDocument:
     sections: list[Section]
     ocr_page_count: int = 0
     table_count: int = 0
+    metadata: dict = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════
@@ -371,6 +379,9 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
     pages: list[PageContent] = []
     table_count = 0
 
+    truncated = False
+    total_rows_read = 0
+
     for idx, sheet_name in enumerate(wb.sheetnames, 1):
         ws = wb[sheet_name]
         rows: list[list[str]] = []
@@ -378,6 +389,12 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
             str_row = [str(cell) if cell is not None else "" for cell in row]
             if any(c.strip() for c in str_row):
                 rows.append(str_row)
+                total_rows_read += 1
+                if total_rows_read >= MAX_PARSE_ROWS:
+                    truncated = True
+                    break
+        if truncated and not rows:
+            break
 
         if not rows:
             continue
@@ -401,8 +418,10 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
 
     wb.close()
 
+    if truncated:
+        logger.warning(f"XLSX truncated at {MAX_PARSE_ROWS} rows")
     logger.info(f"XLSX parse complete: {len(sections)} sheets, {table_count} tables")
-    return ParsedDocument(
+    result = ParsedDocument(
         filename=filepath.name,
         file_type="xlsx",
         total_pages=max(len(pages), 1),
@@ -410,6 +429,10 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
         sections=sections,
         table_count=table_count,
     )
+    if truncated:
+        result.metadata["truncated"] = True
+        result.metadata["max_rows"] = MAX_PARSE_ROWS
+    return result
 
 
 # ═══════════════════════════════════════════
@@ -423,18 +446,26 @@ def parse_csv(filepath: Path) -> ParsedDocument:
     logger.info(f"Parsing CSV: {filepath.name}")
 
     # Try UTF-8-with-BOM first (common Excel export), fall back to latin-1
+    truncated = False
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             with open(filepath, newline="", encoding=encoding) as f:
                 reader = csv.reader(f)
-                rows: list[list[str]] = [
-                    row for row in reader if any(cell.strip() for cell in row)
-                ]
+                rows: list[list[str]] = []
+                for row in reader:
+                    if any(cell.strip() for cell in row):
+                        rows.append(row)
+                        if len(rows) >= MAX_PARSE_ROWS:
+                            truncated = True
+                            break
             break
         except UnicodeDecodeError:
             continue
     else:
         rows = []
+
+    if truncated:
+        logger.warning(f"CSV truncated at {MAX_PARSE_ROWS} rows")
 
     md_table = _rows_to_markdown(rows) if rows else ""
     page = PageContent(page_num=1, text=md_table, tables=[md_table] if md_table else [])
@@ -452,7 +483,7 @@ def parse_csv(filepath: Path) -> ParsedDocument:
 
     table_count = 1 if md_table else 0
     logger.info(f"CSV parse complete: {len(rows)} rows, {table_count} tables")
-    return ParsedDocument(
+    result = ParsedDocument(
         filename=filepath.name,
         file_type="csv",
         total_pages=1,
@@ -460,6 +491,10 @@ def parse_csv(filepath: Path) -> ParsedDocument:
         sections=[section] if md_table else [],
         table_count=table_count,
     )
+    if truncated:
+        result.metadata["truncated"] = True
+        result.metadata["max_rows"] = MAX_PARSE_ROWS
+    return result
 
 
 # ═══════════════════════════════════════════
@@ -948,8 +983,11 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
 # ═══════════════════════════════════════════
 
 def _write_text(path: Path, content: str):
-    with open(path, "w", encoding="utf-8") as f:
+    """Write text atomically via temp file + os.replace."""
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
+    os.replace(tmp, path)
 
 
 def _write_json(path: Path, data: dict):
@@ -1074,12 +1112,19 @@ class SearchResponse(BaseModel):
 app = FastAPI(title="Doc Reader API", version="3.0.0")
 
 
+def _mask_path(p: str | Path) -> str:
+    """Replace home directory prefix with ~ to avoid exposing absolute paths."""
+    s = str(p)
+    home = os.path.expanduser("~")
+    return s.replace(home, "~") if s.startswith(home) else s
+
+
 @app.get("/health")
 async def health():
     return {
         "ok": True,
         "version": "3.0.0",
-        "docs_dir": str(_get_docs_dir()),
+        "docs_dir": _mask_path(_get_docs_dir()),
         "supported_formats": ["pdf", "docx", "xlsx", "csv"],
     }
 
@@ -1098,101 +1143,104 @@ async def api_parse_doc(
     metadata: str | None = Form(None),  # JSON object string
 ):
     """Parse uploaded document (PDF/DOCX), return structured result."""
-    docs_dir = _get_docs_dir()
-    t0 = time.time()
+    if _parse_sem.locked():
+        raise HTTPException(429, "too many concurrent parse requests")
+    async with _parse_sem:
+        docs_dir = _get_docs_dir()
+        t0 = time.time()
 
-    # Check format
-    filename = file.filename or "unknown"
-    suffix = Path(filename).suffix.lower()
-    if suffix not in (".pdf", ".docx", ".xlsx", ".csv"):
-        raise HTTPException(422, t("unsupported_format", fmt=suffix))
+        # Check format
+        filename = file.filename or "unknown"
+        suffix = Path(filename).suffix.lower()
+        if suffix not in (".pdf", ".docx", ".xlsx", ".csv"):
+            raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
-    # Parse tags
-    parsed_tags: list[str] = []
-    if tags:
+        # Parse tags
+        parsed_tags: list[str] = []
+        if tags:
+            try:
+                parsed_tags = json.loads(tags)
+            except json.JSONDecodeError:
+                parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+        # Validate doc_id if user-supplied
+        if doc_id:
+            _validate_doc_id(doc_id)
+
+        # Save temp file
+        d_id = doc_id or _next_doc_id(docs_dir)
+        tmp_dir = docs_dir / d_id / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / filename
         try:
-            parsed_tags = json.loads(tags)
-        except json.JSONDecodeError:
-            parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
+            content = await file.read()
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, f"file too large: {len(content)} bytes (max {MAX_UPLOAD_BYTES})")
+            tmp_path.write_bytes(content)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, t("file_save_failed", err=str(e)))
 
-    # Validate doc_id if user-supplied
-    if doc_id:
-        _validate_doc_id(doc_id)
-
-    # Save temp file
-    d_id = doc_id or _next_doc_id(docs_dir)
-    tmp_dir = docs_dir / d_id / ".tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = tmp_dir / filename
-    try:
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, f"file too large: {len(content)} bytes (max {MAX_UPLOAD_BYTES})")
-        tmp_path.write_bytes(content)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, t("file_save_failed", err=str(e)))
-
-    # Parse
-    try:
-        loop = asyncio.get_event_loop()
-        if suffix == ".pdf":
-            parsed = await loop.run_in_executor(None, lambda: parse_pdf(
-                tmp_path, force_ocr=force_ocr, ocr_threshold=OCR_THRESHOLD,
-                ocr_pages_spec=ocr_pages, extract_tables=extract_tables,
-                max_tables_per_page=max_tables_per_page,
-                concurrency=concurrency, cache_dir=docs_dir / d_id,
-            ))
-        elif suffix == ".docx":
-            parsed = await loop.run_in_executor(None, lambda: parse_word(
-                tmp_path, extract_tables=extract_tables,
-            ))
-        elif suffix == ".xlsx":
-            parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
-        else:  # .csv
-            parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
-    except Exception as e:
-        raise HTTPException(500, t("parse_failed", err=str(e)))
-    finally:
-        # Cleanup temp file
+        # Parse
         try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+            loop = asyncio.get_event_loop()
+            if suffix == ".pdf":
+                parsed = await loop.run_in_executor(None, lambda: parse_pdf(
+                    tmp_path, force_ocr=force_ocr, ocr_threshold=OCR_THRESHOLD,
+                    ocr_pages_spec=ocr_pages, extract_tables=extract_tables,
+                    max_tables_per_page=max_tables_per_page,
+                    concurrency=concurrency, cache_dir=docs_dir / d_id,
+                ))
+            elif suffix == ".docx":
+                parsed = await loop.run_in_executor(None, lambda: parse_word(
+                    tmp_path, extract_tables=extract_tables,
+                ))
+            elif suffix == ".xlsx":
+                parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
+            else:  # .csv
+                parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
+        except Exception as e:
+            raise HTTPException(500, t("parse_failed", err=str(e)))
+        finally:
+            # Cleanup temp file
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
-    # Summarize + write
-    digest = t("summary_pending")
-    try:
-        if generate_summary:
-            digest_text, brief_text, _ = await loop.run_in_executor(
-                None, lambda: generate_summaries(parsed, concurrency=concurrency)
-            )
-            digest = digest_text
-            await loop.run_in_executor(None, lambda: write_output(
-                d_id, parsed, digest_text, brief_text, docs_dir,
-                tags=parsed_tags, source="upload", original_path=str(filename),
-            ))
-        else:
-            await loop.run_in_executor(None, lambda: write_output_extract_only(
-                d_id, parsed, docs_dir, tags=parsed_tags, source="upload",
-            ))
-    except Exception as e:
-        raise HTTPException(500, t("write_failed", err=str(e)))
+        # Summarize + write
+        digest = t("summary_pending")
+        try:
+            if generate_summary:
+                digest_text, brief_text, _ = await loop.run_in_executor(
+                    None, lambda: generate_summaries(parsed, concurrency=concurrency)
+                )
+                digest = digest_text
+                await loop.run_in_executor(None, lambda: write_output(
+                    d_id, parsed, digest_text, brief_text, docs_dir,
+                    tags=parsed_tags, source="upload", original_path=str(filename),
+                ))
+            else:
+                await loop.run_in_executor(None, lambda: write_output_extract_only(
+                    d_id, parsed, docs_dir, tags=parsed_tags, source="upload",
+                ))
+        except Exception as e:
+            raise HTTPException(500, t("write_failed", err=str(e)))
 
-    elapsed = round(time.time() - t0, 2)
-    return ParseResponse(
-        doc_id=d_id,
-        filename=parsed.filename,
-        file_type=parsed.file_type,
-        total_pages=parsed.total_pages,
-        section_count=len(parsed.sections),
-        table_count=parsed.table_count,
-        ocr_page_count=parsed.ocr_page_count,
-        digest=digest[:300],
-        manifest_path=f"docs/{d_id}/manifest.json",
-        processing_time_sec=elapsed,
-    )
+        elapsed = round(time.time() - t0, 2)
+        return ParseResponse(
+            doc_id=d_id,
+            filename=parsed.filename,
+            file_type=parsed.file_type,
+            total_pages=parsed.total_pages,
+            section_count=len(parsed.sections),
+            table_count=parsed.table_count,
+            ocr_page_count=parsed.ocr_page_count,
+            digest=digest[:300],
+            manifest_path=f"docs/{d_id}/manifest.json",
+            processing_time_sec=elapsed,
+        )
 
 
 # ---- Library query endpoints ----

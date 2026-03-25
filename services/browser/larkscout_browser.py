@@ -40,6 +40,12 @@ DEFAULT_LANG = "en-US"
 SESSION_TTL_SECONDS = 30 * 60  # 30 min idle
 SESSION_MAXSIZE = 200
 
+# ---- Rate limiting (in-memory semaphores) ----
+_MAX_CONCURRENT_CAPTURE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_CAPTURE", "10"))
+_MAX_CONCURRENT_SESSIONS = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_SESSIONS", "20"))
+_capture_sem = asyncio.Semaphore(_MAX_CONCURRENT_CAPTURE)
+_session_sem = asyncio.Semaphore(_MAX_CONCURRENT_SESSIONS)
+
 BASE_DIR = Path(__file__).resolve().parent
 
 # ---- Document library (shared with docreader) ----
@@ -2011,19 +2017,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _init_yolo()
 
     _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-background-networking",
-            "--disable-default-apps",
-            "--disable-extensions",
-            # WebMCP: enable Chrome 146+ WebMCP features
-            "--enable-features=WebMCP",
-        ],
-    )
+    try:
+        _browser = await _pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-extensions",
+                # WebMCP: enable Chrome 146+ WebMCP features
+                "--enable-features=WebMCP",
+            ],
+        )
+    except Exception:
+        await _pw.stop()
+        _pw = None
+        raise
 
     # background cleanup task
     async def cleanup_loop() -> None:
@@ -2053,40 +2064,50 @@ app = FastAPI(title="Agent Browser Service (Playwright + WebMCP)", version="0.6.
 # ============================================================
 # Routes
 # ============================================================
+def _mask_path(p: str | Path) -> str:
+    """Replace home directory prefix with ~ to avoid exposing absolute paths."""
+    s = str(p)
+    home = os.path.expanduser("~")
+    return s.replace(home, "~") if s.startswith(home) else s
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
         "ok": True,
         "sessions": len(sessions),
         "readability_available": READABILITY_AVAILABLE,
-        "readability_js_path": str(READABILITY_JS_PATH),
+        "readability_js_path": _mask_path(READABILITY_JS_PATH),
         "yolo_enabled": YOLO_ENABLED,
-        "yolo_onnx_path": YOLO_ONNX_PATH,
+        "yolo_onnx_path": _mask_path(YOLO_ONNX_PATH) if YOLO_ONNX_PATH else None,
         "yolo_input_size": YOLO_INPUT_SIZE,
-        "webmcp_support": True,  # ✅ WebMCP
+        "webmcp_support": True,
     }
 
 
 @app.post("/session/new", response_model=NewSessionResponse)
 async def new_session(req: NewSessionRequest) -> NewSessionResponse:
-    if not _browser:
-        raise HTTPException(500, "browser not ready")
+    if _session_sem.locked():
+        raise HTTPException(429, "too many concurrent session creations")
+    async with _session_sem:
+        if not _browser:
+            raise HTTPException(500, "browser not ready")
 
-    context = await _browser.new_context(
-        user_agent=req.user_agent,
-        locale=req.lang,
-        viewport=req.viewport,
-        storage_state=req.storage_state,
-        extra_http_headers={"Accept-Language": f"{req.lang},en;q=0.9"},
-    )
-    await _setup_routing(context, req.block_resources)
-    page = await context.new_page()
+        context = await _browser.new_context(
+            user_agent=req.user_agent,
+            locale=req.lang,
+            viewport=req.viewport,
+            storage_state=req.storage_state,
+            extra_http_headers={"Accept-Language": f"{req.lang},en;q=0.9"},
+        )
+        await _setup_routing(context, req.block_resources)
+        page = await context.new_page()
 
-    # secrets.token_hex replaces sha1(time) to avoid collision
-    sid = "s_" + secrets.token_hex(8)
-    sess = Session(context=context, page=page, lang=req.lang)
-    await sessions.put(sid, sess)
-    return NewSessionResponse(session_id=sid)
+        # secrets.token_hex replaces sha1(time) to avoid collision
+        sid = "s_" + secrets.token_hex(8)
+        sess = Session(context=context, page=page, lang=req.lang)
+        await sessions.put(sid, sess)
+        return NewSessionResponse(session_id=sid)
 
 
 @app.post("/session/goto", response_model=GotoResponse)
@@ -2376,59 +2397,62 @@ async def capture(req: CaptureRequest) -> CaptureResponse:
     The session is always closed, even on error.
     """
     _validate_url(req.url)
+    if _capture_sem.locked():
+        raise HTTPException(429, "too many concurrent captures")
     if not _browser:
         raise HTTPException(500, "browser not ready")
 
-    context = await _browser.new_context(
-        user_agent=DEFAULT_UA,
-        locale=req.lang,
-        viewport={"width": 900, "height": 700},
-    )
-    await _setup_routing(context, block_resources=True)
-    page = await context.new_page()
-    sid = "s_" + secrets.token_hex(8)
-    sess = Session(context=context, page=page, lang=req.lang)
-    await sessions.put(sid, sess)
+    async with _capture_sem:
+        context = await _browser.new_context(
+            user_agent=DEFAULT_UA,
+            locale=req.lang,
+            viewport={"width": 900, "height": 700},
+        )
+        await _setup_routing(context, block_resources=True)
+        page = await context.new_page()
+        sid = "s_" + secrets.token_hex(8)
+        sess = Session(context=context, page=page, lang=req.lang)
+        await sessions.put(sid, sess)
 
-    try:
         try:
-            await sess.page.goto(req.url, wait_until="domcontentloaded", timeout=req.timeout_ms)
-        except Exception as e:
-            raise HTTPException(502, f"capture goto failed: {e}")
+            try:
+                await sess.page.goto(req.url, wait_until="domcontentloaded", timeout=req.timeout_ms)
+            except Exception as e:
+                raise HTTPException(502, f"capture goto failed: {e}")
 
-        sess.webmcp_tools = None
-        sess.webmcp_available = False
+            sess.webmcp_tools = None
+            sess.webmcp_available = False
 
-        distill_req = DistillRequest(
-            session_id=sid,
-            include_actions=False,
-            include_diff=False,
-            extract_tables=req.extract_tables,
-        )
-        try:
-            out = await _distill(sess, distill_req)
-        except Exception as e:
-            raise HTTPException(500, f"capture distill failed: {e}")
+            distill_req = DistillRequest(
+                session_id=sid,
+                include_actions=False,
+                include_diff=False,
+                extract_tables=req.extract_tables,
+            )
+            try:
+                out = await _distill(sess, distill_req)
+            except Exception as e:
+                raise HTTPException(500, f"capture distill failed: {e}")
 
-        url = out["url"]
-        title = out.get("title")
-        sections: list[dict[str, Any]] = out["sections"]
-        content_hash: str = out["content_hash"]
-        table_sections = [s for s in sections if s.get("type") == "table"]
+            url = out["url"]
+            title = out.get("title")
+            sections: list[dict[str, Any]] = out["sections"]
+            content_hash: str = out["content_hash"]
+            table_sections = [s for s in sections if s.get("type") == "table"]
 
-        digest = _build_web_digest(title, sections)
-        docs_dir = _get_docs_dir()
-        doc_id = _next_web_doc_id(docs_dir)
-        _persist_web_capture(
-            doc_id=doc_id, url=url, title=title, sections=sections,
-            digest=digest, tags=req.tags, content_hash=content_hash, docs_dir=docs_dir,
-        )
+            digest = _build_web_digest(title, sections)
+            docs_dir = _get_docs_dir()
+            doc_id = _next_web_doc_id(docs_dir)
+            _persist_web_capture(
+                doc_id=doc_id, url=url, title=title, sections=sections,
+                digest=digest, tags=req.tags, content_hash=content_hash, docs_dir=docs_dir,
+            )
 
-        return CaptureResponse(
-            doc_id=doc_id,
-            digest=digest,
-            section_count=len(sections),
-            table_count=len(table_sections),
-        )
-    finally:
-        await sessions.remove(sid)
+            return CaptureResponse(
+                doc_id=doc_id,
+                digest=digest,
+                section_count=len(sections),
+                table_count=len(table_sections),
+            )
+        finally:
+            await sessions.remove(sid)
