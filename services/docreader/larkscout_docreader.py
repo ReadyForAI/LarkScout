@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -908,37 +909,38 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
                       source: str = "upload",
                       source_url: str | None = None,
                       content_hash: str | None = None):
-    """Update doc-index.json (v2 format with source/tags/content_hash)."""
-    index_path = docs_dir / "doc-index.json"
-    if index_path.exists():
-        try:
-            with open(index_path, encoding="utf-8") as f:
-                index = json.load(f)
-        except (json.JSONDecodeError, Exception):
+    """Update doc-index.json with threading lock and atomic write."""
+    with _doc_index_lock:
+        index_path = docs_dir / "doc-index.json"
+        if index_path.exists():
+            try:
+                with open(index_path, encoding="utf-8") as f:
+                    index = json.load(f)
+            except (json.JSONDecodeError, Exception):
+                index = {"version": 2, "documents": []}
+        else:
             index = {"version": 2, "documents": []}
-    else:
-        index = {"version": 2, "documents": []}
 
-    index["version"] = 2
-    index["documents"] = [d for d in index["documents"] if d.get("id") != meta["doc_id"]]
+        index["version"] = 2
+        index["documents"] = [d for d in index["documents"] if d.get("id") != meta["doc_id"]]
 
-    entry = {
-        "id": meta["doc_id"], "filename": meta["filename"], "file_type": meta["file_type"],
-        "source": source,
-        "pages": meta["total_pages"], "sections": meta["section_count"],
-        "ocr_pages": meta.get("ocr_page_count", 0), "tables": meta.get("table_count", 0),
-        "digest": digest[:200], "digest_path": f"docs/{meta['doc_id']}/digest.md",
-        "tags": tags or [],
-        "created_at": meta["created_at"],
-    }
-    if content_hash:
-        entry["content_hash"] = content_hash
-    if source_url:
-        entry["source_url"] = source_url
+        entry = {
+            "id": meta["doc_id"], "filename": meta["filename"], "file_type": meta["file_type"],
+            "source": source,
+            "pages": meta["total_pages"], "sections": meta["section_count"],
+            "ocr_pages": meta.get("ocr_page_count", 0), "tables": meta.get("table_count", 0),
+            "digest": digest[:200], "digest_path": f"docs/{meta['doc_id']}/digest.md",
+            "tags": tags or [],
+            "created_at": meta["created_at"],
+        }
+        if content_hash:
+            entry["content_hash"] = content_hash
+        if source_url:
+            entry["source_url"] = source_url
 
-    index["documents"].append(entry)
-    index["last_updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _write_json(index_path, index)
+        index["documents"].append(entry)
+        index["last_updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _write_json(index_path, index)
 
 
 # ═══════════════════════════════════════════
@@ -951,8 +953,11 @@ def _write_text(path: Path, content: str):
 
 
 def _write_json(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
+    """Write JSON atomically via temp file + os.replace."""
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def _safe_filename(title: str, max_len: int = 40) -> str:
@@ -961,19 +966,24 @@ def _safe_filename(title: str, max_len: int = 40) -> str:
     return (safe[:max_len] if len(safe) > max_len else safe) or "untitled"
 
 
+_doc_counter_lock = threading.Lock()
+_doc_index_lock = threading.Lock()
+
+
 def _next_doc_id(docs_dir: Path) -> str:
-    counter_path = docs_dir / ".counter"
-    if counter_path.exists():
-        try:
-            counter = int(counter_path.read_text().strip())
-        except ValueError:
+    with _doc_counter_lock:
+        counter_path = docs_dir / ".counter"
+        if counter_path.exists():
+            try:
+                counter = int(counter_path.read_text().strip())
+            except ValueError:
+                counter = 1
+        else:
             counter = 1
-    else:
-        counter = 1
-    doc_id = f"DOC-{counter:03d}"
-    counter_path.parent.mkdir(parents=True, exist_ok=True)
-    counter_path.write_text(str(counter + 1))
-    return doc_id
+        doc_id = f"DOC-{counter:03d}"
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        counter_path.write_text(str(counter + 1))
+        return doc_id
 
 
 # ═══════════════════════════════════════════

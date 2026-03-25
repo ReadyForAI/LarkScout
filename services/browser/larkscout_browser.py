@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
@@ -102,6 +103,7 @@ class Session:
     last_distill: dict[str, Any] | None = None
     action_map: dict[str, dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)              # concurrency lock
+    closed: bool = False                                                   # set when session is evicted/expired
     # WebMCP: cached tool list
     webmcp_tools: list[dict[str, Any]] | None = None
     webmcp_available: bool = False
@@ -171,6 +173,7 @@ class SessionManager:
 
     @staticmethod
     async def _close_session(sess: Session):
+        sess.closed = True
         try:
             await sess.context.close()
         except Exception:
@@ -1812,7 +1815,7 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
 
 async def _ensure_session(session_id: str) -> Session:
     sess = await sessions.get(session_id)
-    if not sess:
+    if not sess or sess.closed:
         raise HTTPException(404, "session not found or expired")
     return sess
 
@@ -1858,18 +1861,23 @@ def _get_docs_dir() -> Path:
     return d
 
 
+_web_counter_lock = threading.Lock()
+_web_index_lock = threading.Lock()
+
+
 def _next_web_doc_id(docs_dir: Path) -> str:
     """Allocate the next WEB-xxx doc ID using a file-based counter."""
-    counter_path = docs_dir / ".web_counter"
-    counter = 1
-    if counter_path.exists():
-        try:
-            counter = int(counter_path.read_text().strip())
-        except ValueError:
-            counter = 1
-    doc_id = f"WEB-{counter:03d}"
-    counter_path.write_text(str(counter + 1))
-    return doc_id
+    with _web_counter_lock:
+        counter_path = docs_dir / ".web_counter"
+        counter = 1
+        if counter_path.exists():
+            try:
+                counter = int(counter_path.read_text().strip())
+            except ValueError:
+                counter = 1
+        doc_id = f"WEB-{counter:03d}"
+        counter_path.write_text(str(counter + 1))
+        return doc_id
 
 
 def _build_web_digest(title: str | None, sections: list[dict[str, Any]], max_chars: int = 600) -> str:
@@ -1962,35 +1970,38 @@ def _persist_web_capture(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # doc-index.json (v2, shared with docreader)
-    index_path = docs_dir / "doc-index.json"
-    if index_path.exists():
-        try:
-            with open(index_path, encoding="utf-8") as f:
-                index: dict[str, Any] = json.load(f)
-        except Exception:
+    # doc-index.json (v2, shared with docreader) — locked + atomic write
+    with _web_index_lock:
+        index_path = docs_dir / "doc-index.json"
+        if index_path.exists():
+            try:
+                with open(index_path, encoding="utf-8") as f:
+                    index: dict[str, Any] = json.load(f)
+            except Exception:
+                index = {"version": 2, "documents": []}
+        else:
             index = {"version": 2, "documents": []}
-    else:
-        index = {"version": 2, "documents": []}
 
-    index["version"] = 2
-    index["documents"] = [d for d in index["documents"] if d.get("id") != doc_id]
-    index["documents"].append({
-        "id": doc_id,
-        "filename": title or url,
-        "file_type": "web_capture",
-        "source": "web_capture",
-        "source_url": url,
-        "sections": len(sections),
-        "tables": len(table_sections),
-        "digest": digest[:200],
-        "digest_path": f"docs/{doc_id}/digest.md",
-        "tags": tags,
-        "created_at": now_str,
-        "content_hash": content_hash,
-    })
-    index["last_updated"] = now_str
-    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        index["version"] = 2
+        index["documents"] = [d for d in index["documents"] if d.get("id") != doc_id]
+        index["documents"].append({
+            "id": doc_id,
+            "filename": title or url,
+            "file_type": "web_capture",
+            "source": "web_capture",
+            "source_url": url,
+            "sections": len(sections),
+            "tables": len(table_sections),
+            "digest": digest[:200],
+            "digest_path": f"docs/{doc_id}/digest.md",
+            "tags": tags,
+            "created_at": now_str,
+            "content_hash": content_hash,
+        })
+        index["last_updated"] = now_str
+        tmp_path = index_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, index_path)
 
 
 @asynccontextmanager
