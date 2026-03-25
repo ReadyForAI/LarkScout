@@ -49,10 +49,12 @@ _session_sem = asyncio.Semaphore(_MAX_CONCURRENT_SESSIONS)
 BASE_DIR = Path(__file__).resolve().parent
 
 # ---- Document library (shared with docreader) ----
-_DEFAULT_DOCS_DIR = Path(os.environ.get(
-    "LARKSCOUT_DOCS_DIR",
-    os.path.expanduser("~/.larkscout/docs"),
-))
+_DEFAULT_DOCS_DIR = Path(
+    os.environ.get(
+        "LARKSCOUT_DOCS_DIR",
+        os.path.expanduser("~/.larkscout/docs"),
+    )
+)
 
 # ---- URL validation (anti-SSRF) ----
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -107,9 +109,11 @@ class Session:
     page: Page
     lang: str
     last_distill: dict[str, Any] | None = None
-    action_map: dict[str, dict[str, Any]] = field(default_factory=dict)  # ✅ IMPROVED: field(default_factory)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)              # concurrency lock
-    closed: bool = False                                                   # set when session is evicted/expired
+    action_map: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )  # ✅ IMPROVED: field(default_factory)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # concurrency lock
+    closed: bool = False  # set when session is evicted/expired
     # WebMCP: cached tool list
     webmcp_tools: list[dict[str, Any]] | None = None
     webmcp_available: bool = False
@@ -444,22 +448,26 @@ def _make_stable_sid(heading: str | None, text: str) -> str:
     return "s_" + hashlib.sha1(raw).hexdigest()[:10]
 
 
-def _sections_diff(old_sections: list[dict[str, Any]], new_sections: list[dict[str, Any]]) -> dict[str, Any]:
+def _sections_diff(
+    old_sections: list[dict[str, Any]], new_sections: list[dict[str, Any]]
+) -> dict[str, Any]:
     old_map = {s["sid"]: _hash_text(s["t"]) for s in old_sections}
     new_map = {s["sid"]: _hash_text(s["t"]) for s in new_sections}
 
     old_sids = set(old_map)
     new_sids = set(new_map)
 
-    added = sorted(new_sids - old_sids)       # set comprehension
+    added = sorted(new_sids - old_sids)  # set comprehension
     removed = sorted(old_sids - new_sids)
     changed = sorted(sid for sid in (old_sids & new_sids) if old_map[sid] != new_map[sid])
 
     return {"added_sids": added, "removed_sids": removed, "changed_sids": changed}
 
 
-def _actions_diff(old_actions: list[dict[str, Any]], new_actions: list[dict[str, Any]]) -> dict[str, Any]:
-    old_set = {a["aid"] for a in old_actions}   # ✅ IMPROVED
+def _actions_diff(
+    old_actions: list[dict[str, Any]], new_actions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    old_set = {a["aid"] for a in old_actions}  # ✅ IMPROVED
     new_set = {a["aid"] for a in new_actions}
     return {
         "actions_added": sorted(new_set - old_set),
@@ -482,7 +490,11 @@ def _dedup_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     out = []
     for a in actions:
-        key = (a.get("role", ""), a.get("name", ""), json.dumps(a.get("strategy", {}), sort_keys=True))
+        key = (
+            a.get("role", ""),
+            a.get("name", ""),
+            json.dumps(a.get("strategy", {}), sort_keys=True),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -492,7 +504,14 @@ def _dedup_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _rank_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     src_w = {"dom": 0.03, "a11y": 0.02, "vision": 0.01}
-    role_w = {"textbox": 0.03, "button": 0.02, "combobox": 0.02, "link": 0.015, "checkbox": 0.01, "radio": 0.01}
+    role_w = {
+        "textbox": 0.03,
+        "button": 0.02,
+        "combobox": 0.02,
+        "link": 0.015,
+        "checkbox": 0.01,
+        "radio": 0.01,
+    }
 
     def score(a) -> float:
         c = float(a.get("confidence", 0.7))
@@ -509,7 +528,7 @@ def _rank_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _trim_action_fields(a: dict[str, Any], name_max: int, selector_max: int) -> dict[str, Any]:
     a = dict(a)
-    a["name"] = _smart_truncate(a.get("name") or "", name_max)   # word-boundary truncation
+    a["name"] = _smart_truncate(a.get("name") or "", name_max)  # word-boundary truncation
 
     strat = dict(a.get("strategy") or {})
     if strat.get("type") == "css":
@@ -544,7 +563,9 @@ def _apply_total_output_budget(
     name_max: int,
     selector_max: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    actions = [_trim_action_fields(a, name_max=name_max, selector_max=selector_max) for a in actions]
+    actions = [
+        _trim_action_fields(a, name_max=name_max, selector_max=selector_max) for a in actions
+    ]
 
     meta_chars = _estimate_meta_chars(meta)
     sec_chars = sum(len(s.get("t") or "") + len(s.get("h") or "") for s in sections)
@@ -593,7 +614,7 @@ def _apply_total_output_budget(
                 packed.append(b)
                 used += size2
 
-    for a in ranked[len(packed):]:
+    for a in ranked[len(packed) :]:
         size = _estimate_action_chars(a)
         if used + size > remaining:
             continue
@@ -606,10 +627,15 @@ def _apply_total_output_budget(
 # ============================================================
 # Routing: block resources
 # ============================================================
-_BLOCKED_KEYWORDS = frozenset([
-    "doubleclick", "googletagmanager", "google-analytics",
-    "facebook.com/tr", "segment.com",
-])
+_BLOCKED_KEYWORDS = frozenset(
+    [
+        "doubleclick",
+        "googletagmanager",
+        "google-analytics",
+        "facebook.com/tr",
+        "segment.com",
+    ]
+)
 
 _BLOCKED_RESOURCE_TYPES = frozenset(["image", "media", "font"])
 
@@ -1225,6 +1251,7 @@ def _init_yolo():
         return
     try:
         import onnxruntime as ort
+
         YOLO_SESSION = ort.InferenceSession(YOLO_ONNX_PATH, providers=["CPUExecutionProvider"])
         YOLO_INPUT_NAME = YOLO_SESSION.get_inputs()[0].name
         YOLO_OUTPUT_NAMES = [o.name for o in YOLO_SESSION.get_outputs()]
@@ -1296,7 +1323,10 @@ def _decode_yolov8_like(out: np.ndarray, conf_thresh: float):
 
 
 def yolo_detect_ui_components(
-    image_bytes: bytes, conf_thresh: float, iou_thresh: float, max_boxes: int,
+    image_bytes: bytes,
+    conf_thresh: float,
+    iou_thresh: float,
+    max_boxes: int,
 ) -> list[dict[str, Any]]:
     if not YOLO_ENABLED or YOLO_SESSION is None:
         return []
@@ -1321,12 +1351,14 @@ def yolo_detect_ui_components(
         y2 = float(np.clip((y2 - pad_h) / ratio, 0, h0 - 1))
 
         cid = int(class_ids[i])
-        dets.append({
-            "bbox": [x1, y1, x2, y2],
-            "class_id": cid,
-            "type": YOLO_CLASS_MAP.get(cid, f"class_{cid}"),
-            "score": float(scores[i]),
-        })
+        dets.append(
+            {
+                "bbox": [x1, y1, x2, y2],
+                "class_id": cid,
+                "type": YOLO_CLASS_MAP.get(cid, f"class_{cid}"),
+                "score": float(scores[i]),
+            }
+        )
     return dets
 
 
@@ -1399,7 +1431,7 @@ def _blocks_to_sections_stable(
     used = 0
     seen = set()
 
-    for (h, body, sec_type, tbl_meta) in sections_raw[:max_sections]:
+    for h, body, sec_type, tbl_meta in sections_raw[:max_sections]:
         if used >= total_budget:
             break
         remain = total_budget - used
@@ -1414,7 +1446,7 @@ def _blocks_to_sections_stable(
         # Auto-use first sentence as heading when empty
         effective_h = h
         if not effective_h:
-            first_sentence = re.split(r'[.!?。！？\n]', body)[0].strip()
+            first_sentence = re.split(r"[.!?。！？\n]", body)[0].strip()
             if first_sentence and len(first_sentence) > 10:
                 effective_h = _smart_truncate(first_sentence, 80)
 
@@ -1445,10 +1477,17 @@ async def _extract_actions_dom(page: Page, max_actions: int) -> list[dict[str, A
             strategy = {"type": "css", "selector": css}
 
         aid = _aid({"role": role, "name": name, "strategy": strategy})
-        actions.append({
-            "aid": aid, "role": role, "name": name, "strategy": strategy,
-            "actions": acts, "confidence": 0.8, "source": "dom",
-        })
+        actions.append(
+            {
+                "aid": aid,
+                "role": role,
+                "name": name,
+                "strategy": strategy,
+                "actions": acts,
+                "confidence": 0.8,
+                "source": "dom",
+            }
+        )
     return actions
 
 
@@ -1485,10 +1524,17 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict
             for role, name in uniq:
                 strategy = {"type": "role", "role": role, "name": name}
                 aid = _aid({"role": role, "name": name, "strategy": strategy})
-                actions.append({
-                    "aid": aid, "role": role, "name": name, "strategy": strategy,
-                    "actions": _pick_action_methods(role), "confidence": 0.85, "source": "a11y",
-                })
+                actions.append(
+                    {
+                        "aid": aid,
+                        "role": role,
+                        "name": name,
+                        "strategy": strategy,
+                        "actions": _pick_action_methods(role),
+                        "confidence": 0.85,
+                        "source": "a11y",
+                    }
+                )
             return actions, "accessibility.snapshot"
     except Exception:
         pass
@@ -1507,7 +1553,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict
         role = (mm.group(1) or "").strip().lower()
         name = (mm.group(2) or "").strip()
         if role in roles and name:
-            out2.append((role, name.replace(r'\"', '"')))
+            out2.append((role, name.replace(r"\"", '"')))
         if len(out2) >= max_actions * 3:
             break
 
@@ -1524,10 +1570,17 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict
     for role, name in uniq2:
         strategy = {"type": "role", "role": role, "name": name}
         aid = _aid({"role": role, "name": name, "strategy": strategy})
-        actions2.append({
-            "aid": aid, "role": role, "name": name, "strategy": strategy,
-            "actions": _pick_action_methods(role), "confidence": 0.82, "source": "a11y",
-        })
+        actions2.append(
+            {
+                "aid": aid,
+                "role": role,
+                "name": name,
+                "strategy": strategy,
+                "actions": _pick_action_methods(role),
+                "confidence": 0.82,
+                "source": "a11y",
+            }
+        )
     return actions2, "aria_snapshot"
 
 
@@ -1575,11 +1628,17 @@ async def _extract_actions_vision(page: Page, req: DistillRequest) -> list[dict[
             strategy = {"type": "css", "selector": css}
 
         aid = _aid({"role": role, "name": name, "strategy": strategy})
-        actions.append({
-            "aid": aid, "role": role, "name": name, "strategy": strategy,
-            "actions": _pick_action_methods(role),
-            "confidence": float(d.get("score", 0.6)), "source": "vision",
-        })
+        actions.append(
+            {
+                "aid": aid,
+                "role": role,
+                "name": name,
+                "strategy": strategy,
+                "actions": _pick_action_methods(role),
+                "confidence": float(d.get("score", 0.6)),
+                "source": "vision",
+            }
+        )
     return actions
 
 
@@ -1603,18 +1662,27 @@ async def _discover_webmcp_tools(session: Session, force: bool = False) -> dict[
     all_tools: list[dict[str, Any]] = []
 
     for tool in raw.get("imperative_tools", []):
-        all_tools.append({
-            "name": tool.get("name", ""), "description": tool.get("description", ""),
-            "input_schema": tool.get("inputSchema"), "read_only": tool.get("readOnly", False),
-            "source": "webmcp_imperative",
-        })
+        all_tools.append(
+            {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("inputSchema"),
+                "read_only": tool.get("readOnly", False),
+                "source": "webmcp_imperative",
+            }
+        )
 
     for tool in raw.get("declarative_tools", []):
-        all_tools.append({
-            "name": tool.get("name", ""), "description": tool.get("description", ""),
-            "input_schema": tool.get("inputSchema"), "read_only": tool.get("readOnly", False),
-            "auto_submit": tool.get("autoSubmit", False), "source": "webmcp_declarative",
-        })
+        all_tools.append(
+            {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("inputSchema"),
+                "read_only": tool.get("readOnly", False),
+                "auto_submit": tool.get("autoSubmit", False),
+                "source": "webmcp_declarative",
+            }
+        )
         if not available:
             available = True
 
@@ -1640,20 +1708,33 @@ async def _invoke_webmcp_tool(
             result = await session.page.evaluate(WEBMCP_INVOKE_IMPERATIVE_JS, tool_name, params)
         elif tool["source"] == "webmcp_declarative":
             auto_submit = tool.get("auto_submit", False)
-            result = await session.page.evaluate(WEBMCP_INVOKE_DECLARATIVE_JS, tool_name, params, auto_submit)
+            result = await session.page.evaluate(
+                WEBMCP_INVOKE_DECLARATIVE_JS, tool_name, params, auto_submit
+            )
         else:
             return {"success": False, "error": f"unknown source: {tool['source']}"}
 
         try:
-            await session.page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 5000))
+            await session.page.wait_for_load_state(
+                "domcontentloaded", timeout=min(timeout_ms, 5000)
+            )
         except Exception:
             pass
         await _maybe_switch_to_new_page(session)
 
-        return {"success": True, "result": result, "url_before": url_before, "url_after": session.page.url}
+        return {
+            "success": True,
+            "result": result,
+            "url_before": url_before,
+            "url_after": session.page.url,
+        }
     except Exception as e:
-        return {"success": False, "error": f"{type(e).__name__}: {e}",
-                "url_before": url_before, "url_after": session.page.url}
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+            "url_before": url_before,
+            "url_after": session.page.url,
+        }
 
 
 # ============================================================
@@ -1706,9 +1787,12 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
                 # Table extraction: Readability strips <table>, extract from original DOM
                 if req.extract_tables:
                     try:
-                        extracted_tables = await page.evaluate(
-                            EXTRACT_TABLES_JS, req.max_table_rows, req.max_tables
-                        ) or []
+                        extracted_tables = (
+                            await page.evaluate(
+                                EXTRACT_TABLES_JS, req.max_table_rows, req.max_tables
+                            )
+                            or []
+                        )
                     except Exception:
                         extracted_tables = []
 
@@ -1741,17 +1825,22 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
         webmcp_result = await _discover_webmcp_tools(session)
         for wt in webmcp_result.get("tools", []):
             aid = _aid({"webmcp": wt["name"], "source": wt["source"]})
-            actions.append({
-                "aid": aid, "role": "webmcp_tool",
-                "name": f"[WebMCP] {wt['name']}: {(wt.get('description') or '')[:80]}",
-                "strategy": {
-                    "type": "webmcp", "tool_name": wt["name"],
-                    "source": wt["source"], "input_schema": wt.get("input_schema"),
-                },
-                "actions": ["invoke"],
-                "confidence": 0.95,
-                "source": wt["source"],
-            })
+            actions.append(
+                {
+                    "aid": aid,
+                    "role": "webmcp_tool",
+                    "name": f"[WebMCP] {wt['name']}: {(wt.get('description') or '')[:80]}",
+                    "strategy": {
+                        "type": "webmcp",
+                        "tool_name": wt["name"],
+                        "source": wt["source"],
+                        "input_schema": wt.get("input_schema"),
+                    },
+                    "actions": ["invoke"],
+                    "confidence": 0.95,
+                    "source": wt["source"],
+                }
+            )
 
         # Original DOM extraction
         actions.extend(await _extract_actions_dom(page, max_actions=req.max_actions))
@@ -1759,7 +1848,9 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
         if req.enable_a11y_fallback and len(actions) < req.min_actions_before_fallback:
             a11y_attempted = True
             try:
-                a11y_actions, a11y_mode = await _extract_actions_a11y(page, max_actions=req.max_actions)
+                a11y_actions, a11y_mode = await _extract_actions_a11y(
+                    page, max_actions=req.max_actions
+                )
                 actions.extend(a11y_actions)
             except Exception as e:
                 a11y_error = f"{type(e).__name__}: {e}"
@@ -1777,7 +1868,8 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
         "readability_available": READABILITY_AVAILABLE,
         "yolo_enabled": YOLO_ENABLED,
         "a11y": {
-            "attempted": a11y_attempted, "mode": a11y_mode,
+            "attempted": a11y_attempted,
+            "mode": a11y_mode,
             "error": (a11y_error[:200] if a11y_error else None),
         },
         # WebMCP: meta info
@@ -1795,7 +1887,9 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
     }
 
     sections, actions, meta = _apply_total_output_budget(
-        sections=sections, actions=actions, meta=meta,
+        sections=sections,
+        actions=actions,
+        meta=meta,
         total_budget=req.total_output_budget_chars,
         min_actions_to_keep=req.min_actions_to_keep,
         name_max=req.max_action_name_chars,
@@ -1812,8 +1906,12 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
     }
 
     session.last_distill = {
-        "url": url, "title": title, "content_hash": content_hash,
-        "sections": sections, "actions": actions, "meta": meta,
+        "url": url,
+        "title": title,
+        "content_hash": content_hash,
+        "sections": sections,
+        "actions": actions,
+        "meta": meta,
     }
     session.action_map = {a["aid"]: a for a in actions}
     return session.last_distill
@@ -1860,6 +1958,7 @@ _browser: Browser | None = None
 # Document library helpers (shared with docreader)
 # ============================================================
 
+
 def _get_docs_dir() -> Path:
     """Return the document library root, creating it if necessary."""
     d = _DEFAULT_DOCS_DIR
@@ -1878,15 +1977,19 @@ def _next_web_doc_id(docs_dir: Path) -> str:
         counter = 1
         if counter_path.exists():
             try:
-                counter = int(counter_path.read_text().strip())
+                counter = int(counter_path.read_text(encoding="utf-8").strip())
             except ValueError:
                 counter = 1
         doc_id = f"WEB-{counter:03d}"
-        counter_path.write_text(str(counter + 1))
+        tmp = counter_path.with_suffix(".tmp")
+        tmp.write_text(str(counter + 1), encoding="utf-8")
+        os.replace(tmp, counter_path)
         return doc_id
 
 
-def _build_web_digest(title: str | None, sections: list[dict[str, Any]], max_chars: int = 600) -> str:
+def _build_web_digest(
+    title: str | None, sections: list[dict[str, Any]], max_chars: int = 600
+) -> str:
     """Build a short digest from page title and section headings/snippets."""
     parts: list[str] = []
     if title:
@@ -1934,6 +2037,14 @@ def _build_manifest_sections(
     return result
 
 
+def _write_text_atomic(path: Path, content: str) -> None:
+    """Write text atomically via temp file + os.replace."""
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
 def _persist_web_capture(
     doc_id: str,
     url: str,
@@ -1956,9 +2067,7 @@ def _persist_web_capture(
     table_sections = [s for s in sections if s.get("type") == "table"]
 
     # digest.md
-    (doc_dir / "digest.md").write_text(
-        f"# {doc_id}: {title or url}\n\n{digest}\n", encoding="utf-8"
-    )
+    _write_text_atomic(doc_dir / "digest.md", f"# {doc_id}: {title or url}\n\n{digest}\n")
 
     # sections/
     for i, sec in enumerate(text_sections, 1):
@@ -1968,7 +2077,7 @@ def _persist_web_capture(
         safe_h = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", h).strip().replace(" ", "-")[:40] or "section"
         fname = f"{i:02d}-{sid}-{safe_h}.md"
         header = f"## {h}\n\n" if h else ""
-        (sections_dir / fname).write_text(f"{header}{body}\n", encoding="utf-8")
+        _write_text_atomic(sections_dir / fname, f"{header}{body}\n")
 
     # tables/
     if table_sections:
@@ -1978,9 +2087,7 @@ def _persist_web_capture(
             body = tbl.get("t", "")
             meta = tbl.get("table_meta") or {}
             meta_comment = f"\n<!-- table_meta: {json.dumps(meta)} -->\n" if meta else ""
-            (tables_dir / f"table-{i:02d}.md").write_text(
-                f"# {h}\n\n{body}\n{meta_comment}", encoding="utf-8"
-            )
+            _write_text_atomic(tables_dir / f"table-{i:02d}.md", f"# {h}\n\n{body}\n{meta_comment}")
 
     # manifest.json
     manifest: dict[str, Any] = {
@@ -2001,8 +2108,8 @@ def _persist_web_capture(
             "content_hash": content_hash,
         },
     }
-    (doc_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    _write_text_atomic(
+        doc_dir / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)
     )
 
     # doc-index.json (v2, shared with docreader) — locked + atomic write
@@ -2018,6 +2125,8 @@ def _persist_web_capture(
             index = {"version": 2, "documents": []}
 
         index["version"] = 2
+        if not isinstance(index.get("documents"), list):
+            index["documents"] = []
         index["documents"] = [d for d in index["documents"] if d.get("id") != doc_id]
         index["documents"].append({
             "id": doc_id,
@@ -2089,7 +2198,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await _pw.stop()
 
 
-app = FastAPI(title="Agent Browser Service (Playwright + WebMCP)", version="0.6.0", lifespan=lifespan)
+app = FastAPI(
+    title="Agent Browser Service (Playwright + WebMCP)", version="0.6.0", lifespan=lifespan
+)
 
 
 # ============================================================
@@ -2183,7 +2294,9 @@ async def distill(req: DistillRequest) -> DistillResponse:
             out["meta"]["diff"] = {"note": "no_previous_snapshot"}
 
         return DistillResponse(
-            url=out["url"], title=out["title"], content_hash=out["content_hash"],
+            url=out["url"],
+            title=out["title"],
+            content_hash=out["content_hash"],
             sections=[Section(**s) for s in out["sections"]],
             actions=[ActionDescriptor(**a) for a in out["actions"]] if req.include_actions else [],
             meta=out["meta"],
@@ -2204,12 +2317,16 @@ async def read_sections(req: ReadSectionsRequest) -> ReadSectionsResponse:
             s = sec_map.get(sid)
             if not s:
                 continue
-            picked.append({"sid": sid, "h": s.get("h"), "t": _clip(s.get("t", ""), req.max_section_chars)})
+            picked.append(
+                {"sid": sid, "h": s.get("h"), "t": _clip(s.get("t", ""), req.max_section_chars)}
+            )
 
         avail = [s["sid"] for s in out["sections"][:60]]
 
         return ReadSectionsResponse(
-            url=out["url"], title=out["title"], content_hash=out["content_hash"],
+            url=out["url"],
+            title=out["title"],
+            content_hash=out["content_hash"],
             picked_sections=[Section(**s) for s in picked],
             available_section_ids=avail,
         )
@@ -2238,14 +2355,18 @@ async def act(req: ActRequest) -> ActResponse:
         try:
             # WebMCP: route to invoke instead of DOM action
             if ad.get("strategy", {}).get("type") == "webmcp":
-                tool_name = ad["strategy"]["tool_name"]
+                tool_name = ad.get("strategy", {}).get("tool_name")
+                if not tool_name:
+                    raise HTTPException(400, "webmcp action missing tool_name")
                 params = {}
                 if req.text:
                     try:
                         params = json.loads(req.text)
                     except Exception:
                         params = {"input": req.text}
-                invoke_result = await _invoke_webmcp_tool(sess, tool_name, params, timeout_ms=req.timeout_ms)
+                invoke_result = await _invoke_webmcp_tool(
+                    sess, tool_name, params, timeout_ms=req.timeout_ms
+                )
                 if not invoke_result.get("success"):
                     raise HTTPException(500, f"webmcp invoke failed: {invoke_result.get('error')}")
             else:
@@ -2305,7 +2426,11 @@ async def act(req: ActRequest) -> ActResponse:
             **sec_diff,
         }
 
-        top_sections = [Section(**s) for s in after_sections[:req.top_k_sections]] if req.return_top_sections else []
+        top_sections = (
+            [Section(**s) for s in after_sections[: req.top_k_sections]]
+            if req.return_top_sections
+            else []
+        )
         actions_sample = [ActionDescriptor(**a) for a in new_out["actions"][:12]]
 
         title = None
@@ -2315,8 +2440,12 @@ async def act(req: ActRequest) -> ActResponse:
             title = new_out.get("title")
 
         return ActResponse(
-            url_before=before_url, url_after=after_url, title=title,
-            changed=changed, top_sections=top_sections, actions_sample=actions_sample,
+            url_before=before_url,
+            url_after=after_url,
+            title=title,
+            changed=changed,
+            top_sections=top_sections,
+            actions_sample=actions_sample,
         )
 
 
@@ -2475,8 +2604,14 @@ async def capture(req: CaptureRequest) -> CaptureResponse:
             docs_dir = _get_docs_dir()
             doc_id = _next_web_doc_id(docs_dir)
             _persist_web_capture(
-                doc_id=doc_id, url=url, title=title, sections=sections,
-                digest=digest, tags=req.tags, content_hash=content_hash, docs_dir=docs_dir,
+                doc_id=doc_id,
+                url=url,
+                title=title,
+                sections=sections,
+                digest=digest,
+                tags=req.tags,
+                content_hash=content_hash,
+                docs_dir=docs_dir,
             )
 
             return CaptureResponse(
