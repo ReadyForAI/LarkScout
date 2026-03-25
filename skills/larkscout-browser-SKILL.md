@@ -23,6 +23,8 @@ triggers:
   - "table extraction"
   - "web table"
   - "data collection"
+  - "web capture"
+  - "capture page"
 ---
 
 # SKILL: LarkScout Browser (Semantic Distillation Browser + WebMCP)
@@ -215,6 +217,25 @@ Verifies:
 - Readability availability
 - YOLO enabled status
 - `webmcp_support` field (always `true`, indicating server-side WebMCP support)
+
+Response example:
+
+```json
+{
+  "ok": true,
+  "sessions": 2,
+  "readability_available": true,
+  "readability_js_path": "~/.larkscout/Readability.js",
+  "yolo_enabled": false,
+  "yolo_onnx_path": null,
+  "yolo_input_size": 640,
+  "webmcp_support": true
+}
+```
+
+Notes:
+- Filesystem paths are masked (`~` replaces the home directory) for security
+- `sessions` shows the current number of active browser sessions
 
 ### 5.2 Create Session
 
@@ -711,6 +732,57 @@ Request body: `{ "session_id": "s_xxx" }`
 
 Notes: Always `close` after each task to release resources. Even if forgotten, the service auto-cleans sessions after 30 minutes of idle time.
 
+### 5.13 One-Shot Web Capture (Persist to Document Library)
+
+- `POST /web/capture`
+
+Request body:
+
+```json
+{
+  "url": "https://example.com/article",
+  "tags": ["research", "Q3"],
+  "extract_tables": true,
+  "lang": "en-US",
+  "timeout_ms": 25000
+}
+```
+
+| Parameter        | Type     | Default        | Description                                      |
+| ---------------- | -------- | -------------- | ------------------------------------------------ |
+| `url`            | string   | (required)     | URL to capture                                   |
+| `tags`           | string[] | `[]`           | Tags for the captured document                   |
+| `extract_tables` | bool     | `true`         | Whether to extract HTML tables                   |
+| `lang`           | string   | `"en-US"`      | Browser locale                                   |
+| `timeout_ms`     | int      | `25000`        | Page load timeout in milliseconds                |
+
+Response example:
+
+```json
+{
+  "doc_id": "WEB-005",
+  "digest": "Article covers Q3 revenue trends across regions...",
+  "section_count": 8,
+  "table_count": 2
+}
+```
+
+**Key notes:**
+
+- This is a convenience endpoint that internally runs: `session/new → goto → distill → persist → session/close`
+- The captured page is persisted to the document library (same `doc-index.json` shared with DocReader)
+- The session is always closed after capture, even on error
+- Rate-limited: returns `429` when too many concurrent captures are in progress
+- URL validation: private IPs, localhost, and non-HTTP(S) schemes are blocked
+
+**When to use `/capture` vs manual session flow:**
+
+| Scenario                           | Use                          |
+| ---------------------------------- | ---------------------------- |
+| Save a page for later reference    | `/capture` (one-shot)        |
+| Interactive browsing + persistence | Manual session flow + custom persist |
+| Batch URL collection               | Multiple `/capture` calls    |
+
 ---
 
 ## 6. Agent Call Templates (Recommended)
@@ -873,6 +945,7 @@ When Agent later searches "Q3 revenue", web tables and Excel tables are discover
 
 | Error                                       | Cause                                          | Solution                                                                                           |
 | ------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `429 too many concurrent requests`          | Rate limit exceeded                            | Wait and retry — server limits concurrent captures/sessions                                        |
 | `404 session not found`                     | Session expired or closed                      | Create a new session with `new`                                                                    |
 | `502 goto failed`                           | Page load timeout or network issue             | Switch to `wait_until=domcontentloaded` or increase `timeout_ms`                                   |
 | `404 aid not found`                         | Actions expired (page changed)                 | Re-run `distill` to get latest actions                                                             |

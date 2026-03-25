@@ -14,6 +14,8 @@ triggers:
   - "document library search"
   - ".pdf"
   - ".docx"
+  - ".xlsx"
+  - ".csv"
 ---
 
 # SKILL: LarkScout DocReader (Document Parsing HTTP API)
@@ -110,10 +112,14 @@ Response example:
 {
   "ok": true,
   "version": "3.0.0",
-  "docs_dir": "/home/user/.larkscout/docs",
-  "supported_formats": ["pdf", "docx"]
+  "docs_dir": "~/.larkscout/docs",
+  "supported_formats": ["pdf", "docx", "xlsx", "csv"]
 }
 ```
+
+Notes:
+- `docs_dir` shows a masked path (`~` replaces the home directory) — this is intentional for security
+- `supported_formats` includes `xlsx` and `csv` in addition to `pdf` and `docx`
 
 ### 4.2 Upload and Parse Document (Core)
 
@@ -124,7 +130,7 @@ Request parameters:
 
 | Parameter             | Type   | Default    | Description                                                                             |
 | --------------------- | ------ | ---------- | --------------------------------------------------------------------------------------- |
-| `file`                | File   | (required) | File to upload (.pdf or .docx)                                                          |
+| `file`                | File   | (required) | File to upload (.pdf, .docx, .xlsx, or .csv)                                            |
 | `doc_id`              | string | Auto-increment | Manually specify DOC-ID                                                             |
 | `generate_summary`    | bool   | `true`     | Whether to generate summaries (false = extract text only)                               |
 | `force_ocr`           | bool   | `false`    | Force OCR on all pages                                                                  |
@@ -373,13 +379,15 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 
 | Error                                              | Cause                          | Solution                                                                   |
 | -------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------------- |
-| `422 unsupported format`                           | Uploaded non-PDF/DOCX file     | Check file format                                                          |
+| `422 unsupported format`                           | Uploaded non-supported file    | Check file format (pdf, docx, xlsx, csv supported)                         |
+| `429 too many concurrent requests`                 | Rate limit exceeded            | Wait and retry — server limits concurrent parse operations                 |
 | `404 document not found`                           | Invalid doc_id or unparsed doc | Use search to confirm doc_id first                                         |
 | `404 section not found`                            | Invalid sid                    | Call `/doc/library/{doc_id}/sections` first to get valid sid list           |
 | `500 parse failed`                                 | Corrupted or encrypted PDF     | Prompt user to check the file                                              |
 | `500 RuntimeError: Please set GEMINI_API_KEY`      | API key not configured         | Set environment variable and restart service                               |
 | Parsing takes too long                             | Large file + OCR               | Use `generate_summary=false` for fast extraction first, generate summary later |
 | Table is empty                                     | Tables in PDF are images       | Use `force_ocr=true` — OCR will attempt to recognize tables in images      |
+| XLSX/CSV truncated warning in metadata             | File exceeds MAX_PARSE_ROWS    | Normal — large spreadsheets are truncated for safety; check `metadata.truncated` |
 
 ---
 
