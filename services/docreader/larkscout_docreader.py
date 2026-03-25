@@ -41,9 +41,11 @@ _parse_sem = asyncio.Semaphore(_MAX_CONCURRENT_PARSE)
 # Data structures
 # ═══════════════════════════════════════════
 
+
 @dataclass
 class PageContent:
     """Single page content."""
+
     page_num: int
     text: str
     is_ocr: bool = False
@@ -53,6 +55,7 @@ class PageContent:
 @dataclass
 class Section:
     """Document section."""
+
     index: int
     title: str
     level: int  # heading level 1-3
@@ -65,6 +68,7 @@ class Section:
 @dataclass
 class ParsedDocument:
     """Parsed document result."""
+
     filename: str
     file_type: str  # "pdf" | "docx"
     total_pages: int
@@ -98,11 +102,12 @@ def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> 
 # Token estimation
 # ═══════════════════════════════════════════
 
+
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate. CJK ~2.5 chars/tok, Latin ~4 chars/tok."""
     if not text:
         return 0
-    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    cjk_count = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
     ratio = cjk_count / max(len(text), 1)
     chars_per_token = 2.5 * ratio + 4.0 * (1 - ratio)
     return int(len(text) / chars_per_token)
@@ -148,7 +153,7 @@ def _should_ocr(page, text: str, threshold: int) -> bool:
     except Exception:
         pass
     if len(text) > 0:
-        useful = sum(1 for c in text if c.isalnum() or '\u4e00' <= c <= '\u9fff')
+        useful = sum(1 for c in text if c.isalnum() or "\u4e00" <= c <= "\u9fff")
         if useful / len(text) < 0.3 and len(text) < threshold * 5:
             return True
     return False
@@ -168,6 +173,7 @@ def _ocr_cache_key(image_bytes: bytes) -> str:
 # Section stable ID
 # ═══════════════════════════════════════════
 
+
 def _section_sid(title: str, text: str) -> str:
     raw = (title + text[:200]).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:12]
@@ -176,6 +182,7 @@ def _section_sid(title: str, text: str) -> str:
 # ═══════════════════════════════════════════
 # PDF parsing
 # ═══════════════════════════════════════════
+
 
 def parse_pdf(
     filepath: Path,
@@ -258,7 +265,9 @@ def parse_pdf(
                     text = ck_path.read_text(encoding="utf-8")
                     logger.info(f"Page {page_num}/{total_pages}: OCR cache hit")
                     ocr_count += 1
-                    pages.append(PageContent(page_num=page_num, text=text, is_ocr=True, tables=tables))
+                    pages.append(
+                        PageContent(page_num=page_num, text=text, is_ocr=True, tables=tables)
+                    )
                     continue
 
             ocr_tasks.append((page_num, img_bytes))
@@ -305,17 +314,25 @@ def parse_pdf(
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
-    logger.info(f"Parse complete: {len(sections)} sections, {ocr_count} OCR pages, {table_count} tables")
+    logger.info(
+        f"Parse complete: {len(sections)} sections, {ocr_count} OCR pages, {table_count} tables"
+    )
 
     return ParsedDocument(
-        filename=filepath.name, file_type="pdf", total_pages=total_pages,
-        pages=pages, sections=sections, ocr_page_count=ocr_count, table_count=table_count,
+        filename=filepath.name,
+        file_type="pdf",
+        total_pages=total_pages,
+        pages=pages,
+        sections=sections,
+        ocr_page_count=ocr_count,
+        table_count=table_count,
     )
 
 
 # ═══════════════════════════════════════════
 # Word parsing
 # ═══════════════════════════════════════════
+
 
 def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
     from docx import Document
@@ -357,16 +374,23 @@ def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
-    logger.info(f"Parse complete: {len(sections)} sections, ~{est_pages} pages, {table_count} tables")
+    logger.info(
+        f"Parse complete: {len(sections)} sections, ~{est_pages} pages, {table_count} tables"
+    )
     return ParsedDocument(
-        filename=filepath.name, file_type="docx", total_pages=est_pages,
-        pages=pages, sections=sections, table_count=table_count,
+        filename=filepath.name,
+        file_type="docx",
+        total_pages=est_pages,
+        pages=pages,
+        sections=sections,
+        table_count=table_count,
     )
 
 
 # ═══════════════════════════════════════════
 # XLSX parsing
 # ═══════════════════════════════════════════
+
 
 def parse_xlsx(filepath: Path) -> ParsedDocument:
     """Parse an XLSX workbook; each sheet becomes one section and one Markdown table."""
@@ -407,14 +431,16 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
             table_count += 1
 
         sid = _section_sid(sheet_name, md_table)
-        sections.append(Section(
-            index=idx,
-            title=sheet_name,
-            level=1,
-            text=md_table,
-            page_range=f"sheet {idx}",
-            sid=sid,
-        ))
+        sections.append(
+            Section(
+                index=idx,
+                title=sheet_name,
+                level=1,
+                text=md_table,
+                page_range=f"sheet {idx}",
+                sid=sid,
+            )
+        )
 
     wb.close()
 
@@ -438,6 +464,7 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
 # ═══════════════════════════════════════════
 # CSV parsing
 # ═══════════════════════════════════════════
+
 
 def parse_csv(filepath: Path) -> ParsedDocument:
     """Parse a CSV file; the entire file becomes one section and one Markdown table."""
@@ -542,10 +569,15 @@ def _split_sections_from_toc(pages: list[PageContent], toc: list) -> list[Sectio
         text = "\n\n".join(text_parts).strip()
         if not text:
             continue
-        sections.append(Section(
-            index=len(sections) + 1, title=title.strip(),
-            level=min(level, 3), text=text, page_range=f"p.{start_page}-{end_page}",
-        ))
+        sections.append(
+            Section(
+                index=len(sections) + 1,
+                title=title.strip(),
+                level=min(level, 3),
+                text=text,
+                page_range=f"p.{start_page}-{end_page}",
+            )
+        )
 
     if len(sections) < 2:
         logger.warning("PDF TOC produced too few sections, falling back to regex split")
@@ -569,11 +601,15 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
             heading_level = _is_heading(line)
             if heading_level > 0 and current_lines:
                 sec_index += 1
-                sections.append(Section(
-                    index=sec_index, title=current_title, level=current_level,
-                    text="\n".join(current_lines),
-                    page_range=f"p.{current_start_page}-{page.page_num}",
-                ))
+                sections.append(
+                    Section(
+                        index=sec_index,
+                        title=current_title,
+                        level=current_level,
+                        text="\n".join(current_lines),
+                        page_range=f"p.{current_start_page}-{page.page_num}",
+                    )
+                )
                 current_title = line
                 current_level = heading_level
                 current_lines = []
@@ -586,17 +622,27 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
     if current_lines:
         sec_index += 1
         last_page = pages[-1].page_num if pages else 1
-        sections.append(Section(
-            index=sec_index, title=current_title, level=current_level,
-            text="\n".join(current_lines), page_range=f"p.{current_start_page}-{last_page}",
-        ))
+        sections.append(
+            Section(
+                index=sec_index,
+                title=current_title,
+                level=current_level,
+                text="\n".join(current_lines),
+                page_range=f"p.{current_start_page}-{last_page}",
+            )
+        )
 
     if not sections:
         full_text = "\n\n".join(p.text for p in pages)
-        sections.append(Section(
-            index=1, title=tmpl("full_document_title"), level=1, text=full_text,
-            page_range=f"p.1-{pages[-1].page_num if pages else 1}",
-        ))
+        sections.append(
+            Section(
+                index=1,
+                title=tmpl("full_document_title"),
+                level=1,
+                text=full_text,
+                page_range=f"p.1-{pages[-1].page_num if pages else 1}",
+            )
+        )
     return sections
 
 
@@ -611,10 +657,15 @@ def _split_sections_from_elements(elements: list[dict]) -> list[Section]:
         if elem["level"] > 0:
             if current_lines:
                 sec_index += 1
-                sections.append(Section(
-                    index=sec_index, title=current_title,
-                    level=current_level, text="\n".join(current_lines), page_range="",
-                ))
+                sections.append(
+                    Section(
+                        index=sec_index,
+                        title=current_title,
+                        level=current_level,
+                        text="\n".join(current_lines),
+                        page_range="",
+                    )
+                )
             current_title = elem["text"]
             current_level = elem["level"]
             current_lines = []
@@ -622,10 +673,15 @@ def _split_sections_from_elements(elements: list[dict]) -> list[Section]:
             heading_level = _is_heading(elem["text"]) if elem["type"] == "paragraph" else 0
             if heading_level > 0 and current_lines:
                 sec_index += 1
-                sections.append(Section(
-                    index=sec_index, title=current_title,
-                    level=current_level, text="\n".join(current_lines), page_range="",
-                ))
+                sections.append(
+                    Section(
+                        index=sec_index,
+                        title=current_title,
+                        level=current_level,
+                        text="\n".join(current_lines),
+                        page_range="",
+                    )
+                )
                 current_title = elem["text"]
                 current_level = heading_level
                 current_lines = []
@@ -634,19 +690,29 @@ def _split_sections_from_elements(elements: list[dict]) -> list[Section]:
 
     if current_lines:
         sec_index += 1
-        sections.append(Section(
-            index=sec_index, title=current_title,
-            level=current_level, text="\n".join(current_lines), page_range="",
-        ))
+        sections.append(
+            Section(
+                index=sec_index,
+                title=current_title,
+                level=current_level,
+                text="\n".join(current_lines),
+                page_range="",
+            )
+        )
     if not sections:
         full_text = "\n".join(e["text"] for e in elements)
-        sections.append(Section(index=1, title=tmpl("full_document_title"), level=1, text=full_text, page_range=""))
+        sections.append(
+            Section(
+                index=1, title=tmpl("full_document_title"), level=1, text=full_text, page_range=""
+            )
+        )
     return sections
 
 
 # ═══════════════════════════════════════════
 # Table utilities
 # ═══════════════════════════════════════════
+
 
 def _table_to_markdown(table_data: list[list]) -> str:
     if not table_data or len(table_data) < 2:
@@ -666,7 +732,7 @@ def _rows_to_markdown(rows: list[list[str]]) -> str:
     for row in clean_rows[1:]:
         while len(row) < len(clean_rows[0]):
             row.append("")
-        body_lines.append("| " + " | ".join(row[:len(clean_rows[0])]) + " |")
+        body_lines.append("| " + " | ".join(row[: len(clean_rows[0])]) + " |")
     return "\n".join([header, sep] + body_lines)
 
 
@@ -677,7 +743,9 @@ def _rows_to_markdown(rows: list[list[str]]) -> str:
 SUMMARY_MAX_CHARS = 500
 
 
-def generate_summaries(parsed: ParsedDocument, concurrency: int = 3) -> tuple[str, str, list[Section]]:
+def generate_summaries(
+    parsed: ParsedDocument, concurrency: int = 3
+) -> tuple[str, str, list[Section]]:
     logger.info("Generating summaries...")
 
     # Dynamic batching by token estimate
@@ -716,7 +784,8 @@ def generate_summaries(parsed: ParsedDocument, concurrency: int = 3) -> tuple[st
     else:
         sections_overview = "\n\n".join(
             f"## {sec.title} ({sec.page_range})\n{sec.summary[:SUMMARY_MAX_CHARS]}"
-            for sec in parsed.sections if sec.summary
+            for sec in parsed.sections
+            if sec.summary
         )
 
     brief = gemini_summarize(
@@ -790,7 +859,7 @@ def _summarize_batch(sections: list[Section]):
 def _compress_sections_for_brief(sections: list[Section]) -> str:
     groups = []
     for i in range(0, len(sections), 10):
-        group = sections[i:i + 10]
+        group = sections[i : i + 10]
         group_text = "; ".join(f"{s.title}: {s.summary[:150]}" for s in group if s.summary)
         groups.append(f"**Sections {group[0].index}-{group[-1].index}**: {group_text}")
     return "\n\n".join(groups)
@@ -800,9 +869,17 @@ def _compress_sections_for_brief(sections: list[Section]) -> str:
 # Output file writing
 # ═══════════════════════════════════════════
 
-def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, output_dir: Path,
-                 tags: list[str] | None = None, source: str = "upload",
-                 original_path: str | None = None):
+
+def write_output(
+    doc_id: str,
+    parsed: ParsedDocument,
+    digest: str,
+    brief: str,
+    output_dir: Path,
+    tags: list[str] | None = None,
+    source: str = "upload",
+    original_path: str | None = None,
+):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
     tables_dir = doc_dir / "tables"
@@ -819,8 +896,13 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
         "table_count": parsed.table_count,
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sections": [
-            {"index": sec.index, "sid": sec.sid, "title": sec.title,
-             "page_range": sec.page_range, "char_count": len(sec.text)}
+            {
+                "index": sec.index,
+                "sid": sec.sid,
+                "title": sec.title,
+                "page_range": sec.page_range,
+                "char_count": len(sec.text),
+            }
             for sec in parsed.sections
         ],
     }
@@ -830,19 +912,34 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
     _write_text(doc_dir / "digest.md", f"# {doc_id}: {parsed.filename}\n\n{digest}\n")
     logger.info("digest.md written")
 
-    brief_header = tmpl("brief_header",
-        doc_id=doc_id, filename=parsed.filename, pages=parsed.total_pages,
-        sections=len(parsed.sections), ocr_pages=parsed.ocr_page_count)
+    brief_header = tmpl(
+        "brief_header",
+        doc_id=doc_id,
+        filename=parsed.filename,
+        pages=parsed.total_pages,
+        sections=len(parsed.sections),
+        ocr_pages=parsed.ocr_page_count,
+    )
     _write_text(doc_dir / "brief.md", brief_header + brief + "\n")
     logger.info("brief.md written")
 
-    full_parts = [f"{'#' * min(sec.level + 1, 4)} {sec.title}\n\n{sec.text}" for sec in parsed.sections]
-    _write_text(doc_dir / "full.md", f"# {parsed.filename}\n\n" + "\n\n---\n\n".join(full_parts) + "\n")
+    full_parts = [
+        f"{'#' * min(sec.level + 1, 4)} {sec.title}\n\n{sec.text}" for sec in parsed.sections
+    ]
+    _write_text(
+        doc_dir / "full.md", f"# {parsed.filename}\n\n" + "\n\n---\n\n".join(full_parts) + "\n"
+    )
     logger.info("full.md written")
 
     for sec in parsed.sections:
         sec_filename = f"{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md"
-        sec_content = tmpl("section_header", title=sec.title, index=sec.index, sid=sec.sid, page_range=sec.page_range)
+        sec_content = tmpl(
+            "section_header",
+            title=sec.title,
+            index=sec.index,
+            sid=sec.sid,
+            page_range=sec.page_range,
+        )
         if sec.summary:
             sec_content += tmpl("section_summary_line", summary=sec.summary)
         sec_content += sec.text + "\n"
@@ -853,12 +950,16 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
     if all_tables:
         tables_dir.mkdir(exist_ok=True)
         for i, (page_num, table_md) in enumerate(all_tables, 1):
-            _write_text(tables_dir / f"table-{i:02d}.md", f"# Table {i} (page {page_num})\n\n{table_md}\n")
+            _write_text(
+                tables_dir / f"table-{i:02d}.md", f"# Table {i} (page {page_num})\n\n{table_md}\n"
+            )
         logger.info(f"tables/ ({len(all_tables)} files)")
 
     # v3: content_hash
     full_text = "\n".join(sec.text for sec in parsed.sections)
-    content_hash = "sha256:" + hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()
+    content_hash = (
+        "sha256:" + hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()
+    )
 
     # manifest.json + v3 provenance
     manifest = {
@@ -866,7 +967,12 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
         "filename": parsed.filename,
         "file_type": parsed.file_type,
         "source": source,
-        "paths": {"digest": "digest.md", "brief": "brief.md", "full": "full.md", "sections_dir": "sections/"},
+        "paths": {
+            "digest": "digest.md",
+            "brief": "brief.md",
+            "full": "full.md",
+            "sections_dir": "sections/",
+        },
         "sections": [
             {
                 "sid": sec.sid, "index": sec.index, "title": sec.title,
@@ -890,35 +996,59 @@ def write_output(doc_id: str, parsed: ParsedDocument, digest: str, brief: str, o
     _update_doc_index(output_dir, meta, digest, tags=tags, source=source, content_hash=content_hash)
 
 
-def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: Path,
-                              tags: list[str] | None = None, source: str = "upload"):
+def write_output_extract_only(
+    doc_id: str,
+    parsed: ParsedDocument,
+    output_dir: Path,
+    tags: list[str] | None = None,
+    source: str = "upload",
+):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
     doc_dir.mkdir(parents=True, exist_ok=True)
     sections_dir.mkdir(exist_ok=True)
 
     meta = {
-        "doc_id": doc_id, "filename": parsed.filename, "file_type": parsed.file_type,
-        "total_pages": parsed.total_pages, "section_count": len(parsed.sections),
-        "ocr_page_count": parsed.ocr_page_count, "table_count": parsed.table_count,
+        "doc_id": doc_id,
+        "filename": parsed.filename,
+        "file_type": parsed.file_type,
+        "total_pages": parsed.total_pages,
+        "section_count": len(parsed.sections),
+        "ocr_page_count": parsed.ocr_page_count,
+        "table_count": parsed.table_count,
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sections": [
-            {"index": sec.index, "sid": sec.sid, "title": sec.title,
-             "page_range": sec.page_range, "char_count": len(sec.text)}
+            {
+                "index": sec.index,
+                "sid": sec.sid,
+                "title": sec.title,
+                "page_range": sec.page_range,
+                "char_count": len(sec.text),
+            }
             for sec in parsed.sections
         ],
     }
     _write_json(doc_dir / ".meta.json", meta)
 
-    full_parts = [f"{'#' * min(sec.level + 1, 4)} {sec.title}\n\n{sec.text}" for sec in parsed.sections]
-    _write_text(doc_dir / "full.md", f"# {parsed.filename}\n\n" + "\n\n---\n\n".join(full_parts) + "\n")
+    full_parts = [
+        f"{'#' * min(sec.level + 1, 4)} {sec.title}\n\n{sec.text}" for sec in parsed.sections
+    ]
+    _write_text(
+        doc_dir / "full.md", f"# {parsed.filename}\n\n" + "\n\n---\n\n".join(full_parts) + "\n"
+    )
 
     for sec in parsed.sections:
         fn = f"{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md"
         _write_text(sections_dir / fn, f"# {sec.title}\n\n{sec.text}\n")
 
-    _write_text(doc_dir / "digest.md", f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{t('summary_pending')}\n")
-    _write_text(doc_dir / "brief.md", f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{t('summary_pending')}\n")
+    _write_text(
+        doc_dir / "digest.md",
+        f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{t('summary_pending')}\n",
+    )
+    _write_text(
+        doc_dir / "brief.md",
+        f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{t('summary_pending')}\n",
+    )
 
     full_text = "\n".join(sec.text for sec in parsed.sections)
     content_hash = "sha256:" + hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()
@@ -953,11 +1083,16 @@ def write_output_extract_only(doc_id: str, parsed: ParsedDocument, output_dir: P
 # Document index
 # ═══════════════════════════════════════════
 
-def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
-                      tags: list[str] | None = None,
-                      source: str = "upload",
-                      source_url: str | None = None,
-                      content_hash: str | None = None):
+
+def _update_doc_index(
+    docs_dir: Path,
+    meta: dict,
+    digest: str,
+    tags: list[str] | None = None,
+    source: str = "upload",
+    source_url: str | None = None,
+    content_hash: str | None = None,
+):
     """Update doc-index.json with threading lock and atomic write."""
     with _doc_index_lock:
         index_path = docs_dir / "doc-index.json"
@@ -971,6 +1106,8 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
             index = {"version": 2, "documents": []}
 
         index["version"] = 2
+        if not isinstance(index.get("documents"), list):
+            index["documents"] = []
         index["documents"] = [d for d in index["documents"] if d.get("id") != meta["doc_id"]]
 
         entry: dict[str, Any] = {
@@ -994,6 +1131,7 @@ def _update_doc_index(docs_dir: Path, meta: dict, digest: str,
 # Utility functions
 # ═══════════════════════════════════════════
 
+
 def _write_text(path: Path, content: str):
     """Write text atomically via temp file + os.replace."""
     tmp = path.with_suffix(".tmp")
@@ -1011,7 +1149,7 @@ def _write_json(path: Path, data: dict):
 
 
 def _safe_filename(title: str, max_len: int = 40) -> str:
-    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title)
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title)
     safe = safe.strip().replace(" ", "-")
     return (safe[:max_len] if len(safe) > max_len else safe) or "untitled"
 
@@ -1025,14 +1163,16 @@ def _next_doc_id(docs_dir: Path) -> str:
         counter_path = docs_dir / ".counter"
         if counter_path.exists():
             try:
-                counter = int(counter_path.read_text().strip())
+                counter = int(counter_path.read_text(encoding="utf-8").strip())
             except ValueError:
                 counter = 1
         else:
             counter = 1
         doc_id = f"DOC-{counter:03d}"
         counter_path.parent.mkdir(parents=True, exist_ok=True)
-        counter_path.write_text(str(counter + 1))
+        tmp = counter_path.with_suffix(".tmp")
+        tmp.write_text(str(counter + 1), encoding="utf-8")
+        os.replace(tmp, counter_path)
         return doc_id
 
 
@@ -1040,10 +1180,12 @@ def _next_doc_id(docs_dir: Path) -> str:
 # HTTP API（FastAPI）
 # ═══════════════════════════════════════════
 
-DEFAULT_DOCS_DIR = Path(os.environ.get(
-    "LARKSCOUT_DOCS_DIR",
-    os.path.expanduser("~/.larkscout/docs"),
-))
+DEFAULT_DOCS_DIR = Path(
+    os.environ.get(
+        "LARKSCOUT_DOCS_DIR",
+        os.path.expanduser("~/.larkscout/docs"),
+    )
+)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("LARKSCOUT_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 
@@ -1070,6 +1212,7 @@ def _get_docs_dir() -> Path:
 
 
 # ---- Pydantic Models ----
+
 
 class ParseResponse(BaseModel):
     doc_id: str
@@ -1187,7 +1330,9 @@ async def api_parse_doc(
         try:
             content = await file.read()
             if len(content) > MAX_UPLOAD_BYTES:
-                raise HTTPException(413, f"file too large: {len(content)} bytes (max {MAX_UPLOAD_BYTES})")
+                raise HTTPException(
+                    413, f"file too large: {len(content)} bytes (max {MAX_UPLOAD_BYTES})"
+                )
             tmp_path.write_bytes(content)
         except HTTPException:
             raise
@@ -1198,16 +1343,27 @@ async def api_parse_doc(
         try:
             loop = asyncio.get_event_loop()
             if suffix == ".pdf":
-                parsed = await loop.run_in_executor(None, lambda: parse_pdf(
-                    tmp_path, force_ocr=force_ocr, ocr_threshold=OCR_THRESHOLD,
-                    ocr_pages_spec=ocr_pages, extract_tables=extract_tables,
-                    max_tables_per_page=max_tables_per_page,
-                    concurrency=concurrency, cache_dir=docs_dir / d_id,
-                ))
+                parsed = await loop.run_in_executor(
+                    None,
+                    lambda: parse_pdf(
+                        tmp_path,
+                        force_ocr=force_ocr,
+                        ocr_threshold=OCR_THRESHOLD,
+                        ocr_pages_spec=ocr_pages,
+                        extract_tables=extract_tables,
+                        max_tables_per_page=max_tables_per_page,
+                        concurrency=concurrency,
+                        cache_dir=docs_dir / d_id,
+                    ),
+                )
             elif suffix == ".docx":
-                parsed = await loop.run_in_executor(None, lambda: parse_word(
-                    tmp_path, extract_tables=extract_tables,
-                ))
+                parsed = await loop.run_in_executor(
+                    None,
+                    lambda: parse_word(
+                        tmp_path,
+                        extract_tables=extract_tables,
+                    ),
+                )
             elif suffix == ".xlsx":
                 parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
             else:  # .csv
@@ -1229,14 +1385,30 @@ async def api_parse_doc(
                     None, lambda: generate_summaries(parsed, concurrency=concurrency)
                 )
                 digest = digest_text
-                await loop.run_in_executor(None, lambda: write_output(
-                    d_id, parsed, digest_text, brief_text, docs_dir,
-                    tags=parsed_tags, source="upload", original_path=str(filename),
-                ))
+                await loop.run_in_executor(
+                    None,
+                    lambda: write_output(
+                        d_id,
+                        parsed,
+                        digest_text,
+                        brief_text,
+                        docs_dir,
+                        tags=parsed_tags,
+                        source="upload",
+                        original_path=str(filename),
+                    ),
+                )
             else:
-                await loop.run_in_executor(None, lambda: write_output_extract_only(
-                    d_id, parsed, docs_dir, tags=parsed_tags, source="upload",
-                ))
+                await loop.run_in_executor(
+                    None,
+                    lambda: write_output_extract_only(
+                        d_id,
+                        parsed,
+                        docs_dir,
+                        tags=parsed_tags,
+                        source="upload",
+                    ),
+                )
         except Exception as e:
             raise HTTPException(500, t("write_failed", err=str(e)))
 
@@ -1256,6 +1428,7 @@ async def api_parse_doc(
 
 
 # ---- Library query endpoints ----
+
 
 @app.get("/library/search", response_model=SearchResponse)
 async def library_search(
@@ -1283,10 +1456,7 @@ async def library_search(
 
     if tags:
         tag_list = [t.strip() for t in tags.split(",")]
-        documents = [
-            d for d in documents
-            if any(t in (d.get("tags") or []) for t in tag_list)
-        ]
+        documents = [d for d in documents if any(t in (d.get("tags") or []) for t in tag_list)]
 
     if q:
         q_lower = q.lower()
