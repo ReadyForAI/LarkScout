@@ -985,6 +985,23 @@ DEFAULT_DOCS_DIR = Path(os.environ.get(
     os.path.expanduser("~/.larkscout/docs"),
 ))
 
+MAX_UPLOAD_BYTES = int(os.environ.get("LARKSCOUT_MAX_UPLOAD_MB", "200")) * 1024 * 1024
+
+_DOC_ID_RE = re.compile(r"^[A-Z]+-\d+$")
+_TABLE_ID_RE = re.compile(r"^(table-)?\d+$")
+
+
+def _validate_doc_id(doc_id: str) -> None:
+    """Reject doc_id values that could cause path traversal."""
+    if not _DOC_ID_RE.match(doc_id):
+        raise HTTPException(400, f"invalid doc_id: {doc_id!r}")
+
+
+def _validate_table_id(table_id: str) -> None:
+    """Reject table_id values that could cause path traversal."""
+    if not _TABLE_ID_RE.match(table_id):
+        raise HTTPException(400, f"invalid table_id: {table_id!r}")
+
 
 def _get_docs_dir() -> Path:
     d = DEFAULT_DOCS_DIR
@@ -1088,6 +1105,10 @@ async def api_parse_doc(
         except json.JSONDecodeError:
             parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
 
+    # Validate doc_id if user-supplied
+    if doc_id:
+        _validate_doc_id(doc_id)
+
     # Save temp file
     d_id = doc_id or _next_doc_id(docs_dir)
     tmp_dir = docs_dir / d_id / ".tmp"
@@ -1095,7 +1116,11 @@ async def api_parse_doc(
     tmp_path = tmp_dir / filename
     try:
         content = await file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"file too large: {len(content)} bytes (max {MAX_UPLOAD_BYTES})")
         tmp_path.write_bytes(content)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, t("file_save_failed", err=str(e)))
 
@@ -1233,6 +1258,7 @@ async def library_search(
 @app.get("/library/{doc_id}/manifest")
 async def get_manifest(doc_id: str):
     """Get document manifest."""
+    _validate_doc_id(doc_id)
     p = _get_docs_dir() / doc_id / "manifest.json"
     if not p.exists():
         raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
@@ -1242,6 +1268,7 @@ async def get_manifest(doc_id: str):
 @app.get("/library/{doc_id}/digest")
 async def get_digest(doc_id: str):
     """Get document digest (lowest token cost)."""
+    _validate_doc_id(doc_id)
     p = _get_docs_dir() / doc_id / "digest.md"
     if not p.exists():
         raise HTTPException(404, t("digest_not_found", doc_id=doc_id))
@@ -1251,6 +1278,7 @@ async def get_digest(doc_id: str):
 @app.get("/library/{doc_id}/brief")
 async def get_brief(doc_id: str):
     """Get document brief (medium token cost)."""
+    _validate_doc_id(doc_id)
     p = _get_docs_dir() / doc_id / "brief.md"
     if not p.exists():
         raise HTTPException(404, t("brief_not_found", doc_id=doc_id))
@@ -1260,6 +1288,7 @@ async def get_brief(doc_id: str):
 @app.get("/library/{doc_id}/full")
 async def get_full(doc_id: str):
     """Get full document text (high token cost, use sparingly)."""
+    _validate_doc_id(doc_id)
     p = _get_docs_dir() / doc_id / "full.md"
     if not p.exists():
         raise HTTPException(404, t("full_not_found", doc_id=doc_id))
@@ -1269,6 +1298,7 @@ async def get_full(doc_id: str):
 @app.get("/library/{doc_id}/section/{sid}")
 async def get_section(doc_id: str, sid: str):
     """Read a single section by sid."""
+    _validate_doc_id(doc_id)
     sections_dir = _get_docs_dir() / doc_id / "sections"
     if not sections_dir.exists():
         raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
@@ -1284,6 +1314,8 @@ async def get_section(doc_id: str, sid: str):
 @app.get("/library/{doc_id}/table/{table_id}")
 async def get_table(doc_id: str, table_id: str):
     """Read a single table."""
+    _validate_doc_id(doc_id)
+    _validate_table_id(table_id)
     tables_dir = _get_docs_dir() / doc_id / "tables"
     if not tables_dir.exists():
         raise HTTPException(404, t("tables_dir_not_found", doc_id=doc_id))
@@ -1299,6 +1331,7 @@ async def get_table(doc_id: str, table_id: str):
 @app.get("/library/{doc_id}/sections")
 async def list_sections(doc_id: str):
     """List all sections from manifest."""
+    _validate_doc_id(doc_id)
     manifest_path = _get_docs_dir() / doc_id / "manifest.json"
     if not manifest_path.exists():
         raise HTTPException(404, t("doc_not_found", doc_id=doc_id))

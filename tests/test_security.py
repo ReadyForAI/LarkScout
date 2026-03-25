@@ -1,0 +1,168 @@
+"""Security tests for TASK-016: path traversal, SSRF, upload size limits."""
+
+import io
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+# ── DocReader security ──────────────────────────────────────────────
+
+
+@pytest.fixture()
+def doc_client():
+    """TestClient for the docreader sub-app."""
+    from larkscout_docreader import app
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+class TestDocIdTraversal:
+    """C5: doc_id path traversal must be rejected.
+
+    Note: doc_ids containing '/' are naturally split by FastAPI routing and
+    never reach the handler. The validation guards against form-field injection
+    (POST /parse) and against names like '..' or 'back\\slash' that don't
+    contain '/' but are still dangerous.
+    """
+
+    # IDs that reach the handler (no literal '/' or '..') but are invalid
+    MALICIOUS_IDS = [
+        "back\\slash",
+        "not-valid",
+        "DOC001",      # missing hyphen
+        "doc-001",     # lowercase
+    ]
+
+    @pytest.mark.parametrize("doc_id", MALICIOUS_IDS)
+    def test_manifest_rejects_invalid_doc_id(self, doc_client, doc_id):
+        resp = doc_client.get(f"/library/{doc_id}/manifest")
+        assert resp.status_code == 400
+
+    def test_parse_rejects_traversal_doc_id(self, doc_client):
+        """POST /parse form field bypasses routing — test real traversal."""
+        for malicious_id in ["../../etc/passwd", "../secret", "DOC-001/../../etc"]:
+            fake_pdf = io.BytesIO(b"%PDF-1.4 fake")
+            resp = doc_client.post(
+                "/parse",
+                files={"file": ("test.pdf", fake_pdf, "application/pdf")},
+                data={"doc_id": malicious_id},
+            )
+            assert resp.status_code == 400, f"doc_id={malicious_id!r} was not rejected"
+
+    def test_valid_doc_id_not_rejected(self, doc_client):
+        """Valid doc_id format passes validation (may 200 or 404, never 400)."""
+        resp = doc_client.get("/library/DOC-001/manifest")
+        assert resp.status_code != 400
+
+
+class TestTableIdTraversal:
+    """H6: table_id path traversal must be rejected."""
+
+    MALICIOUS_IDS = [
+        "abc",
+        "01-exploit",
+        "table-exploit",
+    ]
+
+    @pytest.mark.parametrize("table_id", MALICIOUS_IDS)
+    def test_table_rejects_invalid_id(self, doc_client, table_id):
+        resp = doc_client.get(f"/library/DOC-001/table/{table_id}")
+        assert resp.status_code == 400
+
+    def test_valid_table_ids_not_rejected(self, doc_client):
+        """Valid formats pass validation (may 404 since doc doesn't exist)."""
+        for tid in ["01", "99", "table-01"]:
+            resp = doc_client.get(f"/library/DOC-001/table/{tid}")
+            assert resp.status_code != 400, f"table_id={tid!r} was wrongly rejected"
+
+
+class TestUploadSizeLimit:
+    """H3: oversized file uploads must return 413."""
+
+    def test_oversized_upload(self, doc_client, monkeypatch):
+        import larkscout_docreader
+
+        monkeypatch.setattr(larkscout_docreader, "MAX_UPLOAD_BYTES", 1024)
+        big_content = b"%PDF-1.4 " + b"x" * 2048
+        resp = doc_client.post(
+            "/parse",
+            files={"file": ("big.pdf", io.BytesIO(big_content), "application/pdf")},
+        )
+        assert resp.status_code == 413
+
+    def test_small_upload_passes_size_check(self, doc_client, monkeypatch):
+        import larkscout_docreader
+
+        monkeypatch.setattr(larkscout_docreader, "MAX_UPLOAD_BYTES", 10 * 1024 * 1024)
+        small_content = b"%PDF-1.4 small file"
+        resp = doc_client.post(
+            "/parse",
+            files={"file": ("small.pdf", io.BytesIO(small_content), "application/pdf")},
+        )
+        assert resp.status_code != 413
+
+
+# ── Browser security (SSRF) ────────────────────────────────────────
+
+
+class TestSSRF:
+    """C6: SSRF via goto and capture must be blocked."""
+
+    def test_file_scheme_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="scheme not allowed"):
+            _validate_url("file:///etc/passwd")
+
+    def test_ftp_scheme_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="scheme not allowed"):
+            _validate_url("ftp://evil.com/malware")
+
+    def test_metadata_ip_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="private/reserved"):
+            _validate_url("http://169.254.169.254/latest/meta-data")
+
+    def test_loopback_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="private/reserved"):
+            _validate_url("http://127.0.0.1:9898/health")
+
+    def test_private_10_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="private/reserved"):
+            _validate_url("http://10.0.0.1/admin")
+
+    def test_private_192_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="private/reserved"):
+            _validate_url("http://192.168.1.1/")
+
+    def test_localhost_name_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="not allowed"):
+            _validate_url("http://localhost:8080/secret")
+
+    def test_ipv6_loopback_blocked(self):
+        from larkscout_browser import _validate_url
+
+        with pytest.raises(Exception, match="private/reserved"):
+            _validate_url("http://[::1]/")
+
+    def test_valid_https_passes(self):
+        from larkscout_browser import _validate_url
+
+        _validate_url("https://example.com/page")
+
+    def test_valid_http_passes(self):
+        from larkscout_browser import _validate_url
+
+        _validate_url("http://example.com:8080/api")

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -44,6 +46,27 @@ _DEFAULT_DOCS_DIR = Path(os.environ.get(
     "LARKSCOUT_DOCS_DIR",
     os.path.expanduser("~/.larkscout/docs"),
 ))
+
+# ---- URL validation (anti-SSRF) ----
+_ALLOWED_SCHEMES = {"http", "https"}
+
+
+def _validate_url(url: str) -> None:
+    """Block non-HTTP schemes and requests to private/loopback networks."""
+    parsed = urlparse(url)
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise HTTPException(400, f"URL scheme not allowed: {parsed.scheme!r}")
+    hostname = parsed.hostname or ""
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            raise HTTPException(400, f"URL target is a private/reserved address: {hostname}")
+    except ValueError:
+        # hostname is a domain name — resolve is left to Playwright;
+        # block obvious localhost aliases
+        if hostname.lower() in ("localhost", "localhost.localdomain"):
+            raise HTTPException(400, f"URL target not allowed: {hostname}")
+
 
 # ---- Readability.js local file ----
 READABILITY_JS_PATH = Path(os.getenv("READABILITY_JS_PATH", str(BASE_DIR / "readability.js")))
@@ -2057,6 +2080,7 @@ async def new_session(req: NewSessionRequest) -> NewSessionResponse:
 
 @app.post("/session/goto", response_model=GotoResponse)
 async def goto(req: GotoRequest) -> GotoResponse:
+    _validate_url(req.url)
     sess = await _ensure_session(req.session_id)
     async with sess.lock:  # concurrency lock
         try:
@@ -2340,6 +2364,7 @@ async def capture(req: CaptureRequest) -> CaptureResponse:
     Internally runs: session/new → goto → distill → persist → session/close.
     The session is always closed, even on error.
     """
+    _validate_url(req.url)
     if not _browser:
         raise HTTPException(500, "browser not ready")
 
