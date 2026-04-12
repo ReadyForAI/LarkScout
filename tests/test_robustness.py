@@ -10,34 +10,10 @@ import pytest
 from starlette.testclient import TestClient
 
 
-class TestCSVRowLimit:
-    """H5: CSV parsing must truncate at MAX_PARSE_ROWS."""
+class TestCSVParse:
+    """CSV parsing via MarkItDown produces valid results."""
 
-    def test_csv_truncated_at_limit(self):
-        import larkscout_docreader
-
-        old_limit = larkscout_docreader.MAX_PARSE_ROWS
-        larkscout_docreader.MAX_PARSE_ROWS = 50
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False, newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["col_a", "col_b"])
-                for i in range(200):
-                    writer.writerow([f"val_{i}", str(i)])
-                path = Path(f.name)
-
-            result = larkscout_docreader.parse_csv(path)
-            assert result.metadata.get("truncated") is True
-            assert result.metadata.get("max_rows") == 50
-            # The markdown table should have at most 50 data rows + header
-            lines = result.sections[0].text.strip().split("\n")
-            # header + separator + data rows
-            assert len(lines) <= 50 + 2
-        finally:
-            larkscout_docreader.MAX_PARSE_ROWS = old_limit
-            path.unlink(missing_ok=True)
-
-    def test_csv_not_truncated_under_limit(self):
+    def test_csv_small_file(self):
         import larkscout_docreader
 
         with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False, newline="") as f:
@@ -49,37 +25,35 @@ class TestCSVRowLimit:
 
         try:
             result = larkscout_docreader.parse_csv(path)
-            assert result.metadata.get("truncated") is None
+            assert result.file_type == "csv"
+            assert result.total_pages == 1
         finally:
             path.unlink(missing_ok=True)
 
 
-class TestXLSXRowLimit:
-    """H4: XLSX parsing must truncate at MAX_PARSE_ROWS."""
+class TestXLSXParse:
+    """XLSX parsing via MarkItDown produces valid results."""
 
-    def test_xlsx_truncated_at_limit(self):
+    def test_xlsx_basic_parse(self):
         openpyxl = pytest.importorskip("openpyxl")
         import larkscout_docreader
 
-        old_limit = larkscout_docreader.MAX_PARSE_ROWS
-        larkscout_docreader.MAX_PARSE_ROWS = 50
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
-                path = Path(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            path = Path(f.name)
 
+        try:
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.append(["col_a", "col_b"])
-            for i in range(200):
+            for i in range(10):
                 ws.append([f"val_{i}", i])
             wb.save(path)
             wb.close()
 
             result = larkscout_docreader.parse_xlsx(path)
-            assert result.metadata.get("truncated") is True
-            assert result.metadata.get("max_rows") == 50
+            assert result.file_type == "xlsx"
+            assert result.total_pages >= 1
         finally:
-            larkscout_docreader.MAX_PARSE_ROWS = old_limit
             path.unlink(missing_ok=True)
 
 

@@ -16,6 +16,8 @@ triggers:
   - ".docx"
   - ".xlsx"
   - ".csv"
+  - ".pptx"
+  - ".html"
 ---
 
 # SKILL: LarkScout DocReader (Document Parsing HTTP API)
@@ -113,13 +115,14 @@ Response example:
   "ok": true,
   "version": "3.0.0",
   "docs_dir": "~/.larkscout/docs",
-  "supported_formats": ["pdf", "docx", "xlsx", "csv"]
+  "supported_formats": ["pdf", "docx", "pptx", "xlsx", "csv", "html"]
 }
 ```
 
 Notes:
 - `docs_dir` shows a masked path (`~` replaces the home directory) — this is intentional for security
-- `supported_formats` includes `xlsx` and `csv` in addition to `pdf` and `docx`
+- `supported_formats` includes `pptx`, `xlsx`, `csv`, and `html` in addition to `pdf` and `docx`
+- Document parsing powered by [MarkItDown](https://github.com/microsoft/markitdown) (Microsoft)
 
 ### 4.2 Upload and Parse Document (Core)
 
@@ -130,7 +133,7 @@ Request parameters:
 
 | Parameter             | Type   | Default    | Description                                                                             |
 | --------------------- | ------ | ---------- | --------------------------------------------------------------------------------------- |
-| `file`                | File   | (required) | File to upload (.pdf, .docx, .xlsx, or .csv)                                            |
+| `file`                | File   | (required) | File to upload (.pdf, .docx, .pptx, .xlsx, .csv, .html)                                 |
 | `doc_id`              | string | Auto-increment | Manually specify DOC-ID                                                             |
 | `generate_summary`    | bool   | `true`     | Whether to generate summaries (false = extract text only)                               |
 | `force_ocr`           | bool   | `false`    | Force OCR on all pages                                                                  |
@@ -379,7 +382,7 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 
 | Error                                              | Cause                          | Solution                                                                   |
 | -------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------------- |
-| `422 unsupported format`                           | Uploaded non-supported file    | Check file format (pdf, docx, xlsx, csv supported)                         |
+| `422 unsupported format`                           | Uploaded non-supported file    | Check file format (pdf, docx, pptx, xlsx, csv, html supported)            |
 | `429 too many concurrent requests`                 | Rate limit exceeded            | Wait and retry — server limits concurrent parse operations                 |
 | `404 document not found`                           | Invalid doc_id or unparsed doc | Use search to confirm doc_id first                                         |
 | `404 section not found`                            | Invalid sid                    | Call `/doc/library/{doc_id}/sections` first to get valid sid list           |
