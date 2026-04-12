@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pymupdf", "python-docx", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart"]
+# dependencies = ["markitdown[pdf,docx,pptx,xlsx]", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart"]
 # ///
 
 import asyncio
@@ -35,6 +35,38 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 MAX_PARSE_ROWS = int(os.environ.get("LARKSCOUT_MAX_PARSE_ROWS", "100000"))
 _MAX_CONCURRENT_PARSE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_PARSE", "5"))
 _parse_sem = asyncio.Semaphore(_MAX_CONCURRENT_PARSE)
+
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".html", ".htm"}
+
+# Lazy-initialized MarkItDown converter
+_md_converter = None
+_md_converter_lock = threading.Lock()
+
+
+def _get_converter():
+    """Return a lazily-initialized MarkItDown converter (thread-safe)."""
+    global _md_converter
+    if _md_converter is None:
+        with _md_converter_lock:
+            if _md_converter is None:
+                from markitdown import MarkItDown
+
+                _md_converter = MarkItDown()
+    return _md_converter
+
+
+def _convert_to_markdown(filepath: Path) -> str:
+    """Convert a document to Markdown text via MarkItDown."""
+    try:
+        result = _get_converter().convert(str(filepath))
+        return result.text_content or ""
+    except Exception as e:
+        raise RuntimeError(t("file_open_failed", path=str(filepath))) from e
+
+
+def _count_markdown_tables(text: str) -> int:
+    """Count distinct Markdown tables by counting separator rows (| --- | --- |)."""
+    return len(re.findall(r"^\|[\s\-:|]+\|$", text, re.MULTILINE))
 
 
 # ═══════════════════════════════════════════
@@ -197,51 +229,30 @@ def parse_pdf(
     import fitz
 
     logger.info(f"Parsing PDF: {filepath.name}")
+
+    # Open with fitz for page count, TOC, and OCR rendering
     doc = fitz.open(str(filepath))
     total_pages = len(doc)
     logger.info(f"Total pages: {total_pages}")
+
+    # PDF TOC (for section splitting)
+    toc = doc.get_toc(simple=True)
+    if toc:
+        logger.info(f"PDF TOC detected: {len(toc)} entries")
 
     ocr_page_set: set[int] | None = None
     if ocr_pages_spec:
         ocr_page_set = _parse_page_range(ocr_pages_spec, total_pages)
         logger.info(f"OCR target pages: {sorted(ocr_page_set)}")
 
-    # PDF TOC
-    toc = doc.get_toc(simple=True)
-    if toc:
-        logger.info(f"PDF TOC detected: {len(toc)} entries")
-
-    pages: list[PageContent] = []
+    # Determine which pages need OCR and collect per-page text for OCR decisions
     ocr_count = 0
-    table_count = 0
-    table_hashes: set[str] = set()
-
     ocr_tasks: list[tuple[int, bytes]] = []
     ocr_results: dict[int, str] = {}
 
     for i, page in enumerate(doc):
         page_num = i + 1
         text = page.get_text("text").strip()
-        tables: list[str] = []
-
-        # Tables: optional + per-page limit + hash dedup
-        if extract_tables:
-            try:
-                page_tables = page.find_tables()
-                added = 0
-                for tab in page_tables:
-                    if added >= max_tables_per_page:
-                        break
-                    md_table = _table_to_markdown(tab.extract())
-                    if md_table:
-                        h = hashlib.md5(md_table.encode()).hexdigest()
-                        if h not in table_hashes:
-                            table_hashes.add(h)
-                            tables.append(md_table)
-                            table_count += 1
-                            added += 1
-            except Exception:
-                pass
 
         # OCR decision
         if ocr_page_set is not None:
@@ -262,21 +273,13 @@ def parse_pdf(
                 ck = _ocr_cache_key(img_bytes)
                 ck_path = cp.with_suffix(f".{ck}.txt")
                 if ck_path.exists():
-                    text = ck_path.read_text(encoding="utf-8")
+                    ocr_results[page_num] = ck_path.read_text(encoding="utf-8")
                     logger.info(f"Page {page_num}/{total_pages}: OCR cache hit")
                     ocr_count += 1
-                    pages.append(
-                        PageContent(page_num=page_num, text=text, is_ocr=True, tables=tables)
-                    )
                     continue
 
             ocr_tasks.append((page_num, img_bytes))
-            pages.append(PageContent(page_num=page_num, text="", is_ocr=True, tables=tables))
             ocr_count += 1
-        else:
-            if page_num % 20 == 0 or page_num == total_pages:
-                logger.info(f"Page {page_num}/{total_pages}: text extracted")
-            pages.append(PageContent(page_num=page_num, text=text, is_ocr=False, tables=tables))
 
     doc.close()
 
@@ -301,11 +304,28 @@ def parse_pdf(
                     ck_path = cp.with_suffix(f".{ck}.txt")
                     ck_path.write_text(result, encoding="utf-8")
 
-    for page in pages:
-        if page.is_ocr and not page.text and page.page_num in ocr_results:
-            page.text = ocr_results[page.page_num]
+    # Build document text: if force_ocr, use only OCR output; otherwise use
+    # MarkItDown for primary extraction and replace OCR-ed page content.
+    if force_ocr and ocr_results:
+        # Full OCR mode: skip MarkItDown entirely to avoid duplication
+        markdown_text = "\n\n".join(txt for _, txt in sorted(ocr_results.items()))
+        logger.info(f"Full OCR mode: {len(ocr_results)} pages")
+    else:
+        # Primary text extraction via MarkItDown
+        markdown_text = _convert_to_markdown(filepath)
+        logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
+        # Append OCR text only for auto-detected sparse pages (selective OCR)
+        if ocr_results:
+            ocr_supplement = "\n\n".join(
+                f"<!-- OCR page {pn} -->\n{txt}" for pn, txt in sorted(ocr_results.items())
+            )
+            markdown_text = markdown_text + "\n\n" + ocr_supplement
+            logger.info(f"Appended OCR for {len(ocr_results)} sparse pages")
 
-    # TOC-first split
+    # Build pages list
+    pages = [PageContent(page_num=1, text=markdown_text)]
+
+    # Section splitting: prefer TOC when available
     if toc:
         sections = _split_sections_from_toc(pages, toc)
     else:
@@ -313,6 +333,9 @@ def parse_pdf(
 
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
+
+    # Count tables in Markdown output
+    table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
 
     logger.info(
         f"Parse complete: {len(sections)} sections, {ocr_count} OCR pages, {table_count} tables"
@@ -335,44 +358,17 @@ def parse_pdf(
 
 
 def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
-    from docx import Document
-    from docx.opc.exceptions import PackageNotFoundError
-
     logger.info(f"Parsing Word: {filepath.name}")
-    try:
-        doc = Document(str(filepath))
-    except PackageNotFoundError:
-        raise RuntimeError(t("file_open_failed", path=str(filepath)))
+    markdown_text = _convert_to_markdown(filepath)
+    logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
 
-    elements: list[dict] = []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        style = para.style.name if para.style else ""
-        level = 0
-        if style.startswith("Heading"):
-            try:
-                level = int(style.replace("Heading", "").strip())
-            except ValueError:
-                level = 1
-        elements.append({"text": text, "level": level, "type": "paragraph"})
-
-    table_count = 0
-    if extract_tables:
-        for table in doc.tables:
-            rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
-            md_table = _rows_to_markdown(rows)
-            if md_table:
-                elements.append({"text": md_table, "level": 0, "type": "table"})
-                table_count += 1
-
-    full_text = "\n\n".join(e["text"] for e in elements)
-    est_pages = max(1, len(full_text) // 3000)
-    pages = [PageContent(page_num=1, text=full_text)]
-    sections = _split_sections_from_elements(elements)
+    est_pages = max(1, len(markdown_text) // 3000)
+    pages = [PageContent(page_num=1, text=markdown_text)]
+    sections = _split_sections(pages)
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
+
+    table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
 
     logger.info(
         f"Parse complete: {len(sections)} sections, ~{est_pages} pages, {table_count} tables"
@@ -393,59 +389,69 @@ def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
 
 
 def parse_xlsx(filepath: Path) -> ParsedDocument:
-    """Parse an XLSX workbook; each sheet becomes one section and one Markdown table."""
-    import openpyxl
-
+    """Parse an XLSX workbook via MarkItDown."""
     logger.info(f"Parsing XLSX: {filepath.name}")
-    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+    markdown_text = _convert_to_markdown(filepath)
+    logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
 
-    sections: list[Section] = []
+    # Split by sheet headers (MarkItDown uses "## Sheet: name" or similar)
     pages: list[PageContent] = []
+    sections: list[Section] = []
     table_count = 0
 
-    truncated = False
-    total_rows_read = 0
+    # Try to split by markdown headings for sheet-level sections
+    sheet_blocks = re.split(r"^(##\s+.+)$", markdown_text, flags=re.MULTILINE)
 
-    for idx, sheet_name in enumerate(wb.sheetnames, 1):
-        ws = wb[sheet_name]
-        rows: list[list[str]] = []
-        for row in ws.iter_rows(values_only=True):
-            str_row = [str(cell) if cell is not None else "" for cell in row]
-            if any(c.strip() for c in str_row):
-                rows.append(str_row)
-                total_rows_read += 1
-                if total_rows_read >= MAX_PARSE_ROWS:
-                    truncated = True
-                    break
-        if truncated and not rows:
-            break
-
-        if not rows:
-            continue
-
-        md_table = _rows_to_markdown(rows)
-        page = PageContent(page_num=idx, text=md_table, tables=[md_table] if md_table else [])
-        pages.append(page)
-
-        if md_table:
-            table_count += 1
-
-        sid = _section_sid(sheet_name, md_table)
-        sections.append(
-            Section(
-                index=idx,
-                title=sheet_name,
-                level=1,
-                text=md_table,
-                page_range=f"sheet {idx}",
-                sid=sid,
+    if len(sheet_blocks) > 1:
+        idx = 0
+        for i in range(1, len(sheet_blocks), 2):
+            idx += 1
+            title = sheet_blocks[i].lstrip("#").strip()
+            text = sheet_blocks[i + 1].strip() if i + 1 < len(sheet_blocks) else ""
+            if not text:
+                continue
+            page = PageContent(page_num=idx, text=text, tables=[text] if "| " in text else [])
+            pages.append(page)
+            if "| " in text:
+                table_count += 1
+            sid = _section_sid(title, text)
+            sections.append(
+                Section(
+                    index=idx, title=title, level=1, text=text, page_range=f"sheet {idx}", sid=sid
+                )
             )
+    else:
+        # Single block — treat as one section
+        pages = [
+            PageContent(
+                page_num=1,
+                text=markdown_text,
+                tables=[markdown_text] if "| " in markdown_text else [],
+            )
+        ]
+        if "| " in markdown_text:
+            table_count = 1
+        sid = _section_sid(filepath.stem, markdown_text)
+        sections = (
+            [
+                Section(
+                    index=1,
+                    title=filepath.stem,
+                    level=1,
+                    text=markdown_text,
+                    page_range="sheet 1",
+                    sid=sid,
+                )
+            ]
+            if markdown_text.strip()
+            else []
         )
 
-    wb.close()
+    # Size guard
+    truncated = len(markdown_text) > MAX_PARSE_ROWS * 100  # rough char limit
 
     if truncated:
-        logger.warning(f"XLSX truncated at {MAX_PARSE_ROWS} rows")
+        logger.warning("XLSX output may be truncated (large file)")
     logger.info(f"XLSX parse complete: {len(sections)} sheets, {table_count} tables")
     result = ParsedDocument(
         filename=filepath.name,
@@ -467,61 +473,65 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
 
 
 def parse_csv(filepath: Path) -> ParsedDocument:
-    """Parse a CSV file; the entire file becomes one section and one Markdown table."""
-    import csv
-
+    """Parse a CSV file via MarkItDown."""
     logger.info(f"Parsing CSV: {filepath.name}")
-
-    # Try UTF-8-with-BOM first (common Excel export), fall back to latin-1
-    truncated = False
-    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            with open(filepath, newline="", encoding=encoding) as f:
-                reader = csv.reader(f)
-                rows: list[list[str]] = []
-                for row in reader:
-                    if any(cell.strip() for cell in row):
-                        rows.append(row)
-                        if len(rows) >= MAX_PARSE_ROWS:
-                            truncated = True
-                            break
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        rows = []
-
-    if truncated:
-        logger.warning(f"CSV truncated at {MAX_PARSE_ROWS} rows")
-
-    md_table = _rows_to_markdown(rows) if rows else ""
-    page = PageContent(page_num=1, text=md_table, tables=[md_table] if md_table else [])
+    markdown_text = _convert_to_markdown(filepath)
+    logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
 
     stem = filepath.stem
-    sid = _section_sid(stem, md_table)
+    table_count = 1 if markdown_text.strip() else 0
+    sid = _section_sid(stem, markdown_text)
+
+    page = PageContent(
+        page_num=1,
+        text=markdown_text,
+        tables=[markdown_text] if markdown_text.strip() else [],
+    )
     section = Section(
         index=1,
         title=stem,
         level=1,
-        text=md_table,
+        text=markdown_text,
         page_range="sheet 1",
         sid=sid,
     )
 
-    table_count = 1 if md_table else 0
-    logger.info(f"CSV parse complete: {len(rows)} rows, {table_count} tables")
-    result = ParsedDocument(
+    logger.info(f"CSV parse complete: {table_count} tables")
+    return ParsedDocument(
         filename=filepath.name,
         file_type="csv",
         total_pages=1,
         pages=[page],
-        sections=[section] if md_table else [],
+        sections=[section] if markdown_text.strip() else [],
         table_count=table_count,
     )
-    if truncated:
-        result.metadata["truncated"] = True
-        result.metadata["max_rows"] = MAX_PARSE_ROWS
-    return result
+
+
+def parse_generic(filepath: Path) -> ParsedDocument:
+    """Parse any MarkItDown-supported format (PPTX, HTML, etc.)."""
+    ext = filepath.suffix.lower()
+    file_type = ext.lstrip(".")
+    logger.info(f"Parsing {file_type.upper()}: {filepath.name}")
+    markdown_text = _convert_to_markdown(filepath)
+    logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
+
+    est_pages = max(1, len(markdown_text) // 3000)
+    pages = [PageContent(page_num=1, text=markdown_text)]
+    sections = _split_sections(pages)
+    for sec in sections:
+        sec.sid = _section_sid(sec.title, sec.text)
+
+    table_count = _count_markdown_tables(markdown_text)
+
+    logger.info(f"Parse complete: {len(sections)} sections, ~{est_pages} pages")
+    return ParsedDocument(
+        filename=filepath.name,
+        file_type=file_type,
+        total_pages=est_pages,
+        pages=pages,
+        sections=sections,
+        table_count=table_count,
+    )
 
 
 # ═══════════════════════════════════════════
@@ -644,96 +654,6 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
             )
         )
     return sections
-
-
-def _split_sections_from_elements(elements: list[dict]) -> list[Section]:
-    sections: list[Section] = []
-    current_title = tmpl("default_section_title")
-    current_level = 1
-    current_lines: list[str] = []
-    sec_index = 0
-
-    for elem in elements:
-        if elem["level"] > 0:
-            if current_lines:
-                sec_index += 1
-                sections.append(
-                    Section(
-                        index=sec_index,
-                        title=current_title,
-                        level=current_level,
-                        text="\n".join(current_lines),
-                        page_range="",
-                    )
-                )
-            current_title = elem["text"]
-            current_level = elem["level"]
-            current_lines = []
-        else:
-            heading_level = _is_heading(elem["text"]) if elem["type"] == "paragraph" else 0
-            if heading_level > 0 and current_lines:
-                sec_index += 1
-                sections.append(
-                    Section(
-                        index=sec_index,
-                        title=current_title,
-                        level=current_level,
-                        text="\n".join(current_lines),
-                        page_range="",
-                    )
-                )
-                current_title = elem["text"]
-                current_level = heading_level
-                current_lines = []
-            else:
-                current_lines.append(elem["text"])
-
-    if current_lines:
-        sec_index += 1
-        sections.append(
-            Section(
-                index=sec_index,
-                title=current_title,
-                level=current_level,
-                text="\n".join(current_lines),
-                page_range="",
-            )
-        )
-    if not sections:
-        full_text = "\n".join(e["text"] for e in elements)
-        sections.append(
-            Section(
-                index=1, title=tmpl("full_document_title"), level=1, text=full_text, page_range=""
-            )
-        )
-    return sections
-
-
-# ═══════════════════════════════════════════
-# Table utilities
-# ═══════════════════════════════════════════
-
-
-def _table_to_markdown(table_data: list[list]) -> str:
-    if not table_data or len(table_data) < 2:
-        return ""
-    return _rows_to_markdown([[cell if cell else "" for cell in row] for row in table_data])
-
-
-def _rows_to_markdown(rows: list[list[str]]) -> str:
-    if not rows:
-        return ""
-    clean_rows = [[cell.replace("\n", " ").strip() for cell in row] for row in rows]
-    if not clean_rows:
-        return ""
-    header = "| " + " | ".join(clean_rows[0]) + " |"
-    sep = "| " + " | ".join(["---"] * len(clean_rows[0])) + " |"
-    body_lines = []
-    for row in clean_rows[1:]:
-        while len(row) < len(clean_rows[0]):
-            row.append("")
-        body_lines.append("| " + " | ".join(row[: len(clean_rows[0])]) + " |")
-    return "\n".join([header, sep] + body_lines)
 
 
 # ═══════════════════════════════════════════
@@ -975,10 +895,15 @@ def write_output(
         },
         "sections": [
             {
-                "sid": sec.sid, "index": sec.index, "title": sec.title,
-                "page_range": sec.page_range, "char_count": len(sec.text),
+                "sid": sec.sid,
+                "index": sec.index,
+                "title": sec.title,
+                "page_range": sec.page_range,
+                "char_count": len(sec.text),
                 "type": "text",
-                "summary_preview": (sec.summary[:120] + "...") if len(sec.summary) > 120 else sec.summary,
+                "summary_preview": (sec.summary[:120] + "...")
+                if len(sec.summary) > 120
+                else sec.summary,
                 "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
             }
             for sec in parsed.sections
@@ -1051,19 +976,32 @@ def write_output_extract_only(
     )
 
     full_text = "\n".join(sec.text for sec in parsed.sections)
-    content_hash = "sha256:" + hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()
+    content_hash = (
+        "sha256:" + hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()
+    )
 
     manifest = {
-        "doc_id": doc_id, "filename": parsed.filename,
+        "doc_id": doc_id,
+        "filename": parsed.filename,
         "file_type": parsed.file_type,
         "source": source,
-        "paths": {"digest": "digest.md", "brief": "brief.md", "full": "full.md", "sections_dir": "sections/"},
+        "paths": {
+            "digest": "digest.md",
+            "brief": "brief.md",
+            "full": "full.md",
+            "sections_dir": "sections/",
+        },
         "sections": [
-            {"sid": sec.sid, "index": sec.index, "title": sec.title,
-             "page_range": sec.page_range, "char_count": len(sec.text),
-             "type": "text",
-             "summary_preview": "",
-             "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md"}
+            {
+                "sid": sec.sid,
+                "index": sec.index,
+                "title": sec.title,
+                "page_range": sec.page_range,
+                "char_count": len(sec.text),
+                "type": "text",
+                "summary_preview": "",
+                "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
+            }
             for sec in parsed.sections
         ],
         "provenance": {
@@ -1074,8 +1012,9 @@ def write_output_extract_only(
         },
     }
     _write_json(doc_dir / "manifest.json", manifest)
-    _update_doc_index(output_dir, meta, t("summary_pending"), tags=tags, source=source,
-                      content_hash=content_hash)
+    _update_doc_index(
+        output_dir, meta, t("summary_pending"), tags=tags, source=source, content_hash=content_hash
+    )
     logger.info(f"Text extraction complete (no summary): {doc_dir}")
 
 
@@ -1111,12 +1050,17 @@ def _update_doc_index(
         index["documents"] = [d for d in index["documents"] if d.get("id") != meta["doc_id"]]
 
         entry: dict[str, Any] = {
-            "id": meta["doc_id"], "filename": meta["filename"], "file_type": meta["file_type"],
+            "id": meta["doc_id"],
+            "filename": meta["filename"],
+            "file_type": meta["file_type"],
             "source": source,
             "source_url": source_url or "",
-            "pages": meta["total_pages"], "sections": meta["section_count"],
-            "ocr_pages": meta.get("ocr_page_count", 0), "tables": meta.get("table_count", 0),
-            "digest": digest[:200], "digest_path": f"docs/{meta['doc_id']}/digest.md",
+            "pages": meta["total_pages"],
+            "sections": meta["section_count"],
+            "ocr_pages": meta.get("ocr_page_count", 0),
+            "tables": meta.get("table_count", 0),
+            "digest": digest[:200],
+            "digest_path": f"docs/{meta['doc_id']}/digest.md",
             "tags": tags or [],
             "created_at": meta["created_at"],
             "content_hash": content_hash or "",
@@ -1280,7 +1224,7 @@ async def health():
         "ok": True,
         "version": "3.0.0",
         "docs_dir": _mask_path(_get_docs_dir()),
-        "supported_formats": ["pdf", "docx", "xlsx", "csv"],
+        "supported_formats": ["pdf", "docx", "pptx", "xlsx", "csv", "html"],
     }
 
 
@@ -1307,7 +1251,7 @@ async def api_parse_doc(
         # Check format
         filename = file.filename or "unknown"
         suffix = Path(filename).suffix.lower()
-        if suffix not in (".pdf", ".docx", ".xlsx", ".csv"):
+        if suffix not in SUPPORTED_EXTENSIONS:
             raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
         # Parse tags
@@ -1364,10 +1308,12 @@ async def api_parse_doc(
                         extract_tables=extract_tables,
                     ),
                 )
-            elif suffix == ".xlsx":
+            elif suffix in (".xlsx", ".xls"):
                 parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
-            else:  # .csv
+            elif suffix == ".csv":
                 parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
+            else:  # .pptx, .html, .htm, etc.
+                parsed = await loop.run_in_executor(None, lambda: parse_generic(tmp_path))
         except Exception as e:
             raise HTTPException(500, t("parse_failed", err=str(e)))
         finally:

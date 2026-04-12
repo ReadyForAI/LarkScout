@@ -26,7 +26,7 @@ Most scrapers hand your Agent a wall of raw HTML — expensive to process and mo
 - **Three-tier loading** — digest (~200 tokens) → brief (~1,500 tokens) → section (on-demand); Agents load only what they need
 - **Diff-first** — `distill` returns only changed sections (`changed_sids`); repeat visits cost near-zero tokens
 - **Table-aware** — auto-extracts tables with precomputed stats (min/max/avg); answer data questions without reading rows
-- **Document parsing** — PDF, DOCX, XLSX, CSV with OCR fallback
+- **Document parsing** — PDF, DOCX, PPTX, XLSX, CSV, HTML via [MarkItDown](https://github.com/microsoft/markitdown), with Gemini OCR fallback
 - **Multi-LLM support** — Gemini (default), OpenAI, DeepSeek, Ollama, Groq, or any OpenAI-compatible API
 - **WebMCP** — Chrome 146+ structured tool discovery (MCP-over-HTTP)
 - **i18n** — English and Chinese (set `LANG=zh`)
@@ -104,7 +104,7 @@ All endpoints are served on port **9898**.
 | `GET` | `/web/health` | Browser sub-app health |
 | `GET` | `/doc/health` | DocReader sub-app health (includes `docs_dir`) |
 | `POST` | `/web/capture` | Capture a URL and persist it to the document library |
-| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, XLSX, CSV) |
+| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, PPTX, XLSX, CSV, HTML) |
 
 #### Browser Session API
 
@@ -178,7 +178,7 @@ MIT — see [LICENSE](LICENSE).
 - **三层加载** — digest（约 200 token）→ brief（约 1,500 token）→ section（按需）；Agent 只取所需
 - **增量读取** — `distill` 仅返回变化段落（`changed_sids`），重复访问近零 token 开销
 - **表格感知** — 自动提取并预计算统计值（min/max/avg），无需读取原始行即可回答数据问题
-- **文档解析** — 支持 PDF、DOCX、XLSX、CSV，可自动 OCR 兜底
+- **文档解析** — 支持 PDF、DOCX、PPTX、XLSX、CSV、HTML，基于 [MarkItDown](https://github.com/microsoft/markitdown)（微软），可自动 Gemini OCR 兜底
 - **多 LLM 支持** — Gemini（默认）、OpenAI、DeepSeek、Ollama、Groq，以及任意 OpenAI 兼容接口
 - **WebMCP** — Chrome 146+ 结构化工具发现（MCP-over-HTTP）
 - **多语言** — 支持中英文（设置 `LANG=zh` 切换为中文）
@@ -256,7 +256,7 @@ docker compose up
 | `GET` | `/web/health` | Browser 子服务健康检查 |
 | `GET` | `/doc/health` | DocReader 子服务健康检查（含 `docs_dir`） |
 | `POST` | `/web/capture` | 抓取 URL 并保存到文档库 |
-| `POST` | `/doc/parse` | 上传并解析文档（PDF、DOCX、XLSX、CSV） |
+| `POST` | `/doc/parse` | 上传并解析文档（PDF、DOCX、PPTX、XLSX、CSV、HTML） |
 
 #### Browser Session API
 
