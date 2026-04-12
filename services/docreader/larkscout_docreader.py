@@ -40,22 +40,33 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".htm
 
 # Lazy-initialized MarkItDown converter
 _md_converter = None
+_md_converter_lock = threading.Lock()
 
 
 def _get_converter():
-    """Return a lazily-initialized MarkItDown converter."""
+    """Return a lazily-initialized MarkItDown converter (thread-safe)."""
     global _md_converter
     if _md_converter is None:
-        from markitdown import MarkItDown
+        with _md_converter_lock:
+            if _md_converter is None:
+                from markitdown import MarkItDown
 
-        _md_converter = MarkItDown()
+                _md_converter = MarkItDown()
     return _md_converter
 
 
 def _convert_to_markdown(filepath: Path) -> str:
     """Convert a document to Markdown text via MarkItDown."""
-    result = _get_converter().convert(str(filepath))
-    return result.text_content or ""
+    try:
+        result = _get_converter().convert(str(filepath))
+        return result.text_content or ""
+    except Exception as e:
+        raise RuntimeError(t("file_open_failed", path=str(filepath))) from e
+
+
+def _count_markdown_tables(text: str) -> int:
+    """Count distinct Markdown tables by counting separator rows (| --- | --- |)."""
+    return len(re.findall(r"^\|[\s\-:|]+\|$", text, re.MULTILINE))
 
 
 # ═══════════════════════════════════════════
@@ -215,28 +226,30 @@ def parse_pdf(
     concurrency: int = 3,
     cache_dir: Path | None = None,
 ) -> ParsedDocument:
-    logger.info(f"Parsing PDF: {filepath.name}")
-
-    # Primary text extraction via MarkItDown
-    markdown_text = _convert_to_markdown(filepath)
-    logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
-
-    # Use fitz only for page count and OCR path
     import fitz
 
+    logger.info(f"Parsing PDF: {filepath.name}")
+
+    # Open with fitz for page count, TOC, and OCR rendering
     doc = fitz.open(str(filepath))
     total_pages = len(doc)
     logger.info(f"Total pages: {total_pages}")
+
+    # PDF TOC (for section splitting)
+    toc = doc.get_toc(simple=True)
+    if toc:
+        logger.info(f"PDF TOC detected: {len(toc)} entries")
 
     ocr_page_set: set[int] | None = None
     if ocr_pages_spec:
         ocr_page_set = _parse_page_range(ocr_pages_spec, total_pages)
         logger.info(f"OCR target pages: {sorted(ocr_page_set)}")
 
-    # OCR pass: detect pages needing OCR and process them
+    # Determine which pages need OCR and collect per-page text for OCR decisions
     ocr_count = 0
     ocr_tasks: list[tuple[int, bytes]] = []
     ocr_results: dict[int, str] = {}
+    ocr_page_nums: set[int] = set()
 
     for i, page in enumerate(doc):
         page_num = i + 1
@@ -251,6 +264,7 @@ def parse_pdf(
             need_ocr = _should_ocr(page, text, ocr_threshold)
 
         if need_ocr:
+            ocr_page_nums.add(page_num)
             mat = fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat)
             img_bytes = pix.tobytes("png")
@@ -292,24 +306,38 @@ def parse_pdf(
                     ck_path = cp.with_suffix(f".{ck}.txt")
                     ck_path.write_text(result, encoding="utf-8")
 
-    # Merge OCR text into MarkItDown output
-    if ocr_results:
-        ocr_text = "\n\n".join(
-            f"<!-- OCR page {pn} -->\n{txt}" for pn, txt in sorted(ocr_results.items())
-        )
-        markdown_text = markdown_text + "\n\n" + ocr_text
+    # Build document text: if force_ocr, use only OCR output; otherwise use
+    # MarkItDown for primary extraction and replace OCR-ed page content.
+    if force_ocr and ocr_results:
+        # Full OCR mode: skip MarkItDown entirely to avoid duplication
+        markdown_text = "\n\n".join(txt for _, txt in sorted(ocr_results.items()))
+        logger.info(f"Full OCR mode: {len(ocr_results)} pages")
+    else:
+        # Primary text extraction via MarkItDown
+        markdown_text = _convert_to_markdown(filepath)
+        logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
+        # Append OCR text only for auto-detected sparse pages (selective OCR)
+        if ocr_results:
+            ocr_supplement = "\n\n".join(
+                f"<!-- OCR page {pn} -->\n{txt}" for pn, txt in sorted(ocr_results.items())
+            )
+            markdown_text = markdown_text + "\n\n" + ocr_supplement
+            logger.info(f"Appended OCR for {len(ocr_results)} sparse pages")
 
-    # Build pages list (single page for MarkItDown output + OCR pages)
+    # Build pages list
     pages = [PageContent(page_num=1, text=markdown_text)]
 
-    # Section splitting on the combined Markdown text
-    sections = _split_sections(pages)
+    # Section splitting: prefer TOC when available
+    if toc:
+        sections = _split_sections_from_toc(pages, toc)
+    else:
+        sections = _split_sections(pages)
 
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
-    # Count tables in Markdown output (Markdown table blocks)
-    table_count = markdown_text.count("\n| ") if extract_tables else 0
+    # Count tables in Markdown output
+    table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
 
     logger.info(
         f"Parse complete: {len(sections)} sections, {ocr_count} OCR pages, {table_count} tables"
@@ -342,7 +370,7 @@ def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
-    table_count = markdown_text.count("\n| ") if extract_tables else 0
+    table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
 
     logger.info(
         f"Parse complete: {len(sections)} sections, ~{est_pages} pages, {table_count} tables"
@@ -495,7 +523,7 @@ def parse_generic(filepath: Path) -> ParsedDocument:
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
-    table_count = markdown_text.count("\n| ")
+    table_count = _count_markdown_tables(markdown_text)
 
     logger.info(f"Parse complete: {len(sections)} sections, ~{est_pages} pages")
     return ParsedDocument(
