@@ -249,7 +249,6 @@ def parse_pdf(
     ocr_count = 0
     ocr_tasks: list[tuple[int, bytes]] = []
     ocr_results: dict[int, str] = {}
-    ocr_page_nums: set[int] = set()
 
     for i, page in enumerate(doc):
         page_num = i + 1
@@ -264,7 +263,6 @@ def parse_pdf(
             need_ocr = _should_ocr(page, text, ocr_threshold)
 
         if need_ocr:
-            ocr_page_nums.add(page_num)
             mat = fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat)
             img_bytes = pix.tobytes("png")
