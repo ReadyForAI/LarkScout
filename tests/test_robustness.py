@@ -98,6 +98,7 @@ class TestGeminiOCRRetry:
 
     def test_docreader_ocr_wrapper_handles_provider_init_failure(self, monkeypatch):
         import larkscout_docreader
+
         import providers
 
         monkeypatch.setattr(providers, "get_provider", lambda: (_ for _ in ()).throw(RuntimeError("missing key")))
