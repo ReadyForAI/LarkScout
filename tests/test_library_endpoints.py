@@ -20,14 +20,19 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
     doc_dir.mkdir(parents=True)
     (doc_dir / "digest.md").write_text(f"# {doc_id} digest\n\nShort summary.", encoding="utf-8")
     (doc_dir / "brief.md").write_text(f"# {doc_id} brief\n\nDetailed brief.", encoding="utf-8")
-    (doc_dir / "full.md").write_text(f"# {doc_id} full\n\nFull text content.", encoding="utf-8")
+    (doc_dir / "full.md").write_text(
+        f"# {doc_id} full\n\nPayment terms require invoice submission within 30 days.",
+        encoding="utf-8",
+    )
 
     sections_dir = doc_dir / "sections"
     sections_dir.mkdir()
     (sections_dir / "01-abc123-Introduction.md").write_text(
-        "# Introduction\n\nHello.", encoding="utf-8"
+        "# Introduction\n\nCustomer ACME requests payment terms within 30 days.", encoding="utf-8"
     )
-    (sections_dir / "02-def456-Methods.md").write_text("# Methods\n\nWorld.", encoding="utf-8")
+    (sections_dir / "02-def456-Methods.md").write_text(
+        "# Methods\n\nConfidentiality survives termination.", encoding="utf-8"
+    )
 
     tables_dir = doc_dir / "tables"
     tables_dir.mkdir()
@@ -39,6 +44,15 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
         "doc_id": doc_id,
         "filename": "test.pdf",
         "file_type": "pdf",
+        "source": "upload",
+        "metadata": {"customer": "ACME", "contract_type": "MSA"},
+        "source_file": {
+            "kind": "upload",
+            "filename": "test.pdf",
+            "ref": "source/test.pdf",
+            "sha256": "abc123",
+            "size_bytes": 2048,
+        },
         "paths": {
             "digest": "digest.md",
             "brief": "brief.md",
@@ -51,6 +65,8 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
                 "index": 1,
                 "title": "Introduction",
                 "page_range": "p.1",
+                "page_start": 1,
+                "page_end": 1,
                 "char_count": 6,
                 "type": "text",
                 "summary_preview": "Hello.",
@@ -61,6 +77,8 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
                 "index": 2,
                 "title": "Methods",
                 "page_range": "p.2",
+                "page_start": 2,
+                "page_end": 2,
                 "char_count": 6,
                 "type": "text",
                 "summary_preview": "World.",
@@ -69,6 +87,11 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
         ],
         "provenance": {
             "source": "upload",
+            "source_kind": "upload",
+            "source_filename": "test.pdf",
+            "source_ref": "source/test.pdf",
+            "source_sha256": "abc123",
+            "source_size_bytes": 2048,
             "source_url": "test.pdf",
             "created_at": "2026-01-01T00:00:00Z",
             "content_hash": "sha256:abc",
@@ -85,6 +108,7 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
                 "filename": "test.pdf",
                 "file_type": "pdf",
                 "source": "upload",
+                "source_url": "test.pdf",
                 "pages": 2,
                 "sections": 2,
                 "ocr_pages": 0,
@@ -94,10 +118,18 @@ def _setup_doc(docs_dir: Path, doc_id: str = "DOC-001") -> Path:
                 "tags": ["test", "Q3"],
                 "created_at": "2026-01-01T00:00:00Z",
                 "content_hash": "sha256:abc",
+                "metadata": {"customer": "ACME", "contract_type": "MSA"},
+                "source_ref": "source/test.pdf",
+                "source_filename": "test.pdf",
+                "source_sha256": "abc123",
+                "source_available": True,
             }
         ],
     }
     (docs_dir / "doc-index.json").write_text(json.dumps(index), encoding="utf-8")
+    source_dir = doc_dir / "source"
+    source_dir.mkdir()
+    (source_dir / "test.pdf").write_bytes(b"%PDF-1.4 fixture")
     return doc_dir
 
 
@@ -251,6 +283,16 @@ class TestLibrarySearch:
         assert resp.status_code == 200
         assert resp.json()["total"] == 0
 
+    def test_search_by_metadata_filter(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_doc(Path(tmp))
+            with patch("larkscout_docreader._get_docs_dir", return_value=Path(tmp)):
+                resp = client.get("/doc/library/search?metadata.customer=ACME")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["results"][0]["metadata"]["customer"] == "ACME"
+
     def test_search_empty_index(self, client: TestClient):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("larkscout_docreader._get_docs_dir", return_value=Path(tmp)):
@@ -275,12 +317,30 @@ class TestLibraryManifest:
         assert data["doc_id"] == "DOC-001"
         assert "provenance" in data
         assert "sections" in data
+        assert data["metadata"]["customer"] == "ACME"
+        assert data["source_file"]["ref"] == "source/test.pdf"
 
     def test_manifest_not_found(self, client: TestClient):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("larkscout_docreader._get_docs_dir", return_value=Path(tmp)):
                 resp = client.get("/doc/library/DOC-999/manifest")
         assert resp.status_code == 404
+
+
+class TestLibrarySearchText:
+    def test_search_text_returns_section_match_and_page_hint(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_doc(Path(tmp))
+            with patch("larkscout_docreader._get_docs_dir", return_value=Path(tmp)):
+                resp = client.get("/doc/library/search_text?q=payment&scope=section")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] >= 1
+        first = data["results"][0]
+        assert first["doc_id"] == "DOC-001"
+        assert first["sid"] == "abc123"
+        assert first["page_start"] == 1
+        assert "payment" in first["snippet"].lower()
 
 
 # ---------------------------------------------------------------------------
