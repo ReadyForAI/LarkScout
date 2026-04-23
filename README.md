@@ -81,6 +81,7 @@ services:
 | `LARKSCOUT_LLM_BASE_URL` | `https://api.openai.com/v1` | Base URL for OpenAI-compat provider |
 | `LARKSCOUT_LLM_MODEL` | provider default | Model name override |
 | `LARKSCOUT_DOCS_DIR` | `~/.larkscout/docs` | Document library directory |
+| `LARKSCOUT_STORE_SOURCE_FILES` | `true` | Persist uploaded source files under each document's `source/` directory |
 
 #### Using a local Ollama model
 
@@ -104,7 +105,7 @@ All endpoints are served on port **9898**.
 | `GET` | `/web/health` | Browser sub-app health |
 | `GET` | `/doc/health` | DocReader sub-app health (includes `docs_dir`) |
 | `POST` | `/web/capture` | Capture a URL and persist it to the document library |
-| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, PPTX, XLSX, CSV, HTML) |
+| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, PPTX, XLSX, CSV, HTML), optionally storing metadata and a source file reference |
 
 #### Browser Session API
 
@@ -131,6 +132,7 @@ Access documents stored by `/web/capture` and `/doc/parse`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/doc/library/search` | Search by keyword, tag, and/or file type |
+| `GET` | `/doc/library/search_text` | Search full text / sections with snippets and page hints |
 | `GET` | `/doc/library/{doc_id}/digest` | Short summary (~200 tokens) |
 | `GET` | `/doc/library/{doc_id}/brief` | Extended summary (~1500 tokens) |
 | `GET` | `/doc/library/{doc_id}/full` | Full document text |
@@ -140,6 +142,13 @@ Access documents stored by `/web/capture` and `/doc/parse`.
 | `GET` | `/doc/library/{doc_id}/manifest` | Provenance metadata (source, timestamps, content hash) |
 
 Full API reference: see [`skills/larkscout-browser-SKILL.md`](skills/larkscout-browser-SKILL.md) and [`skills/larkscout-docreader-SKILL.md`](skills/larkscout-docreader-SKILL.md).
+
+DocReader notes:
+
+- `POST /doc/parse` accepts an optional `metadata` form field containing a JSON object; shallow scalar values are indexed for later filtering.
+- `GET /doc/library/search` also accepts query params prefixed with `metadata.` for equality-style filtering, for example `metadata.customer=ACME`.
+- `GET /doc/library/search_text` returns `snippet`, `sid`, `page_range`, `page_start`, and `page_end` to support page-level follow-up actions.
+- Parsed document manifests now include `metadata`, `source_file`, and enriched section page bounds.
 
 ### Configuration
 
@@ -233,6 +242,7 @@ services:
 | `LARKSCOUT_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口的 Base URL |
 | `LARKSCOUT_LLM_MODEL` | 各 provider 默认值 | 指定模型名称 |
 | `LARKSCOUT_DOCS_DIR` | `~/.larkscout/docs` | 文档库存储目录 |
+| `LARKSCOUT_STORE_SOURCE_FILES` | `true` | 是否将上传原件保存在每个文档目录下的 `source/` 子目录 |
 
 #### 使用本地 Ollama 模型
 
@@ -256,7 +266,7 @@ docker compose up
 | `GET` | `/web/health` | Browser 子服务健康检查 |
 | `GET` | `/doc/health` | DocReader 子服务健康检查（含 `docs_dir`） |
 | `POST` | `/web/capture` | 抓取 URL 并保存到文档库 |
-| `POST` | `/doc/parse` | 上传并解析文档（PDF、DOCX、PPTX、XLSX、CSV、HTML） |
+| `POST` | `/doc/parse` | 上传并解析文档（PDF、DOCX、PPTX、XLSX、CSV、HTML），可附带 metadata 并保留原始文件引用 |
 
 #### Browser Session API
 
@@ -283,6 +293,7 @@ docker compose up
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/doc/library/search` | 按关键词、标签和/或文件类型搜索 |
+| `GET` | `/doc/library/search_text` | 按全文 / section 搜索，并返回片段与页码提示 |
 | `GET` | `/doc/library/{doc_id}/digest` | 简短摘要（约 200 token） |
 | `GET` | `/doc/library/{doc_id}/brief` | 详细摘要（约 1500 token） |
 | `GET` | `/doc/library/{doc_id}/full` | 完整文档正文 |
@@ -292,6 +303,13 @@ docker compose up
 | `GET` | `/doc/library/{doc_id}/manifest` | 来源元数据（来源地址、时间戳、内容哈希） |
 
 完整 API 说明见 [`skills/larkscout-browser-SKILL.md`](skills/larkscout-browser-SKILL.md) 和 [`skills/larkscout-docreader-SKILL.md`](skills/larkscout-docreader-SKILL.md)。
+
+DocReader 补充说明：
+
+- `POST /doc/parse` 支持可选 `metadata` 表单字段，值为 JSON object；其中浅层标量字段会进入索引，供后续过滤。
+- `GET /doc/library/search` 支持 `metadata.*` 形式的查询参数做等值过滤，例如 `metadata.customer=ACME`。
+- `GET /doc/library/search_text` 会返回 `snippet`、`sid`、`page_range`、`page_start`、`page_end`，便于后续定位页面。
+- `manifest.json` 现在会包含 `metadata`、`source_file`，以及补强后的 section 页码边界。
 
 ### 配置项
 

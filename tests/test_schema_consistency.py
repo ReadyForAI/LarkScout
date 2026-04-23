@@ -115,6 +115,29 @@ class TestDocIndexDocreaderEntry:
             assert entry["content_hash"] == ""
             assert entry["source_url"] == ""
 
+    def test_docreader_index_entry_includes_metadata_and_source_ref(self):
+        from larkscout_docreader import _update_doc_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            meta = {
+                "doc_id": "DOC-003", "filename": "contract.pdf", "file_type": "pdf",
+                "total_pages": 2, "section_count": 1, "ocr_page_count": 0,
+                "table_count": 0, "created_at": "2026-01-01T00:00:00Z",
+            }
+            _update_doc_index(
+                docs_dir,
+                meta,
+                "Contract digest",
+                metadata={"customer": "ACME", "nested": {"ignored": True}},
+                source_record={"ref": "source/contract.pdf", "filename": "contract.pdf", "sha256": "abc"},
+            )
+
+            entry = json.loads((docs_dir / "doc-index.json").read_text(encoding="utf-8"))["documents"][0]
+            assert entry["metadata"]["customer"] == "ACME"
+            assert "nested" not in entry["metadata"]
+            assert entry["source_ref"] == "source/contract.pdf"
+
 
 class TestManifestBrowserFormat:
     """Browser manifest must have all required fields."""
@@ -229,6 +252,29 @@ class TestManifestDocreaderFormat:
             manifest = json.loads((docs_dir / "DOC-012" / "manifest.json").read_text(encoding="utf-8"))
             assert manifest["file_type"] == "pdf"
             assert manifest["source"] == "upload"
+
+    def test_docreader_manifest_includes_metadata_and_source_file(self):
+        from larkscout_docreader import write_output
+
+        parsed = self._make_parsed()
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            write_output(
+                "DOC-014",
+                parsed,
+                "digest",
+                "brief",
+                docs_dir,
+                tags=[],
+                source="upload",
+                metadata={"customer": "ACME"},
+                source_record={"ref": "source/contract.pdf", "filename": "contract.pdf", "sha256": "abc"},
+            )
+            manifest = json.loads((docs_dir / "DOC-014" / "manifest.json").read_text(encoding="utf-8"))
+            assert manifest["metadata"]["customer"] == "ACME"
+            assert manifest["source_file"]["ref"] == "source/contract.pdf"
+            assert manifest["sections"][0]["page_start"] == 1
+            assert manifest["sections"][0]["page_end"] == 1
 
     def test_docreader_manifest_section_has_type(self):
         from larkscout_docreader import write_output

@@ -1,6 +1,6 @@
 ---
 name: larkscout-docreader
-description: Long document parsing and reading HTTP API. Use when you need to read, analyze, or summarize Word (.docx) or PDF files. Supports file upload parsing, three-tier summaries (digest/brief/full), on-demand section loading, table extraction, and document library search via HTTP API. Outputs doc-index v2 format, sharing a unified index with larkscout-browser web capture results. Serves as the document parsing engine for the LarkScout open-source data collection platform.
+description: Long document parsing and reading HTTP API. Use when you need to read, analyze, or summarize Word (.docx) or PDF files. Supports file upload parsing, three-tier summaries (digest/brief/full), on-demand section loading, table extraction, metadata persistence, source file references, and document library search via HTTP API. Outputs doc-index v2 format, sharing a unified index with larkscout-browser web capture results. Serves as the document parsing engine for the LarkScout open-source data collection platform.
 triggers:
   - "read document"
   - "parse document"
@@ -85,7 +85,7 @@ Savings: 97%
 ### 3.4 Document Library Search
 
 ```
-GET /doc/library/search?q=revenue&tags=financial&file_type=pdf
+GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer=ACME
 ↓
 Returns matching doc_id list + digest previews
 ↓
@@ -142,7 +142,7 @@ Request parameters:
 | `max_tables_per_page` | int    | `3`        | Maximum tables to extract per page                                                      |
 | `concurrency`         | int    | `3`        | OCR/summary concurrency                                                                 |
 | `tags`                | string | null       | Tags — JSON array (`'["Q3","financial"]'`) or comma-separated (`"Q3,financial"`)        |
-| `metadata`            | string | null       | Custom metadata (JSON object)                                                           |
+| `metadata`            | string | null       | Custom metadata (JSON object). Stored in manifest; shallow scalar fields are indexed.   |
 
 Call example:
 
@@ -167,7 +167,8 @@ Response example:
   "ocr_page_count": 3,
   "digest": "Q3 revenue grew 15%, net profit up 23% YoY...",
   "manifest_path": "docs/DOC-010/manifest.json",
-  "processing_time_sec": 23.5
+  "processing_time_sec": 23.5,
+  "source_ref": "source/report.pdf"
 }
 ```
 
@@ -175,6 +176,8 @@ Response example:
 
 - The returned `digest` field already contains the first 300 characters of the summary — Agent usually doesn't need an extra call to `/doc/library/{doc_id}/digest`
 - `generate_summary=false` extracts text and tables only without calling LLM — faster but no summary
+- `metadata` should be a JSON object; nested objects are preserved in manifest, while shallow scalar fields are available for filtering in `/doc/library/search`
+- `source_ref` points to the stored upload inside the document directory when `LARKSCOUT_STORE_SOURCE_FILES=true`
 - Large files (100+ page PDFs) may take 30–60 seconds to parse — Agents should set a longer timeout
 
 ### 4.3 Search Document Library
@@ -183,9 +186,10 @@ Response example:
 
 | Parameter   | Description                                         |
 | ----------- | --------------------------------------------------- |
-| `q`         | Keyword (searches filename, digest, tags)           |
+| `q`         | Keyword (searches filename, digest, tags, metadata summary) |
 | `tags`      | Tag filter, comma-separated                         |
 | `file_type` | File type filter (`pdf` / `docx` / `web`)           |
+| `metadata.*`| Equality-style metadata filters, e.g. `metadata.customer=ACME` |
 | `limit`     | Maximum results (default 20)                        |
 
 Response example:
@@ -200,6 +204,10 @@ Response example:
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
+      "metadata": {"customer": "ACME", "contract_type": "MSA"},
+      "source_ref": "source/Q3-report.pdf",
+      "source_filename": "Q3-report.pdf",
+      "source_available": true,
       "score": 3.5
     }
   ],
@@ -209,25 +217,67 @@ Response example:
 
 **Search matches both documents uploaded via DocReader and web pages captured via LarkScout Browser.** The `source` field distinguishes origin: `"upload"` = file upload, `"web_capture"` = web capture.
 
-### 4.4 Get Document Digest (Lowest Token Cost)
+### 4.4 Search Full Text / Sections
+
+- `GET /doc/library/search_text`
+
+| Parameter   | Description |
+| ----------- | ----------- |
+| `q`         | Required query string |
+| `tags`      | Tag filter, comma-separated |
+| `file_type` | File type filter |
+| `doc_id`    | Restrict to one document |
+| `scope`     | `all` / `full` / `section` (default `all`) |
+| `limit`     | Maximum results (default 20) |
+| `metadata.*`| Equality-style metadata filters |
+
+Response example:
+
+```json
+{
+  "results": [
+    {
+      "doc_id": "DOC-010",
+      "filename": "Q3-report.pdf",
+      "file_type": "pdf",
+      "digest": "Q3 revenue grew 15%...",
+      "tags": ["Q3", "financial"],
+      "source": "upload",
+      "metadata": {"customer": "ACME"},
+      "sid": "a3f8e1b902cd",
+      "section_title": "Payment Terms",
+      "page_range": "p.12-13",
+      "page_start": 12,
+      "page_end": 13,
+      "snippet": "...payment terms require invoice submission within 30 days...",
+      "score": 1.5
+    }
+  ],
+  "total": 1
+}
+```
+
+Use this endpoint when you need a snippet and page hint before reading a section in full.
+
+### 4.5 Get Document Digest (Lowest Token Cost)
 
 - `GET /doc/library/{doc_id}/digest`
 
 Response: `{"doc_id": "DOC-010", "content": "# DOC-010: report.pdf\n\nQ3 revenue grew 15%..."}`
 
-### 4.5 Get Document Brief (Medium Token Cost)
+### 4.6 Get Document Brief (Medium Token Cost)
 
 - `GET /doc/library/{doc_id}/brief`
 
 Response: `{"doc_id": "DOC-010", "content": "# DOC-010: report.pdf · Brief\n\n..."}`
 
-### 4.6 Get Document Full Text (High Token Cost — Use Sparingly)
+### 4.7 Get Document Full Text (High Token Cost — Use Sparingly)
 
 - `GET /doc/library/{doc_id}/full`
 
 Response: `{"doc_id": "DOC-010", "content": "# report.pdf\n\n..."}`
 
-### 4.7 List Document Sections
+### 4.8 List Document Sections
 
 - `GET /doc/library/{doc_id}/sections`
 
@@ -242,6 +292,8 @@ Response example:
       "index": 1,
       "title": "Executive Summary",
       "page_range": "p.1-3",
+      "page_start": 1,
+      "page_end": 3,
       "char_count": 2500,
       "summary_preview": "Q3 revenue grew 15%, net profit up 23% YoY..."
     },
@@ -250,6 +302,8 @@ Response example:
       "index": 2,
       "title": "Financial Analysis",
       "page_range": "p.4-15",
+      "page_start": 4,
+      "page_end": 15,
       "char_count": 12000,
       "summary_preview": "Revenue mix shifted, service revenue share rose to 42%..."
     }
@@ -259,13 +313,13 @@ Response example:
 
 **Agent should call this endpoint first to get the section list, then read specific sections by sid.**
 
-### 4.8 Read Single Section
+### 4.9 Read Single Section
 
 - `GET /doc/library/{doc_id}/section/{sid}`
 
 Response: `{"doc_id": "DOC-010", "sid": "a3f8e1b902cd", "content": "# Executive Summary\n\n..."}`
 
-### 4.9 Read Single Table
+### 4.10 Read Single Table
 
 - `GET /doc/library/{doc_id}/table/{table_id}`
 
@@ -273,11 +327,11 @@ table_id format: `"01"` or `"table-01"`.
 
 Response: `{"doc_id": "DOC-010", "table_id": "01", "content": "# Table 1 (Page 5)\n\n| ... |"}`
 
-### 4.10 Get Manifest
+### 4.11 Get Manifest
 
 - `GET /doc/library/{doc_id}/manifest`
 
-Returns the full manifest.json contents, including document structure, section list, path information, and provenance.
+Returns the full manifest.json contents, including document structure, section list, path information, metadata, source file reference, and provenance.
 
 ---
 
@@ -292,6 +346,8 @@ docs/
   ├─ DOC-001/                    ← PDF parsed results
   │   ├─ .meta.json
   │   ├─ manifest.json           ← Contains provenance tracking
+  │   ├─ source/                 ← Original uploaded file (when enabled)
+  │   │   └─ original.pdf
   │   ├─ digest.md               ← ~200 tokens
   │   ├─ brief.md                ← ~1500 tokens
   │   ├─ full.md                 ← Full text
@@ -316,6 +372,8 @@ docs/
 | `id`           | DOC-001 / WEB-001                               |
 | `source`       | `"upload"` or `"web_capture"`                   |
 | `tags`         | Tag array                                       |
+| `metadata`     | Indexed scalar metadata copied from upload metadata |
+| `source_ref`   | Relative path to stored upload under `source/`  |
 | `content_hash` | SHA256 of content, used for deduplication and change detection |
 | `digest`       | First 200 characters of the summary             |
 
@@ -354,13 +412,23 @@ Synthesize analysis and produce comparison report
 ### 6.3 Document Library Search
 
 ```
-GET /doc/library/search?q=Q3+revenue&tags=financial
+GET /doc/library/search?q=Q3+revenue&tags=financial&metadata.customer=ACME
 ↓
 Returns matching document list + digest previews
 ↓
 Select target document → GET /doc/library/{doc_id}/brief
 ↓
 Drill down as needed → GET /doc/library/{doc_id}/section/{sid}
+```
+
+Need page-level hint before loading a section:
+
+```
+GET /doc/library/search_text?q=payment+terms&doc_id=DOC-010&scope=section
+↓
+Returns snippet + sid + page_start/page_end
+↓
+GET /doc/library/{doc_id}/section/{sid}
 ```
 
 ### 6.4 Text-Only Extraction (No Summary Generation)
@@ -415,5 +483,5 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 
 - Temporary copies of uploaded files are automatically cleaned up after parsing
 - Document library is physically isolated by `DOCS_DIR` directory
-- Provenance tracking: Each document's manifest contains provenance (upload time, content_hash, original path)
-- Raw file content is not cached — only structured parsed text is retained
+- Provenance tracking: Each document's manifest contains provenance (created_at, content_hash, source_ref when available)
+- If `LARKSCOUT_STORE_SOURCE_FILES=true` (default), the original uploaded file is stored under each document's `source/` directory for later reference

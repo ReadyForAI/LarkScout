@@ -11,6 +11,7 @@ playwright>=1.45.0
 
 # Document parsing (MarkItDown by Microsoft)
 markitdown[pdf,docx,pptx,xlsx]>=0.1.0
+pymupdf>=1.24.0
 
 # LLM / OCR
 google-genai>=0.8.0

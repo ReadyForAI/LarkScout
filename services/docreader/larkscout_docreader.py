@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["markitdown[pdf,docx,pptx,xlsx]", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart"]
+# dependencies = ["markitdown[pdf,docx,pptx,xlsx]", "pymupdf", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart"]
 # ///
 
 import asyncio
@@ -19,8 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel, Field
 
 from i18n import init_locale, prompt, t, tmpl
 
@@ -120,7 +120,11 @@ def gemini_ocr(image_bytes: bytes, page_num: int) -> str:
     """OCR a single page image via the active LLM provider."""
     from providers import get_provider
 
-    return get_provider().ocr(image_bytes, page_num)
+    try:
+        return get_provider().ocr(image_bytes, page_num)
+    except Exception as exc:
+        logger.warning("OCR unavailable for page %d: %s", page_num, exc)
+        return t("ocr_failed", page=page_num)
 
 
 def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
@@ -799,6 +803,8 @@ def write_output(
     tags: list[str] | None = None,
     source: str = "upload",
     original_path: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    source_record: dict[str, Any] | None = None,
 ):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
@@ -815,12 +821,17 @@ def write_output(
         "ocr_page_count": parsed.ocr_page_count,
         "table_count": parsed.table_count,
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "metadata": metadata or {},
+        "parse_metadata": parsed.metadata or {},
+        "source_file": source_record or {},
         "sections": [
             {
                 "index": sec.index,
                 "sid": sec.sid,
                 "title": sec.title,
                 "page_range": sec.page_range,
+                "page_start": _page_bounds(sec.page_range)[0],
+                "page_end": _page_bounds(sec.page_range)[1],
                 "char_count": len(sec.text),
             }
             for sec in parsed.sections
@@ -887,6 +898,9 @@ def write_output(
         "filename": parsed.filename,
         "file_type": parsed.file_type,
         "source": source,
+        "metadata": metadata or {},
+        "parse_metadata": parsed.metadata or {},
+        "source_file": source_record or {},
         "paths": {
             "digest": "digest.md",
             "brief": "brief.md",
@@ -894,18 +908,10 @@ def write_output(
             "sections_dir": "sections/",
         },
         "sections": [
-            {
-                "sid": sec.sid,
-                "index": sec.index,
-                "title": sec.title,
-                "page_range": sec.page_range,
-                "char_count": len(sec.text),
-                "type": "text",
-                "summary_preview": (sec.summary[:120] + "...")
-                if len(sec.summary) > 120
-                else sec.summary,
-                "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
-            }
+            _build_section_entry(
+                sec,
+                summary_preview=(sec.summary[:120] + "...") if len(sec.summary) > 120 else sec.summary,
+            )
             for sec in parsed.sections
         ],
         "provenance": {
@@ -913,12 +919,27 @@ def write_output(
             "source_url": original_path or str(parsed.filename),
             "created_at": meta["created_at"],
             "content_hash": content_hash,
+            "source_kind": (source_record or {}).get("kind", ""),
+            "source_filename": (source_record or {}).get("filename", ""),
+            "source_ref": (source_record or {}).get("ref", ""),
+            "source_sha256": (source_record or {}).get("sha256", ""),
+            "source_size_bytes": (source_record or {}).get("size_bytes", 0),
         },
     }
     _write_json(doc_dir / "manifest.json", manifest)
     logger.info("manifest.json written")
 
-    _update_doc_index(output_dir, meta, digest, tags=tags, source=source, content_hash=content_hash)
+    _update_doc_index(
+        output_dir,
+        meta,
+        digest,
+        tags=tags,
+        source=source,
+        source_url=original_path or str(parsed.filename),
+        content_hash=content_hash,
+        metadata=metadata,
+        source_record=source_record,
+    )
 
 
 def write_output_extract_only(
@@ -927,6 +948,8 @@ def write_output_extract_only(
     output_dir: Path,
     tags: list[str] | None = None,
     source: str = "upload",
+    metadata: dict[str, Any] | None = None,
+    source_record: dict[str, Any] | None = None,
 ):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
@@ -942,12 +965,17 @@ def write_output_extract_only(
         "ocr_page_count": parsed.ocr_page_count,
         "table_count": parsed.table_count,
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "metadata": metadata or {},
+        "parse_metadata": parsed.metadata or {},
+        "source_file": source_record or {},
         "sections": [
             {
                 "index": sec.index,
                 "sid": sec.sid,
                 "title": sec.title,
                 "page_range": sec.page_range,
+                "page_start": _page_bounds(sec.page_range)[0],
+                "page_end": _page_bounds(sec.page_range)[1],
                 "char_count": len(sec.text),
             }
             for sec in parsed.sections
@@ -985,6 +1013,9 @@ def write_output_extract_only(
         "filename": parsed.filename,
         "file_type": parsed.file_type,
         "source": source,
+        "metadata": metadata or {},
+        "parse_metadata": parsed.metadata or {},
+        "source_file": source_record or {},
         "paths": {
             "digest": "digest.md",
             "brief": "brief.md",
@@ -992,16 +1023,7 @@ def write_output_extract_only(
             "sections_dir": "sections/",
         },
         "sections": [
-            {
-                "sid": sec.sid,
-                "index": sec.index,
-                "title": sec.title,
-                "page_range": sec.page_range,
-                "char_count": len(sec.text),
-                "type": "text",
-                "summary_preview": "",
-                "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
-            }
+            _build_section_entry(sec, summary_preview="")
             for sec in parsed.sections
         ],
         "provenance": {
@@ -1009,11 +1031,24 @@ def write_output_extract_only(
             "source_url": str(parsed.filename),
             "created_at": meta["created_at"],
             "content_hash": content_hash,
+            "source_kind": (source_record or {}).get("kind", ""),
+            "source_filename": (source_record or {}).get("filename", ""),
+            "source_ref": (source_record or {}).get("ref", ""),
+            "source_sha256": (source_record or {}).get("sha256", ""),
+            "source_size_bytes": (source_record or {}).get("size_bytes", 0),
         },
     }
     _write_json(doc_dir / "manifest.json", manifest)
     _update_doc_index(
-        output_dir, meta, t("summary_pending"), tags=tags, source=source, content_hash=content_hash
+        output_dir,
+        meta,
+        t("summary_pending"),
+        tags=tags,
+        source=source,
+        source_url=str(parsed.filename),
+        content_hash=content_hash,
+        metadata=metadata,
+        source_record=source_record,
     )
     logger.info(f"Text extraction complete (no summary): {doc_dir}")
 
@@ -1031,6 +1066,8 @@ def _update_doc_index(
     source: str = "upload",
     source_url: str | None = None,
     content_hash: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    source_record: dict[str, Any] | None = None,
 ):
     """Update doc-index.json with threading lock and atomic write."""
     with _doc_index_lock:
@@ -1064,6 +1101,11 @@ def _update_doc_index(
             "tags": tags or [],
             "created_at": meta["created_at"],
             "content_hash": content_hash or "",
+            "metadata": _indexable_metadata(metadata or meta.get("metadata") or {}),
+            "source_ref": (source_record or meta.get("source_file") or {}).get("ref", ""),
+            "source_filename": (source_record or meta.get("source_file") or {}).get("filename", ""),
+            "source_sha256": (source_record or meta.get("source_file") or {}).get("sha256", ""),
+            "source_available": bool((source_record or meta.get("source_file") or {}).get("ref")),
         }
 
         index["documents"].append(entry)
@@ -1089,6 +1131,14 @@ def _write_json(path: Path, data: dict):
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _write_bytes(path: Path, content: bytes):
+    """Write bytes atomically via temp file + os.replace."""
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        f.write(content)
     os.replace(tmp, path)
 
 
@@ -1132,6 +1182,11 @@ DEFAULT_DOCS_DIR = Path(
 )
 
 MAX_UPLOAD_BYTES = int(os.environ.get("LARKSCOUT_MAX_UPLOAD_MB", "200")) * 1024 * 1024
+STORE_SOURCE_FILES = os.environ.get("LARKSCOUT_STORE_SOURCE_FILES", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 _DOC_ID_RE = re.compile(r"^[A-Z]+-\d+$")
 _TABLE_ID_RE = re.compile(r"^(table-)?\d+$")
@@ -1169,6 +1224,7 @@ class ParseResponse(BaseModel):
     digest: str
     manifest_path: str
     processing_time_sec: float
+    source_ref: str | None = None
 
 
 class SectionInfo(BaseModel):
@@ -1199,6 +1255,16 @@ class SearchResult(BaseModel):
     source: str = "upload"
     created_at: str | None = None
     score: float = 1.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_ref: str | None = None
+    source_filename: str | None = None
+    source_available: bool = False
+    sid: str | None = None
+    section_title: str | None = None
+    page_range: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+    snippet: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -1209,6 +1275,234 @@ class SearchResponse(BaseModel):
 # ---- FastAPI app ----
 
 app = FastAPI(title="Doc Reader API", version="3.0.0")
+
+
+def _parse_metadata_form(metadata: str | None) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    try:
+        value = json.loads(metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, f"metadata must be a JSON object: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(422, "metadata must be a JSON object")
+    return value
+
+
+def _indexable_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep only shallow scalar metadata in doc-index for cheap filtering."""
+    out: dict[str, Any] = {}
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(raw, (str, int, float, bool)) or raw is None:
+            out[key] = raw
+        elif isinstance(raw, list) and all(
+            isinstance(item, (str, int, float, bool)) or item is None for item in raw
+        ):
+            out[key] = raw[:20]
+    return out
+
+
+def _metadata_value_matches(actual: Any, expected: str) -> bool:
+    expected_lower = expected.lower()
+    if isinstance(actual, list):
+        return any(_metadata_value_matches(item, expected) for item in actual)
+    if actual is None:
+        return expected_lower in {"", "null", "none"}
+    return str(actual).lower() == expected_lower
+
+
+def _metadata_filters_from_request(request: Request) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key.startswith("metadata."):
+            meta_key = key.split(".", 1)[1].strip()
+            if meta_key:
+                filters[meta_key] = value
+    return filters
+
+
+def _matches_metadata_filters(metadata: dict[str, Any], filters: dict[str, str]) -> bool:
+    for key, expected in filters.items():
+        if not _metadata_value_matches(metadata.get(key), expected):
+            return False
+    return True
+
+
+def _page_bounds(page_range: str | None) -> tuple[int | None, int | None]:
+    if not page_range:
+        return None, None
+    cleaned = page_range.strip()
+    m = re.fullmatch(r"(?:p\.)?(\d+)(?:-(\d+))?", cleaned)
+    if not m:
+        return None, None
+    start = int(m.group(1))
+    end = int(m.group(2) or m.group(1))
+    return start, end
+
+
+def _build_section_entry(sec: Section, summary_preview: str = "") -> dict[str, Any]:
+    page_start, page_end = _page_bounds(sec.page_range)
+    return {
+        "sid": sec.sid,
+        "index": sec.index,
+        "title": sec.title,
+        "page_range": sec.page_range,
+        "page_start": page_start,
+        "page_end": page_end,
+        "char_count": len(sec.text),
+        "type": "text",
+        "summary_preview": summary_preview,
+        "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
+    }
+
+
+def _safe_source_filename(filename: str) -> str:
+    base = Path(filename).name or "source.bin"
+    suffix = Path(base).suffix
+    stem = base[: -len(suffix)] if suffix else base
+    safe_stem = _safe_filename(stem, max_len=80)
+    return f"{safe_stem}{suffix}" if suffix else safe_stem
+
+
+def _persist_source_file(doc_dir: Path, filename: str, content: bytes) -> dict[str, Any]:
+    source_dir = doc_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = _safe_source_filename(filename)
+    target = source_dir / safe_name
+    _write_bytes(target, content)
+    return {
+        "kind": "upload",
+        "filename": filename,
+        "stored_filename": safe_name,
+        "ref": f"source/{safe_name}",
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+    }
+
+
+def _load_doc_index(docs_dir: Path) -> list[dict[str, Any]]:
+    index_path = docs_dir / "doc-index.json"
+    if not index_path.exists():
+        return []
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    documents = index.get("documents", [])
+    return documents if isinstance(documents, list) else []
+
+
+def _doc_entry_from_manifest(docs_dir: Path, doc_id: str) -> dict[str, Any] | None:
+    doc_dir = docs_dir / doc_id
+    manifest_path = doc_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    meta: dict[str, Any] = {}
+    meta_path = doc_dir / ".meta.json"
+    if meta_path.exists():
+        try:
+            raw_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(raw_meta, dict):
+                meta = raw_meta
+        except Exception:
+            meta = {}
+
+    source_file = manifest.get("source_file") or meta.get("source_file") or {}
+    provenance = manifest.get("provenance") or {}
+    sections = manifest.get("sections") if isinstance(manifest.get("sections"), list) else []
+    digest = ""
+    digest_path = doc_dir / "digest.md"
+    if digest_path.exists():
+        try:
+            digest = digest_path.read_text(encoding="utf-8")[:200]
+        except Exception:
+            digest = ""
+
+    return {
+        "id": doc_id,
+        "filename": manifest.get("filename") or meta.get("filename") or "",
+        "file_type": manifest.get("file_type") or meta.get("file_type") or "",
+        "source": manifest.get("source") or provenance.get("source") or "upload",
+        "source_url": provenance.get("source_url") or "",
+        "pages": meta.get("total_pages", 0),
+        "sections": len(sections),
+        "ocr_pages": meta.get("ocr_page_count", 0),
+        "tables": meta.get("table_count", 0),
+        "digest": digest,
+        "digest_path": f"docs/{doc_id}/digest.md",
+        "tags": meta.get("tags", []),
+        "created_at": provenance.get("created_at") or meta.get("created_at"),
+        "content_hash": provenance.get("content_hash") or "",
+        "metadata": _indexable_metadata(manifest.get("metadata") or meta.get("metadata") or {}),
+        "source_ref": source_file.get("ref", ""),
+        "source_filename": source_file.get("filename", ""),
+        "source_sha256": source_file.get("sha256", ""),
+        "source_available": bool(source_file.get("ref")),
+    }
+
+
+def _filter_documents(
+    documents: list[dict[str, Any]],
+    *,
+    file_type: str | None = None,
+    tags: str | None = None,
+    metadata_filters: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    filtered = documents
+    if file_type:
+        filtered = [d for d in filtered if d.get("file_type") == file_type]
+    if tags:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        filtered = [d for d in filtered if any(t in (d.get("tags") or []) for t in tag_list)]
+    if metadata_filters:
+        filtered = [
+            d
+            for d in filtered
+            if _matches_metadata_filters(d.get("metadata") or {}, metadata_filters)
+        ]
+    return filtered
+
+
+def _resolve_manifest_section_path(doc_dir: Path, rel_path: str) -> Path | None:
+    if not isinstance(rel_path, str):
+        return None
+    raw_path = Path(rel_path)
+    if raw_path.is_absolute() or raw_path.suffix != ".md":
+        return None
+    sections_dir = (doc_dir / "sections").resolve()
+    section_path = (doc_dir / raw_path).resolve()
+    try:
+        section_path.relative_to(sections_dir)
+    except ValueError:
+        return None
+    return section_path
+
+
+def _make_snippet(text: str, query: str, radius: int = 90) -> str:
+    haystack = text.strip()
+    if not haystack:
+        return ""
+    idx = haystack.lower().find(query.lower())
+    if idx == -1:
+        return haystack[: radius * 2].strip()
+    start = max(0, idx - radius)
+    end = min(len(haystack), idx + len(query) + radius)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(haystack) else ""
+    return prefix + haystack[start:end].strip() + suffix
+
+
+def _search_score(*parts: tuple[bool, float]) -> float:
+    return sum(weight for matched, weight in parts if matched)
 
 
 def _mask_path(p: str | Path) -> str:
@@ -1247,6 +1541,7 @@ async def api_parse_doc(
     async with _parse_sem:
         docs_dir = _get_docs_dir()
         t0 = time.time()
+        parsed_metadata = _parse_metadata_form(metadata)
 
         # Check format
         filename = file.filename or "unknown"
@@ -1271,6 +1566,7 @@ async def api_parse_doc(
         tmp_dir = docs_dir / d_id / ".tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = tmp_dir / filename
+        content = b""
         try:
             content = await file.read()
             if len(content) > MAX_UPLOAD_BYTES:
@@ -1325,6 +1621,9 @@ async def api_parse_doc(
 
         # Summarize + write
         digest = t("summary_pending")
+        source_record = (
+            _persist_source_file(docs_dir / d_id, filename, content) if STORE_SOURCE_FILES else {}
+        )
         try:
             if generate_summary:
                 digest_text, brief_text, _ = await loop.run_in_executor(
@@ -1342,6 +1641,8 @@ async def api_parse_doc(
                         tags=parsed_tags,
                         source="upload",
                         original_path=str(filename),
+                        metadata=parsed_metadata,
+                        source_record=source_record,
                     ),
                 )
             else:
@@ -1353,6 +1654,8 @@ async def api_parse_doc(
                         docs_dir,
                         tags=parsed_tags,
                         source="upload",
+                        metadata=parsed_metadata,
+                        source_record=source_record,
                     ),
                 )
         except Exception as e:
@@ -1370,6 +1673,7 @@ async def api_parse_doc(
             digest=digest[:300],
             manifest_path=f"docs/{d_id}/manifest.json",
             processing_time_sec=elapsed,
+            source_ref=source_record.get("ref"),
         )
 
 
@@ -1378,6 +1682,7 @@ async def api_parse_doc(
 
 @app.get("/library/search", response_model=SearchResponse)
 async def library_search(
+    request: Request,
     q: str | None = None,
     tags: str | None = None,
     file_type: str | None = None,
@@ -1385,24 +1690,13 @@ async def library_search(
 ):
     """Search document library."""
     docs_dir = _get_docs_dir()
-    index_path = docs_dir / "doc-index.json"
-    if not index_path.exists():
-        return SearchResponse(results=[], total=0)
-
-    try:
-        index = json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception:
-        return SearchResponse(results=[], total=0)
-
-    documents = index.get("documents", [])
-
-    # Filter
-    if file_type:
-        documents = [d for d in documents if d.get("file_type") == file_type]
-
-    if tags:
-        tag_list = [t.strip() for t in tags.split(",")]
-        documents = [d for d in documents if any(t in (d.get("tags") or []) for t in tag_list)]
+    metadata_filters = _metadata_filters_from_request(request)
+    documents = _filter_documents(
+        _load_doc_index(docs_dir),
+        file_type=file_type,
+        tags=tags,
+        metadata_filters=metadata_filters,
+    )
 
     if q:
         q_lower = q.lower()
@@ -1413,9 +1707,17 @@ async def library_search(
                 score += 2.0
             if q_lower in (d.get("digest") or "").lower():
                 score += 1.0
+            if q_lower in (d.get("source_filename") or "").lower():
+                score += 1.0
             for tag in d.get("tags") or []:
                 if q_lower in tag.lower():
                     score += 1.5
+            for val in (d.get("metadata") or {}).values():
+                if isinstance(val, list):
+                    if any(q_lower in str(item).lower() for item in val):
+                        score += 1.0
+                elif q_lower in str(val).lower():
+                    score += 1.0
             if score > 0:
                 scored.append((d, score))
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1435,10 +1737,138 @@ async def library_search(
             source=d.get("source", "upload"),
             created_at=d.get("created_at"),
             score=scores.get(d.get("id"), 1.0),
+            metadata=d.get("metadata") or {},
+            source_ref=d.get("source_ref") or None,
+            source_filename=d.get("source_filename") or None,
+            source_available=bool(d.get("source_available")),
         )
         for d in documents
     ]
     return SearchResponse(results=results, total=len(results))
+
+
+@app.get("/library/search_text", response_model=SearchResponse)
+async def library_search_text(
+    request: Request,
+    q: str,
+    tags: str | None = None,
+    file_type: str | None = None,
+    doc_id: str | None = None,
+    limit: int = 20,
+    scope: str = "all",
+):
+    """Search full text and/or section text with snippets and page hints."""
+    query = q.strip()
+    if not query:
+        raise HTTPException(422, "q is required")
+    if doc_id:
+        _validate_doc_id(doc_id)
+    if scope not in {"all", "full", "section"}:
+        raise HTTPException(422, "scope must be one of: all, full, section")
+
+    docs_dir = _get_docs_dir()
+    metadata_filters = _metadata_filters_from_request(request)
+    documents = _filter_documents(
+        _load_doc_index(docs_dir),
+        file_type=file_type,
+        tags=tags,
+        metadata_filters=metadata_filters,
+    )
+    if doc_id:
+        documents = [d for d in documents if d.get("id") == doc_id]
+        if not documents:
+            fallback_doc = _doc_entry_from_manifest(docs_dir, doc_id)
+            if fallback_doc:
+                documents = _filter_documents(
+                    [fallback_doc],
+                    file_type=file_type,
+                    tags=tags,
+                    metadata_filters=metadata_filters,
+                )
+
+    results: list[SearchResult] = []
+    for d in documents:
+        current_doc_id = d.get("id", "")
+        if not isinstance(current_doc_id, str) or not _DOC_ID_RE.match(current_doc_id):
+            continue
+        doc_dir = docs_dir / current_doc_id
+        manifest_path = doc_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if scope in {"all", "full"}:
+            full_path = doc_dir / "full.md"
+            if full_path.exists():
+                full_text = full_path.read_text(encoding="utf-8")
+                if query.lower() in full_text.lower():
+                    results.append(
+                        SearchResult(
+                            doc_id=current_doc_id,
+                            filename=d.get("filename", ""),
+                            file_type=d.get("file_type", ""),
+                            digest=d.get("digest", ""),
+                            tags=d.get("tags", []),
+                            source=d.get("source", "upload"),
+                            created_at=d.get("created_at"),
+                            score=_search_score((True, 1.0)),
+                            metadata=d.get("metadata") or {},
+                            source_ref=d.get("source_ref") or None,
+                            source_filename=d.get("source_filename") or None,
+                            source_available=bool(d.get("source_available")),
+                            snippet=_make_snippet(full_text, query),
+                        )
+                    )
+
+        if scope in {"all", "section"}:
+            for sec in manifest.get("sections", []):
+                rel_path = sec.get("file")
+                if not rel_path:
+                    continue
+                section_path = _resolve_manifest_section_path(doc_dir, rel_path)
+                if not section_path:
+                    continue
+                if not section_path.exists():
+                    continue
+                section_text = section_path.read_text(encoding="utf-8")
+                title = sec.get("title", "")
+                title_hit = query.lower() in title.lower()
+                text_hit = query.lower() in section_text.lower()
+                if not (title_hit or text_hit):
+                    continue
+                page_start = sec.get("page_start")
+                page_end = sec.get("page_end")
+                if page_start is None and page_end is None:
+                    page_start, page_end = _page_bounds(sec.get("page_range"))
+                results.append(
+                    SearchResult(
+                        doc_id=current_doc_id,
+                        filename=d.get("filename", ""),
+                        file_type=d.get("file_type", ""),
+                        digest=d.get("digest", ""),
+                        tags=d.get("tags", []),
+                        source=d.get("source", "upload"),
+                        created_at=d.get("created_at"),
+                        score=_search_score((title_hit, 2.0), (text_hit, 1.5)),
+                        metadata=d.get("metadata") or {},
+                        source_ref=d.get("source_ref") or None,
+                        source_filename=d.get("source_filename") or None,
+                        source_available=bool(d.get("source_available")),
+                        sid=sec.get("sid"),
+                        section_title=title,
+                        page_range=sec.get("page_range"),
+                        page_start=page_start,
+                        page_end=page_end,
+                        snippet=_make_snippet(section_text if text_hit else title, query),
+                    )
+                )
+
+    results.sort(key=lambda item: item.score, reverse=True)
+    total = len(results)
+    return SearchResponse(results=results[:limit], total=total)
 
 
 @app.get("/library/{doc_id}/manifest")

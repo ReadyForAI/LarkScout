@@ -96,6 +96,17 @@ class TestAtomicWriteText:
 class TestGeminiOCRRetry:
     """M6: OCR must retry on failure like summarize()."""
 
+    def test_docreader_ocr_wrapper_handles_provider_init_failure(self, monkeypatch):
+        import larkscout_docreader
+
+        import providers
+
+        monkeypatch.setattr(providers, "get_provider", lambda: (_ for _ in ()).throw(RuntimeError("missing key")))
+
+        result = larkscout_docreader.gemini_ocr(b"png-bytes", page_num=2)
+
+        assert result == "[OCR failed: page 2]"
+
     def test_ocr_retries_on_failure(self):
         from providers.gemini import GeminiProvider
 
