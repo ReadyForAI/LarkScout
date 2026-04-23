@@ -1789,6 +1789,8 @@ async def library_search_text(
     results: list[SearchResult] = []
     for d in documents:
         current_doc_id = d.get("id", "")
+        if not isinstance(current_doc_id, str) or not _DOC_ID_RE.match(current_doc_id):
+            continue
         doc_dir = docs_dir / current_doc_id
         manifest_path = doc_dir / "manifest.json"
         if not manifest_path.exists():

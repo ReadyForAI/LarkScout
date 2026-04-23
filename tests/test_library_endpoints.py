@@ -374,6 +374,41 @@ class TestLibrarySearchText:
         assert resp.status_code == 200
         assert resp.json()["total"] == 0
 
+    def test_search_text_ignores_invalid_index_doc_ids(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            docs_dir = base_dir / "docs"
+            docs_dir.mkdir()
+            outside_dir = base_dir / "outside"
+            outside_dir.mkdir()
+            (outside_dir / "full.md").write_text("outside needle", encoding="utf-8")
+            (outside_dir / "manifest.json").write_text(
+                json.dumps({"doc_id": "../outside", "sections": []}),
+                encoding="utf-8",
+            )
+            (docs_dir / "doc-index.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "documents": [
+                            {
+                                "id": "../outside",
+                                "filename": "outside.pdf",
+                                "file_type": "pdf",
+                                "digest": "",
+                                "tags": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.get("/doc/library/search_text?q=needle&scope=full")
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Rate limiting (429)
