@@ -57,6 +57,60 @@ class TestXLSXParse:
             path.unlink(missing_ok=True)
 
 
+class TestPDFParse:
+    """PDF parsing should preserve page-level location hints."""
+
+    def test_pdf_page_ranges_are_not_collapsed_to_page_one(self):
+        from fixtures.generate_fixtures import generate_pdf
+        from larkscout_docreader import _page_bounds, parse_pdf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_pdf(Path(tmp) / "sample.pdf")
+            result = parse_pdf(path, extract_tables=False)
+
+        assert result.total_pages == 2
+        assert result.sections
+        page_ranges = [_page_bounds(sec.page_range) for sec in result.sections]
+        assert any((start == 2 or end == 2) for start, end in page_ranges), page_ranges
+
+
+class TestDocIdStrategy:
+    """doc_id generation can derive a safe directory name from the source filename."""
+
+    def test_source_filename_strategy_uses_stem(self, monkeypatch):
+        import larkscout_docreader
+
+        monkeypatch.setenv("LARKSCOUT_DOC_ID_STRATEGY", "source_filename")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            assert larkscout_docreader._resolve_doc_id(docs_dir, "NBS250321.pdf", None) == "NBS250321"
+
+    def test_source_filename_strategy_filters_unsupported_chars(self, monkeypatch):
+        import larkscout_docreader
+
+        monkeypatch.setenv("LARKSCOUT_DOC_ID_STRATEGY", "source_filename")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            result = larkscout_docreader._resolve_doc_id(
+                docs_dir,
+                "合同/NBS_250321（终版）.pdf",
+                None,
+            )
+            assert result == "NBS-250321"
+
+    def test_source_filename_strategy_falls_back_when_nothing_usable_remains(self, monkeypatch):
+        import larkscout_docreader
+
+        monkeypatch.setenv("LARKSCOUT_DOC_ID_STRATEGY", "source_filename")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            result = larkscout_docreader._resolve_doc_id(docs_dir, "合同终版.pdf", None)
+            assert result == "DOC-001"
+
+
 class TestHealthPathMasking:
     """M10: Health endpoints must not expose absolute filesystem paths."""
 

@@ -30,8 +30,8 @@ class TestDocIdTraversal:
     MALICIOUS_IDS = [
         "back\\slash",
         "not-valid",
-        "DOC001",      # missing hyphen
-        "doc-001",     # lowercase
+        "-doc001",     # leading hyphen
+        "doc001-",     # trailing hyphen
     ]
 
     @pytest.mark.parametrize("doc_id", MALICIOUS_IDS)
@@ -52,8 +52,9 @@ class TestDocIdTraversal:
 
     def test_valid_doc_id_not_rejected(self, doc_client):
         """Valid doc_id format passes validation (may 200 or 404, never 400)."""
-        resp = doc_client.get("/library/DOC-001/manifest")
-        assert resp.status_code != 400
+        for doc_id in ["DOC-001", "NBS250321", "doc001", "nbs250321"]:
+            resp = doc_client.get(f"/library/{doc_id}/manifest")
+            assert resp.status_code != 400, f"doc_id={doc_id!r} was wrongly rejected"
 
 
 class TestTableIdTraversal:

@@ -28,7 +28,7 @@ class OpenAICompatProvider(LLMProvider):
     def __init__(self) -> None:
         self._api_key = os.environ.get("LARKSCOUT_LLM_API_KEY", "")
         self._base_url = os.environ.get("LARKSCOUT_LLM_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
-        self._model = os.environ.get("LARKSCOUT_LLM_MODEL", _DEFAULT_MODEL)
+        self._model = os.environ.get("LARKSCOUT_LLM_MODEL") or _DEFAULT_MODEL
 
         if not self._api_key:
             raise RuntimeError(
