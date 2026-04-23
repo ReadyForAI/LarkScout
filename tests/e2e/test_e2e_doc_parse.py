@@ -17,7 +17,9 @@ Run with summary generation (requires GEMINI_API_KEY or equivalent)::
 
 from __future__ import annotations
 
+import json
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -124,6 +126,71 @@ def test_parse_pdf_section_count_matches(base_url: str, http_client, fixtures: d
     assert actual == reported, (
         f"parse.section_count={reported} but sections list has {actual} entries"
     )
+
+
+@pytest.mark.live
+def test_parse_pdf_metadata_source_and_text_search(
+    base_url: str,
+    http_client,
+    fixtures: dict,
+) -> None:
+    """Parse with metadata/source retention, then verify manifest and library search."""
+    file_path = fixtures["pdf"]
+    customer = f"ACME-E2E-{uuid.uuid4().hex[:8]}"
+    metadata = {
+        "customer": customer,
+        "contract_type": "MSA",
+        "status": "draft",
+    }
+
+    with file_path.open("rb") as fh:
+        resp = http_client.post(
+            f"{base_url}/doc/parse",
+            data={
+                "generate_summary": "false",
+                "metadata": json.dumps(metadata),
+                "tags": '["e2e","metadata"]',
+            },
+            files={"file": (file_path.name, fh)},
+        )
+    assert resp.status_code == 200, f"parse with metadata failed: {resp.text}"
+    parse_data = resp.json()
+    doc_id = parse_data["doc_id"]
+    source_ref = parse_data.get("source_ref")
+    assert doc_id.startswith("DOC-"), f"Expected DOC- doc_id, got {doc_id!r}"
+    assert source_ref, "Expected source_ref when source file storage is enabled"
+
+    resp = http_client.get(f"{base_url}/doc/library/{doc_id}/manifest")
+    assert resp.status_code == 200, f"GET manifest failed: {resp.text}"
+    manifest = resp.json()
+    assert manifest.get("metadata", {}).get("customer") == customer
+    assert manifest.get("source_file", {}).get("ref") == source_ref
+    sections = manifest.get("sections", [])
+    assert sections, f"Expected manifest sections for {doc_id}"
+    assert sections[0].get("page_start") is not None
+    assert sections[0].get("page_end") is not None
+
+    resp = http_client.get(
+        f"{base_url}/doc/library/search",
+        params={"metadata.customer": customer},
+    )
+    assert resp.status_code == 200, f"metadata search failed: {resp.text}"
+    search_results = resp.json().get("results", [])
+    assert any(item.get("doc_id") == doc_id for item in search_results), (
+        f"metadata search did not return {doc_id}: {search_results}"
+    )
+
+    resp = http_client.get(
+        f"{base_url}/doc/library/search_text",
+        params={"q": "provider", "scope": "section", "doc_id": doc_id},
+    )
+    assert resp.status_code == 200, f"search_text failed: {resp.text}"
+    text_results = resp.json().get("results", [])
+    assert text_results, f"search_text returned no section results for {doc_id}"
+    first = text_results[0]
+    assert first.get("sid"), f"search_text result missing sid: {first}"
+    assert first.get("snippet"), f"search_text result missing snippet: {first}"
+    assert first.get("page_start") is not None, f"search_text missing page_start: {first}"
 
 
 @pytest.mark.live
