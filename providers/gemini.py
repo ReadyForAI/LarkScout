@@ -22,7 +22,7 @@ class GeminiProvider(LLMProvider):
 
     def __init__(self) -> None:
         self._client = None
-        self._model = os.environ.get("LARKSCOUT_LLM_MODEL", _DEFAULT_MODEL)
+        self._model = os.environ.get("LARKSCOUT_LLM_MODEL") or _DEFAULT_MODEL
 
     def _init(self) -> None:
         """Lazy-initialise the Gemini client on first use."""

@@ -146,9 +146,11 @@ Full API reference: see [`skills/larkscout-browser-SKILL.md`](skills/larkscout-b
 DocReader notes:
 
 - `POST /doc/parse` accepts an optional `metadata` form field containing a JSON object; shallow scalar values are indexed for later filtering.
+- `POST /doc/parse` also accepts an optional `doc_id` form field. Valid values may contain letters, digits, and internal hyphens, for example `DOC-001`, `NBS250321`, or `doc001`.
 - `GET /doc/library/search` also accepts query params prefixed with `metadata.` for equality-style filtering, for example `metadata.customer=ACME`.
 - `GET /doc/library/search_text` returns `snippet`, `sid`, `page_range`, `page_start`, and `page_end` to support page-level follow-up actions.
 - Parsed document manifests now include `metadata`, `source_file`, and enriched section page bounds.
+- If `LARKSCOUT_DOC_ID_STRATEGY=source_filename`, uploaded files may use a sanitized source filename as the document directory name. Unsupported characters are stripped, separators such as spaces / `_` / `.` are normalized to `-`, and the service falls back to `DOC-xxx` when no usable characters remain.
 
 ### Configuration
 
@@ -158,6 +160,7 @@ LarkScout is configured entirely through environment variables. See the table in
 |---|---|---|
 | `PORT` | `9898` | HTTP listening port |
 | `LANG` | `en` | UI language (`en` or `zh`) |
+| `LARKSCOUT_DOC_ID_STRATEGY` | `counter` | Document directory naming strategy: `counter` keeps `DOC-xxx`; `source_filename` derives a safe directory name from the uploaded filename stem |
 
 ### For AI Agents
 
@@ -307,9 +310,11 @@ docker compose up
 DocReader 补充说明：
 
 - `POST /doc/parse` 支持可选 `metadata` 表单字段，值为 JSON object；其中浅层标量字段会进入索引，供后续过滤。
+- `POST /doc/parse` 也支持可选 `doc_id` 表单字段；合法值可包含字母、数字和中间连字符，例如 `DOC-001`、`NBS250321`、`doc001`。
 - `GET /doc/library/search` 支持 `metadata.*` 形式的查询参数做等值过滤，例如 `metadata.customer=ACME`。
 - `GET /doc/library/search_text` 会返回 `snippet`、`sid`、`page_range`、`page_start`、`page_end`，便于后续定位页面。
 - `manifest.json` 现在会包含 `metadata`、`source_file`，以及补强后的 section 页码边界。
+- 如果设置 `LARKSCOUT_DOC_ID_STRATEGY=source_filename`，上传文件会优先使用“过滤后的源文件名”作为文档目录名；空格、下划线、点会归一成 `-`，不支持的字符会被剔除；若过滤后没有剩余可用字符，则自动回退为 `DOC-xxx`。
 
 ### 配置项
 
@@ -319,6 +324,7 @@ LarkScout 所有配置均通过环境变量管理。LLM 相关配置见上方 **
 |---|---|---|
 | `PORT` | `9898` | HTTP 监听端口 |
 | `LANG` | `en` | 界面语言（`en` 英文 / `zh` 中文） |
+| `LARKSCOUT_DOC_ID_STRATEGY` | `counter` | 文档目录命名策略：`counter` 保持 `DOC-xxx`；`source_filename` 基于上传文件名生成安全目录名 |
 
 ### 接入 AI Agent
 

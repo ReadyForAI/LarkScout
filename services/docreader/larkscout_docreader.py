@@ -232,6 +232,13 @@ def parse_pdf(
 ) -> ParsedDocument:
     import fitz
 
+    def _usable_page_text(raw_text: str, ocr_text: str | None) -> str:
+        if not ocr_text:
+            return raw_text
+        if ocr_text.startswith("[OCR failed"):
+            return raw_text or ocr_text
+        return ocr_text
+
     logger.info(f"Parsing PDF: {filepath.name}")
 
     # Open with fitz for page count, TOC, and OCR rendering
@@ -253,10 +260,12 @@ def parse_pdf(
     ocr_count = 0
     ocr_tasks: list[tuple[int, bytes]] = []
     ocr_results: dict[int, str] = {}
+    page_texts: dict[int, str] = {}
 
     for i, page in enumerate(doc):
         page_num = i + 1
         text = page.get_text("text").strip()
+        page_texts[page_num] = text
 
         # OCR decision
         if ocr_page_set is not None:
@@ -308,26 +317,23 @@ def parse_pdf(
                     ck_path = cp.with_suffix(f".{ck}.txt")
                     ck_path.write_text(result, encoding="utf-8")
 
-    # Build document text: if force_ocr, use only OCR output; otherwise use
-    # MarkItDown for primary extraction and replace OCR-ed page content.
+    pages: list[PageContent] = []
+    for page_num in range(1, total_pages + 1):
+        raw_text = page_texts.get(page_num, "")
+        page_text = raw_text
+        if force_ocr or page_num in ocr_results:
+            page_text = _usable_page_text(raw_text, ocr_results.get(page_num))
+        pages.append(PageContent(page_num=page_num, text=page_text.strip()))
+
     if force_ocr and ocr_results:
-        # Full OCR mode: skip MarkItDown entirely to avoid duplication
-        markdown_text = "\n\n".join(txt for _, txt in sorted(ocr_results.items()))
         logger.info(f"Full OCR mode: {len(ocr_results)} pages")
-    else:
-        # Primary text extraction via MarkItDown
+
+    # Keep MarkItDown for PDF table counting, but derive page mapping from
+    # per-page text extracted directly from the PDF.
+    markdown_text = ""
+    if extract_tables and not force_ocr:
         markdown_text = _convert_to_markdown(filepath)
         logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
-        # Append OCR text only for auto-detected sparse pages (selective OCR)
-        if ocr_results:
-            ocr_supplement = "\n\n".join(
-                f"<!-- OCR page {pn} -->\n{txt}" for pn, txt in sorted(ocr_results.items())
-            )
-            markdown_text = markdown_text + "\n\n" + ocr_supplement
-            logger.info(f"Appended OCR for {len(ocr_results)} sparse pages")
-
-    # Build pages list
-    pages = [PageContent(page_num=1, text=markdown_text)]
 
     # Section splitting: prefer TOC when available
     if toc:
@@ -339,7 +345,7 @@ def parse_pdf(
         sec.sid = _section_sid(sec.title, sec.text)
 
     # Count tables in Markdown output
-    table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
+    table_count = _count_markdown_tables(markdown_text) if extract_tables and markdown_text else 0
 
     logger.info(
         f"Parse complete: {len(sections)} sections, {ocr_count} OCR pages, {table_count} tables"
@@ -546,6 +552,7 @@ HEADING_PATTERNS = [
     re.compile(r"^第[一二三四五六七八九十\d]+[章节部分篇]\s*[、:：]?\s*.+"),
     re.compile(r"^[（(]?[一二三四五六七八九十]+[）)]?[、.．]\s*.+"),
     re.compile(r"^\d+(\.\d+)*[.、．)\s]\s*.{2,}"),
+    re.compile(r"^(?=.{8,60}$)[A-Z][A-Za-z0-9/&()'-]*(?: [A-Z][A-Za-z0-9/&()'-]*){0,5}$"),
     re.compile(r"^[A-Z][A-Z\s]{5,}$"),
     re.compile(r"^(摘要|目录|引言|绪论|前言|导论|背景|概述|总结|结论|致谢|参考文献|附录|附件)$"),
 ]
@@ -608,12 +615,14 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
     sec_index = 0
 
     for page in pages:
+        page_has_body = False
         for line in page.text.split("\n"):
             line = line.strip()
             if not line:
                 continue
             heading_level = _is_heading(line)
             if heading_level > 0 and current_lines:
+                end_page = page.page_num if page_has_body else max(current_start_page, page.page_num - 1)
                 sec_index += 1
                 sections.append(
                     Section(
@@ -621,7 +630,7 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
                         title=current_title,
                         level=current_level,
                         text="\n".join(current_lines),
-                        page_range=f"p.{current_start_page}-{page.page_num}",
+                        page_range=f"p.{current_start_page}-{end_page}",
                     )
                 )
                 current_title = line
@@ -630,8 +639,10 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
                 current_start_page = page.page_num
             else:
                 current_lines.append(line)
+                page_has_body = True
         for table in page.tables:
             current_lines.append(f"\n{table}\n")
+            page_has_body = True
 
     if current_lines:
         sec_index += 1
@@ -645,6 +656,27 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
                 page_range=f"p.{current_start_page}-{last_page}",
             )
         )
+
+    if len(sections) == 1 and len(pages) > 1 and sections[0].page_range != "p.1-1":
+        page_sections: list[Section] = []
+        for page in pages:
+            text_parts = [page.text.strip()] if page.text.strip() else []
+            if page.tables:
+                text_parts.extend(table.strip() for table in page.tables if table.strip())
+            page_text = "\n\n".join(text_parts).strip()
+            if not page_text:
+                continue
+            page_sections.append(
+                Section(
+                    index=len(page_sections) + 1,
+                    title=f"Page {page.page_num}",
+                    level=1,
+                    text=page_text,
+                    page_range=f"p.{page.page_num}-{page.page_num}",
+                )
+            )
+        if page_sections:
+            return page_sections
 
     if not sections:
         full_text = "\n\n".join(p.text for p in pages)
@@ -1188,7 +1220,7 @@ STORE_SOURCE_FILES = os.environ.get("LARKSCOUT_STORE_SOURCE_FILES", "true").lowe
     "no",
 }
 
-_DOC_ID_RE = re.compile(r"^[A-Z]+-\d+$")
+_DOC_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,78}[A-Za-z0-9])?$")
 _TABLE_ID_RE = re.compile(r"^(table-)?\d+$")
 
 
@@ -1208,6 +1240,46 @@ def _get_docs_dir() -> Path:
     d = DEFAULT_DOCS_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _doc_id_strategy() -> str:
+    strategy = os.environ.get("LARKSCOUT_DOC_ID_STRATEGY", "counter").strip().lower()
+    return strategy if strategy in {"counter", "source_filename"} else "counter"
+
+
+def _sanitize_doc_id_candidate(value: str, max_len: int = 80) -> str:
+    base = Path(value).name.strip()
+    stem = Path(base).stem if Path(base).suffix else base
+    normalized = re.sub(r"[\s._]+", "-", stem)
+    sanitized = re.sub(r"[^A-Za-z0-9-]+", "", normalized)
+    sanitized = re.sub(r"-{2,}", "-", sanitized).strip("-")
+    return sanitized[:max_len]
+
+
+def _next_filename_doc_id(docs_dir: Path, filename: str) -> str | None:
+    base = _sanitize_doc_id_candidate(filename)
+    if not base:
+        return None
+    candidate = base
+    suffix = 2
+    while (docs_dir / candidate).exists():
+        numbered = f"{base}-{suffix}"
+        candidate = numbered[:80].rstrip("-")
+        suffix += 1
+    return candidate if _DOC_ID_RE.match(candidate) else None
+
+
+def _resolve_doc_id(docs_dir: Path, filename: str, requested_doc_id: str | None) -> str:
+    if requested_doc_id:
+        _validate_doc_id(requested_doc_id)
+        return requested_doc_id
+
+    if _doc_id_strategy() == "source_filename":
+        filename_doc_id = _next_filename_doc_id(docs_dir, filename)
+        if filename_doc_id:
+            return filename_doc_id
+
+    return _next_doc_id(docs_dir)
 
 
 # ---- Pydantic Models ----
@@ -1557,12 +1629,8 @@ async def api_parse_doc(
             except json.JSONDecodeError:
                 parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
 
-        # Validate doc_id if user-supplied
-        if doc_id:
-            _validate_doc_id(doc_id)
-
         # Save temp file
-        d_id = doc_id or _next_doc_id(docs_dir)
+        d_id = _resolve_doc_id(docs_dir, filename, doc_id)
         tmp_dir = docs_dir / d_id / ".tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = tmp_dir / filename
