@@ -1394,6 +1394,62 @@ def _load_doc_index(docs_dir: Path) -> list[dict[str, Any]]:
     return documents if isinstance(documents, list) else []
 
 
+def _doc_entry_from_manifest(docs_dir: Path, doc_id: str) -> dict[str, Any] | None:
+    doc_dir = docs_dir / doc_id
+    manifest_path = doc_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    meta: dict[str, Any] = {}
+    meta_path = doc_dir / ".meta.json"
+    if meta_path.exists():
+        try:
+            raw_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(raw_meta, dict):
+                meta = raw_meta
+        except Exception:
+            meta = {}
+
+    source_file = manifest.get("source_file") or meta.get("source_file") or {}
+    provenance = manifest.get("provenance") or {}
+    sections = manifest.get("sections") if isinstance(manifest.get("sections"), list) else []
+    digest = ""
+    digest_path = doc_dir / "digest.md"
+    if digest_path.exists():
+        try:
+            digest = digest_path.read_text(encoding="utf-8")[:200]
+        except Exception:
+            digest = ""
+
+    return {
+        "id": doc_id,
+        "filename": manifest.get("filename") or meta.get("filename") or "",
+        "file_type": manifest.get("file_type") or meta.get("file_type") or "",
+        "source": manifest.get("source") or provenance.get("source") or "upload",
+        "source_url": provenance.get("source_url") or "",
+        "pages": meta.get("total_pages", 0),
+        "sections": len(sections),
+        "ocr_pages": meta.get("ocr_page_count", 0),
+        "tables": meta.get("table_count", 0),
+        "digest": digest,
+        "digest_path": f"docs/{doc_id}/digest.md",
+        "tags": meta.get("tags", []),
+        "created_at": provenance.get("created_at") or meta.get("created_at"),
+        "content_hash": provenance.get("content_hash") or "",
+        "metadata": _indexable_metadata(manifest.get("metadata") or meta.get("metadata") or {}),
+        "source_ref": source_file.get("ref", ""),
+        "source_filename": source_file.get("filename", ""),
+        "source_sha256": source_file.get("sha256", ""),
+        "source_available": bool(source_file.get("ref")),
+    }
+
+
 def _filter_documents(
     documents: list[dict[str, Any]],
     *,
@@ -1414,6 +1470,21 @@ def _filter_documents(
             if _matches_metadata_filters(d.get("metadata") or {}, metadata_filters)
         ]
     return filtered
+
+
+def _resolve_manifest_section_path(doc_dir: Path, rel_path: str) -> Path | None:
+    if not isinstance(rel_path, str):
+        return None
+    raw_path = Path(rel_path)
+    if raw_path.is_absolute() or raw_path.suffix != ".md":
+        return None
+    sections_dir = (doc_dir / "sections").resolve()
+    section_path = (doc_dir / raw_path).resolve()
+    try:
+        section_path.relative_to(sections_dir)
+    except ValueError:
+        return None
+    return section_path
 
 
 def _make_snippet(text: str, query: str, radius: int = 90) -> str:
@@ -1705,6 +1776,15 @@ async def library_search_text(
     )
     if doc_id:
         documents = [d for d in documents if d.get("id") == doc_id]
+        if not documents:
+            fallback_doc = _doc_entry_from_manifest(docs_dir, doc_id)
+            if fallback_doc:
+                documents = _filter_documents(
+                    [fallback_doc],
+                    file_type=file_type,
+                    tags=tags,
+                    metadata_filters=metadata_filters,
+                )
 
     results: list[SearchResult] = []
     for d in documents:
@@ -1746,7 +1826,9 @@ async def library_search_text(
                 rel_path = sec.get("file")
                 if not rel_path:
                     continue
-                section_path = doc_dir / rel_path
+                section_path = _resolve_manifest_section_path(doc_dir, rel_path)
+                if not section_path:
+                    continue
                 if not section_path.exists():
                     continue
                 section_text = section_path.read_text(encoding="utf-8")

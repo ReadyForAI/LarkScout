@@ -342,6 +342,38 @@ class TestLibrarySearchText:
         assert first["page_start"] == 1
         assert "payment" in first["snippet"].lower()
 
+    def test_search_text_doc_id_falls_back_without_index(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            _setup_doc(docs_dir)
+            (docs_dir / "doc-index.json").unlink()
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.get(
+                    "/doc/library/search_text?q=payment&scope=section&doc_id=DOC-001"
+                )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] >= 1
+        assert data["results"][0]["doc_id"] == "DOC-001"
+
+    def test_search_text_ignores_section_paths_outside_sections(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            doc_dir = _setup_doc(docs_dir)
+            (docs_dir / "leak.md").write_text(
+                "secret needle outside doc sections",
+                encoding="utf-8",
+            )
+            manifest_path = doc_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["sections"][0]["file"] = "../leak.md"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.get("/doc/library/search_text?q=needle&scope=section")
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Rate limiting (429)
