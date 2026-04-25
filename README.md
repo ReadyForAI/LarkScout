@@ -27,7 +27,7 @@ Most scrapers hand your Agent a wall of raw HTML — expensive to process and mo
 - **Diff-first** — `distill` returns only changed sections (`changed_sids`); repeat visits cost near-zero tokens
 - **Table-aware** — auto-extracts tables with precomputed stats (min/max/avg); answer data questions without reading rows
 - **Document parsing** — PDF, DOCX, PPTX, XLSX, CSV, HTML via [MarkItDown](https://github.com/microsoft/markitdown), with Gemini OCR fallback
-- **Multi-LLM support** — Gemini (default), OpenAI, DeepSeek, Ollama, Groq, or any OpenAI-compatible API
+- **Multi-LLM support** — Gemini (default), OpenAI, Ollama, Groq, or any OpenAI-compatible API
 - **WebMCP** — Chrome 146+ structured tool discovery (MCP-over-HTTP)
 - **i18n** — English and Chinese (set `LANG=zh`)
 
@@ -76,10 +76,15 @@ services:
 | Variable | Default | Description |
 |---|---|---|
 | `LARKSCOUT_LLM_PROVIDER` | `gemini` | LLM backend: `gemini` or `openai` |
+| `LARKSCOUT_LLM_VENDOR` | `openai` | Vendor profile for OpenAI-compatible APIs: `openai`, `zhipu`, `kimi`, `aliyun`, `volcengine` |
 | `GEMINI_API_KEY` | — | Google Gemini API key |
 | `LARKSCOUT_LLM_API_KEY` | — | API key for OpenAI-compatible provider |
-| `LARKSCOUT_LLM_BASE_URL` | `https://api.openai.com/v1` | Base URL for OpenAI-compat provider |
-| `LARKSCOUT_LLM_MODEL` | provider default | Model name override |
+| `LARKSCOUT_LLM_BASE_URL` | vendor default | Base URL override for OpenAI-compat provider |
+| `LARKSCOUT_LLM_MODEL` | vendor default | Model name override |
+| `LARKSCOUT_OCR_MODEL` | `LARKSCOUT_LLM_MODEL` | Optional OCR vision model override |
+| `LARKSCOUT_OCR_IMAGE_INPUT_MODE` | `data_url` | OCR image serialization mode: `data_url`, `plain_base64`, `remote_url_only` |
+| `LARKSCOUT_LLM_EXTRA_BODY_JSON` | — | Optional JSON object merged into text chat request body |
+| `LARKSCOUT_OCR_EXTRA_BODY_JSON` | — | Optional JSON object merged into OCR request body |
 | `LARKSCOUT_DOCS_DIR` | `~/.larkscout/docs` | Document library directory |
 | `LARKSCOUT_STORE_SOURCE_FILES` | `true` | Persist uploaded source files under each document's `source/` directory |
 
@@ -92,6 +97,55 @@ LARKSCOUT_LLM_BASE_URL=http://host.docker.internal:11434/v1 \
 LARKSCOUT_LLM_MODEL=llama3 \
 docker compose up
 ```
+
+#### OpenAI-compatible vendor profiles
+
+OpenAI-compatible integrations can use a vendor profile to supply a default `base_url`,
+text model, and OCR model. You can still override any of them explicitly.
+The global default OCR image input mode stays `data_url` for maximum compatibility.
+
+```bash
+# Zhipu: text + OCR models split by default
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=zhipu \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+docker compose up
+
+# Kimi: one multimodal model for text and OCR by default
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=kimi \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+docker compose up
+
+# Aliyun Bailian: vendor defaults can be overridden
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=aliyun \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+docker compose up
+
+# Volcengine Ark: set your deployed endpoint/model explicitly
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=volcengine \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+LARKSCOUT_LLM_MODEL=your_endpoint_or_model \
+LARKSCOUT_OCR_MODEL=your_vision_endpoint_or_model \
+docker compose up
+```
+
+Vendor-specific request fields can be injected without code changes:
+
+```bash
+LARKSCOUT_OCR_EXTRA_BODY_JSON='{"image_url_detail":"high"}'
+```
+
+OCR image serialization can also be switched explicitly:
+
+```bash
+LARKSCOUT_OCR_IMAGE_INPUT_MODE=plain_base64
+```
+
+`remote_url_only` is recognized but currently fails fast in the built-in OCR pipeline,
+because LarkScout renders pages in-memory and does not yet upload them to a hosted URL.
 
 ### API
 
@@ -191,7 +245,7 @@ MIT — see [LICENSE](LICENSE).
 - **增量读取** — `distill` 仅返回变化段落（`changed_sids`），重复访问近零 token 开销
 - **表格感知** — 自动提取并预计算统计值（min/max/avg），无需读取原始行即可回答数据问题
 - **文档解析** — 支持 PDF、DOCX、PPTX、XLSX、CSV、HTML，基于 [MarkItDown](https://github.com/microsoft/markitdown)（微软），可自动 Gemini OCR 兜底
-- **多 LLM 支持** — Gemini（默认）、OpenAI、DeepSeek、Ollama、Groq，以及任意 OpenAI 兼容接口
+- **多 LLM 支持** — Gemini（默认）、OpenAI、Ollama、Groq，以及任意 OpenAI 兼容接口
 - **WebMCP** — Chrome 146+ 结构化工具发现（MCP-over-HTTP）
 - **多语言** — 支持中英文（设置 `LANG=zh` 切换为中文）
 
@@ -240,10 +294,15 @@ services:
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `LARKSCOUT_LLM_PROVIDER` | `gemini` | LLM 后端：`gemini` 或 `openai` |
+| `LARKSCOUT_LLM_VENDOR` | `openai` | OpenAI 兼容厂商配置：`openai`、`zhipu`、`kimi`、`aliyun`、`volcengine` |
 | `GEMINI_API_KEY` | — | Google Gemini API Key |
 | `LARKSCOUT_LLM_API_KEY` | — | OpenAI 兼容接口的 API Key |
-| `LARKSCOUT_LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口的 Base URL |
-| `LARKSCOUT_LLM_MODEL` | 各 provider 默认值 | 指定模型名称 |
+| `LARKSCOUT_LLM_BASE_URL` | 厂商默认值 | 覆盖 OpenAI 兼容接口的 Base URL |
+| `LARKSCOUT_LLM_MODEL` | 厂商默认值 | 指定模型名称 |
+| `LARKSCOUT_OCR_MODEL` | `LARKSCOUT_LLM_MODEL` | 可选：单独指定 OCR 视觉模型 |
+| `LARKSCOUT_OCR_IMAGE_INPUT_MODE` | `data_url` | OCR 图片序列化模式：`data_url`、`plain_base64`、`remote_url_only` |
+| `LARKSCOUT_LLM_EXTRA_BODY_JSON` | — | 可选：合并到文本请求体中的 JSON 对象 |
+| `LARKSCOUT_OCR_EXTRA_BODY_JSON` | — | 可选：合并到 OCR 请求体中的 JSON 对象 |
 | `LARKSCOUT_DOCS_DIR` | `~/.larkscout/docs` | 文档库存储目录 |
 | `LARKSCOUT_STORE_SOURCE_FILES` | `true` | 是否将上传原件保存在每个文档目录下的 `source/` 子目录 |
 
@@ -256,6 +315,53 @@ LARKSCOUT_LLM_BASE_URL=http://host.docker.internal:11434/v1 \
 LARKSCOUT_LLM_MODEL=llama3 \
 docker compose up
 ```
+
+#### OpenAI 兼容厂商配置
+
+OpenAI 兼容接口支持按厂商 profile 自动补全默认 `base_url`、文本模型和 OCR 模型；如果你已有固定配置，也可以继续显式覆盖。
+OCR 图片输入模式的全局默认值仍固定为 `data_url`，优先保证兼容面。
+
+```bash
+# 智谱：默认文本模型与 OCR 模型分离
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=zhipu \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+docker compose up
+
+# Kimi：默认使用同一个多模态模型处理文本与 OCR
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=kimi \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+docker compose up
+
+# 阿里百炼：可使用 profile 默认模型，也可自行覆盖
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=aliyun \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+docker compose up
+
+# 火山方舟：通常需要显式填写你的推理接入点 / 模型名
+LARKSCOUT_LLM_PROVIDER=openai \
+LARKSCOUT_LLM_VENDOR=volcengine \
+LARKSCOUT_LLM_API_KEY=your_key_here \
+LARKSCOUT_LLM_MODEL=your_endpoint_or_model \
+LARKSCOUT_OCR_MODEL=your_vision_endpoint_or_model \
+docker compose up
+```
+
+如果厂商需要额外请求参数，也可以直接透传 JSON：
+
+```bash
+LARKSCOUT_OCR_EXTRA_BODY_JSON='{"image_url_detail":"high"}'
+```
+
+也可以显式切换 OCR 图片输入模式：
+
+```bash
+LARKSCOUT_OCR_IMAGE_INPUT_MODE=plain_base64
+```
+
+其中 `remote_url_only` 目前只做了显式报错路径：LarkScout 现在是把 PDF 页渲染到内存里直接上送，还没有内建“先上传图片再传远程 URL”的流程。
 
 ### API 接口
 

@@ -8,6 +8,7 @@ import pytest
 import providers as providers_module
 from providers import get_provider, reset_provider
 from providers.base import LLMProvider
+from providers.vendor_profiles import get_vendor_profile
 
 
 @pytest.fixture(autouse=True)
@@ -145,55 +146,212 @@ class TestOpenAICompatProvider:
         with pytest.raises(RuntimeError, match="LARKSCOUT_LLM_API_KEY"):
             get_provider()
 
-    def test_openai_compat_summarize_calls_http(self, monkeypatch):
-        """OpenAICompatProvider.summarize() uses httpx to POST /chat/completions."""
+    def test_openai_compat_summarize_calls_openai_sdk(self, monkeypatch):
+        """OpenAICompatProvider.summarize() uses the official OpenAI SDK."""
         monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
         monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
         monkeypatch.setenv("LARKSCOUT_LLM_BASE_URL", "https://api.example.com/v1")
         monkeypatch.setenv("LARKSCOUT_LLM_MODEL", "gpt-test")
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": "  great summary  "}}]
-        }
-        mock_resp.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="  great summary  "))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
 
-        mock_httpx = MagicMock()
-        mock_httpx.post.return_value = mock_resp
-
-        with patch.dict("sys.modules", {"httpx": mock_httpx}):
+        with patch.dict("sys.modules", {"openai": mock_openai}):
             p = get_provider()
             result = p.summarize("body text", "system prompt")
 
         assert result == "great summary"
-        mock_httpx.post.assert_called_once()
-        call_kwargs = mock_httpx.post.call_args
-        assert "chat/completions" in call_kwargs.args[0]
+        mock_openai.OpenAI.assert_called_once_with(
+            api_key="sk-test",
+            base_url="https://api.example.com/v1",
+            max_retries=0,
+            timeout=120,
+        )
+        mock_client.chat.completions.create.assert_called_once()
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-test"
+
+    def test_openai_compat_uses_vendor_defaults_when_overrides_absent(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_VENDOR", "zhipu")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.delenv("LARKSCOUT_LLM_BASE_URL", raising=False)
+        monkeypatch.delenv("LARKSCOUT_LLM_MODEL", raising=False)
+        monkeypatch.delenv("LARKSCOUT_OCR_MODEL", raising=False)
+
+        mock_client = MagicMock()
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+
+        assert p._base_url == "https://open.bigmodel.cn/api/paas/v4"
+        assert p._model == "glm-5.1"
+        assert p._ocr_model == "glm-4.6v"
+        mock_openai.OpenAI.assert_called_once_with(
+            api_key="sk-test",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            max_retries=0,
+            timeout=120,
+        )
 
     def test_openai_compat_ocr_sends_base64_image(self, monkeypatch):
-        """OpenAICompatProvider.ocr() encodes image as base64 and posts to vision endpoint."""
+        """OpenAICompatProvider.ocr() encodes image as base64 and sends multipart content."""
         monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
         monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": "page text"}}]
-        }
-        mock_resp.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="page text"))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
 
-        mock_httpx = MagicMock()
-        mock_httpx.post.return_value = mock_resp
-
-        with patch.dict("sys.modules", {"httpx": mock_httpx}):
+        with patch.dict("sys.modules", {"openai": mock_openai}):
             p = get_provider()
             result = p.ocr(b"\x89PNG", page_num=2)
 
         assert result == "page text"
-        payload = mock_httpx.post.call_args.kwargs["json"]
-        messages = payload["messages"]
+        messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
         assert any(
             isinstance(m.get("content"), list) for m in messages
         ), "Expected a multipart (list) content for vision"
+        image_part = messages[0]["content"][1]
+        assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_openai_compat_ocr_uses_dedicated_ocr_model_when_set(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_LLM_MODEL", "glm-5.1")
+        monkeypatch.setenv("LARKSCOUT_OCR_MODEL", "glm-4.6v")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="page text"))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+            p.ocr(b"\x89PNG", page_num=2)
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["model"] == "glm-4.6v"
+
+    def test_openai_compat_ocr_supports_plain_base64_mode(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_OCR_IMAGE_INPUT_MODE", "plain_base64")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="page text"))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+            p.ocr(b"\x89PNG", page_num=2)
+
+        image_part = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"][1]
+        assert image_part["image_url"]["url"] == "iVBORw=="
+
+    def test_openai_compat_ocr_rejects_remote_url_only_mode(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_OCR_IMAGE_INPUT_MODE", "remote_url_only")
+
+        mock_client = MagicMock()
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+            with pytest.raises(RuntimeError, match="remote_url_only"):
+                p.ocr(b"\x89PNG", page_num=2)
+
+    def test_openai_compat_rejects_invalid_image_input_mode(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_OCR_IMAGE_INPUT_MODE", "bad_mode")
+
+        mock_openai = MagicMock()
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            with pytest.raises(RuntimeError, match="LARKSCOUT_OCR_IMAGE_INPUT_MODE"):
+                get_provider()
+
+    def test_openai_compat_merges_ocr_extra_body_json(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_OCR_EXTRA_BODY_JSON", '{"image_url_detail":"high"}')
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="page text"))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+            p.ocr(b"\x89PNG", page_num=2)
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["image_url_detail"] == "high"
+
+    def test_openai_compat_rejects_invalid_extra_body_json(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_OCR_EXTRA_BODY_JSON", "[1,2,3]")
+
+        mock_openai = MagicMock()
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            with pytest.raises(RuntimeError, match="LARKSCOUT_OCR_EXTRA_BODY_JSON"):
+                get_provider()
+
+
+class TestVendorProfiles:
+    def test_openai_vendor_profile_defaults(self):
+        profile = get_vendor_profile("openai")
+        assert profile.base_url == "https://api.openai.com/v1"
+        assert profile.default_text_model == "gpt-4o-mini"
+
+    def test_zhipu_vendor_profile_defaults(self):
+        profile = get_vendor_profile("zhipu")
+        assert profile.base_url == "https://open.bigmodel.cn/api/paas/v4"
+        assert profile.default_text_model == "glm-5.1"
+        assert profile.default_ocr_model == "glm-4.6v"
+
+    def test_kimi_vendor_profile_defaults(self):
+        profile = get_vendor_profile("kimi")
+        assert profile.base_url == "https://api.moonshot.cn/v1"
+        assert profile.default_text_model == "kimi-k2.6"
+        assert profile.default_ocr_model == "kimi-k2.6"
+
+    def test_aliyun_vendor_profile_defaults(self):
+        profile = get_vendor_profile("aliyun")
+        assert profile.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        assert profile.default_text_model == "qwen-plus"
+        assert profile.default_ocr_model == "qwen-vl-ocr"
+
+    def test_volcengine_vendor_profile_defaults(self):
+        profile = get_vendor_profile("volcengine")
+        assert profile.base_url == "https://ark.cn-beijing.volces.com/api/v3"
+        assert profile.default_text_model is None
+        assert profile.default_ocr_model is None
+
+    def test_unknown_vendor_falls_back_to_openai(self):
+        profile = get_vendor_profile("unknown")
+        assert profile.name == "openai"
 
 
 # ── AC-4: provider caching ────────────────────────────────────────────────────

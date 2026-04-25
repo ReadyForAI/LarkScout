@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
   larkscout:
@@ -6,11 +5,14 @@ services:
     ports:
       - "9898:9898"
     volumes:
-      - larkscout-docs:/root/.larkscout/docs
+      - .:/app
+      - /Users/grace/.larkscout/docs:/root/.larkscout/docs
+
     environment:
       LARKSCOUT_DOCS_DIR: /root/.larkscout/docs
       # LLM provider (default: gemini)
       LARKSCOUT_LLM_PROVIDER: ${LARKSCOUT_LLM_PROVIDER:-gemini}
+      LARKSCOUT_LLM_VENDOR: ${LARKSCOUT_LLM_VENDOR:-openai}
       # Gemini / Google AI credentials
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
@@ -18,7 +20,9 @@ services:
       LARKSCOUT_LLM_API_KEY: ${LARKSCOUT_LLM_API_KEY:-}
       LARKSCOUT_LLM_BASE_URL: ${LARKSCOUT_LLM_BASE_URL:-https://api.openai.com/v1}
       LARKSCOUT_LLM_MODEL: ${LARKSCOUT_LLM_MODEL:-}
-    restart: unless-stopped
-
-volumes:
-  larkscout-docs:
+      LARKSCOUT_OCR_MODEL: ${LARKSCOUT_OCR_MODEL:-}
+      LARKSCOUT_OCR_IMAGE_INPUT_MODE: ${LARKSCOUT_OCR_IMAGE_INPUT_MODE:-}
+      LARKSCOUT_LLM_EXTRA_BODY_JSON: ${LARKSCOUT_LLM_EXTRA_BODY_JSON:-}
+      LARKSCOUT_OCR_EXTRA_BODY_JSON: ${LARKSCOUT_OCR_EXTRA_BODY_JSON:-}
+      LARKSCOUT_DOC_ID_STRATEGY: ${LARKSCOUT_DOC_ID_STRATEGY:-counter}
+    restart: always
