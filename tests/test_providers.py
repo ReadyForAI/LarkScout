@@ -305,7 +305,26 @@ class TestOpenAICompatProvider:
             p.ocr(b"\x89PNG", page_num=2)
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["image_url_detail"] == "high"
+        assert call_kwargs["extra_body"]["image_url_detail"] == "high"
+
+    def test_openai_compat_merges_text_extra_body_json(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_LLM_EXTRA_BODY_JSON", '{"reasoning_effort":"low"}')
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="summary"))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+            p.summarize("body text", "system prompt")
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"]["reasoning_effort"] == "low"
 
     def test_openai_compat_rejects_invalid_extra_body_json(self, monkeypatch):
         monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")

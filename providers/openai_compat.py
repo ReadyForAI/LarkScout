@@ -148,7 +148,7 @@ class OpenAICompatProvider(LLMProvider):
                     "messages": messages,
                 }
                 if extra_body:
-                    kwargs.update(extra_body)
+                    kwargs["extra_body"] = extra_body
                 resp = self._client.chat.completions.create(
                     **kwargs,
                 )
