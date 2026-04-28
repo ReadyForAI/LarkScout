@@ -24,12 +24,13 @@ class LLMProvider(ABC):
         """
 
     @abstractmethod
-    def ocr(self, image_bytes: bytes, page_num: int) -> str:
+    def ocr(self, image_bytes: bytes, page_num: int, proofread: bool | None = None) -> str:
         """Extract text from a page image via vision.
 
         Args:
             image_bytes: Raw image bytes (PNG/JPEG).
             page_num:    1-based page number (used only for logging).
+            proofread:   Override provider default OCR proofreading behaviour.
 
         Returns:
             Extracted text string.

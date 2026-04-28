@@ -15,6 +15,22 @@ from providers.base import LLMProvider
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "gemini-2.5-flash"
+_OCR_TRANSCRIBE_PROMPT = (
+    "Transcribe this document page exactly as written. "
+    "Preserve names, numbers, dates, account numbers, email addresses, and punctuation exactly. "
+    "Do not summarize, translate, infer, normalize, or correct the source. "
+    "Ignore only obvious scanner borders or decorative watermarks. "
+    "If the page contains a table, return the table as a complete GitHub-flavored Markdown table. "
+    "Return only the transcribed page text."
+)
+_OCR_PROOFREAD_PROMPT = (
+    "Proofread the following OCR draft against the document page image. "
+    "Fix OCR mistakes only where the image clearly supports the correction. "
+    "Pay extra attention to company names, amounts, percentages, dates, account numbers, email addresses, and table cells. "
+    "Keep the same layout style, including Markdown tables where present. "
+    "Return only the corrected page text.\n\n"
+    "OCR draft:\n{draft}"
+)
 
 
 class GeminiProvider(LLMProvider):
@@ -23,6 +39,12 @@ class GeminiProvider(LLMProvider):
     def __init__(self) -> None:
         self._client = None
         self._model = os.environ.get("LARKSCOUT_LLM_MODEL") or _DEFAULT_MODEL
+        self._ocr_proofread = os.environ.get("LARKSCOUT_OCR_PROOFREAD", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
 
     def _init(self) -> None:
         """Lazy-initialise the Gemini client on first use."""
@@ -66,23 +88,45 @@ class GeminiProvider(LLMProvider):
                     return "[summary generation failed]"
         return "[summary generation failed]"
 
-    def ocr(self, image_bytes: bytes, page_num: int, max_retries: int = 2) -> str:
+    def ocr(
+        self,
+        image_bytes: bytes,
+        page_num: int,
+        proofread: bool | None = None,
+        max_retries: int = 2,
+    ) -> str:
         """OCR a single page image via Gemini Vision."""
         self._init()
 
         import PIL.Image
 
         img = PIL.Image.open(io.BytesIO(image_bytes))
-        ocr_prompt = "Extract all text from this image. Return only the extracted text, no commentary."
-
+        do_proofread = self._ocr_proofread if proofread is None else proofread
         for attempt in range(max_retries + 1):
             try:
                 response = self._client.models.generate_content(
                     model=self._model,
-                    contents=[ocr_prompt, img],
+                    contents=[_OCR_TRANSCRIBE_PROMPT, img],
                     config={"http_options": {"timeout": 60_000}},
                 )
-                return response.text.strip()
+                result = response.text.strip()
+                if do_proofread and attempt == 0 and result and not result.startswith("["):
+                    try:
+                        review = self._client.models.generate_content(
+                            model=self._model,
+                            contents=[_OCR_PROOFREAD_PROMPT.format(draft=result), img],
+                            config={"http_options": {"timeout": 60_000}},
+                        )
+                        reviewed = review.text.strip()
+                        if reviewed and not reviewed.startswith("["):
+                            result = reviewed
+                    except Exception as exc:
+                        logger.warning(
+                            "Gemini OCR proofread skipped for page %d: %s",
+                            page_num,
+                            exc,
+                        )
+                return result
             except Exception as exc:
                 if attempt < max_retries:
                     logger.warning("Gemini OCR retry (%d/%d) for page %d: %s", attempt + 1, max_retries, page_num, exc)

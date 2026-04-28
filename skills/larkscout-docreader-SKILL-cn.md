@@ -442,7 +442,7 @@ GET /doc/library/{doc_id}/sections → section 列表
 GET /doc/library/{doc_id}/section/{sid} → 读取内容
 ```
 
-适用于：Agent 自己做分析、不需要 LLM 摘要，或者需要节省 Gemini API 调用的场景。
+适用于：Agent 自己做分析、不需要 LLM 摘要，或者需要节省 LLM API 调用的场景。
 
 ---
 
@@ -455,9 +455,10 @@ GET /doc/library/{doc_id}/section/{sid} → 读取内容
 | `404 document not found`                           | doc_id 无效或文档尚未入库      | 先用 search 确认 doc_id |
 | `404 section not found`                            | sid 无效                       | 先调用 `/doc/library/{doc_id}/sections` 获取有效 sid 列表 |
 | `500 parse failed`                                 | PDF 损坏或加密                 | 提示用户检查文件 |
-| `500 RuntimeError: Please set GEMINI_API_KEY`      | API key 未配置                 | 设置环境变量并重启服务 |
+| 与缺少 LLM 凭证相关的 `500 RuntimeError`           | LLM provider 凭证未配置        | 检查当前启用的 LLM provider 配置并重启服务 |
 | Parsing takes too long                             | 文件较大且包含 OCR             | 先用 `generate_summary=false` 做快速提取，再单独生成摘要 |
 | Table is empty                                     | PDF 中的表格是图片             | 使用 `force_ocr=true`，OCR 会尝试识别图片表格 |
+| OCR 结果出现 `No image provided` 一类内容          | 视觉模型或图片输入模式不匹配   | 先检查当前 OCR 模型、vendor profile 和 OCR 图片输入模式，再决定是否重试 |
 | XLSX/CSV truncated warning in metadata             | 文件超过 `MAX_PARSE_ROWS`      | 正常现象，为安全起见大表会被截断；可检查 `metadata.truncated` |
 
 ---
@@ -469,13 +470,14 @@ GET /doc/library/{doc_id}/section/{sid} → 读取内容
 - `generate_summary=true`（需要摘要时）
 - `extract_tables=true`
 - `max_tables_per_page=3`
-- `concurrency=3`（可根据 Gemini API 配额调整）
+- `concurrency=3`（可根据上游 LLM/OCR 配额调整）
 
 **OCR：**
 
 - 普通文档：不要传 `force_ocr`，服务会自动检测需要 OCR 的页面
 - 扫描文档：使用 `force_ocr=true`
 - 混合文档：使用 `ocr_pages="10-30"`（只对指定页范围 OCR）
+- 如果 OCR 以某个 provider 特有的方式失败，先检查服务当前使用的 OCR 模型 / vendor 配置，不要先归因到文档本身
 
 ---
 

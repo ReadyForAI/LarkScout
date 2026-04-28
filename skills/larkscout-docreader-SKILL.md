@@ -442,7 +442,7 @@ GET /doc/library/{doc_id}/sections → section list
 GET /doc/library/{doc_id}/section/{sid} → read content
 ```
 
-Use for: scenarios where the Agent performs its own analysis without needing LLM summaries, or to conserve Gemini API calls.
+Use for: scenarios where the Agent performs its own analysis without needing LLM summaries, or to conserve LLM API calls.
 
 ---
 
@@ -455,9 +455,10 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 | `404 document not found`                           | Invalid doc_id or unparsed doc | Use search to confirm doc_id first                                         |
 | `404 section not found`                            | Invalid sid                    | Call `/doc/library/{doc_id}/sections` first to get valid sid list           |
 | `500 parse failed`                                 | Corrupted or encrypted PDF     | Prompt user to check the file                                              |
-| `500 RuntimeError: Please set GEMINI_API_KEY`      | API key not configured         | Set environment variable and restart service                               |
+| `500 RuntimeError` about missing LLM credentials   | LLM provider credentials not configured | Check the active LLM provider settings and restart service        |
 | Parsing takes too long                             | Large file + OCR               | Use `generate_summary=false` for fast extraction first, generate summary later |
 | Table is empty                                     | Tables in PDF are images       | Use `force_ocr=true` — OCR will attempt to recognize tables in images      |
+| OCR output looks like `No image provided`          | Vision model / image input mode mismatch | Check the active OCR model, vendor profile, and OCR image input mode before retrying |
 | XLSX/CSV truncated warning in metadata             | File exceeds MAX_PARSE_ROWS    | Normal — large spreadsheets are truncated for safety; check `metadata.truncated` |
 
 ---
@@ -469,13 +470,14 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 - `generate_summary=true` (when summaries are needed)
 - `extract_tables=true`
 - `max_tables_per_page=3`
-- `concurrency=3` (adjust based on Gemini API quota)
+- `concurrency=3` (adjust based on upstream LLM/OCR quota)
 
 **OCR:**
 
 - Normal documents: Don't pass `force_ocr` — service auto-detects pages needing OCR
 - Scanned documents: `force_ocr=true`
 - Mixed documents: `ocr_pages="10-30"` (OCR only specified page ranges)
+- If OCR fails in a provider-specific way, first inspect the service's active OCR model / vendor configuration before blaming the document itself
 
 ---
 

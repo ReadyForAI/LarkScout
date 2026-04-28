@@ -22,6 +22,7 @@ Basic usage (async)::
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,19 @@ def _tags_param(tags: list[str] | None) -> str | None:
     import json
 
     return json.dumps(tags) if tags else None
+
+
+def _metadata_param(metadata: dict[str, Any] | None) -> str | None:
+    """Encode metadata as a JSON-object string for form fields."""
+    if not metadata:
+        return None
+    import json
+
+    return json.dumps(metadata, ensure_ascii=False)
+
+
+def _doc_id_like(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", value.strip()))
 
 
 # ── sync client ───────────────────────────────────────────────────────────────
@@ -135,8 +149,17 @@ class LarkScoutClient:
         file_path: str | Path,
         *,
         generate_summary: bool = True,
+        summary_mode: str | None = None,
+        profile: str | None = None,
         extract_tables: bool = True,
         tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        doc_type: str | None = None,
+        project_id: str | None = None,
+        source_role: str | None = None,
+        id_strategy: str | None = None,
+        skip_ocr_pages: str | list[int | str] | None = None,
+        doc_id: str | None = None,
         force_ocr: bool = False,
     ) -> dict[str, Any]:
         """Upload and parse a document (PDF, DOCX, XLSX, or CSV).
@@ -144,24 +167,61 @@ class LarkScoutClient:
         Args:
             file_path:        Local path to the document.
             generate_summary: Generate LLM summaries (default: True).
+            summary_mode:     Optional summary mode: ``"sync"``, ``"defer"``, or ``"off"``.
+            profile:          Optional document profile name, e.g. ``"contract_cn"``.
             extract_tables:   Extract tables as Markdown (default: True).
             tags:             Optional list of tags.
+            metadata:         Optional JSON-serializable metadata attached to the document.
+            doc_type:         Optional caller-defined document type.
+            project_id:       Optional caller-defined project id.
+            source_role:      Optional caller-defined source role.
+            id_strategy:      Optional document id strategy: ``"counter"`` or ``"source_filename"``.
+            skip_ocr_pages:   Optional page range/list treated as manually skipped OCR pages.
+            doc_id:           Optional explicit document id.
             force_ocr:        Force OCR on all pages (default: False).
 
         Returns:
             dict with ``doc_id``, ``digest``, ``section_count``, ``table_count``, etc.
         """
         path = Path(file_path)
+        merged_metadata = dict(metadata or {})
+        for key, value in {
+            "summary_mode": summary_mode,
+            "document_profile": profile,
+            "doc_type": doc_type,
+            "project_id": project_id,
+            "source_role": source_role,
+            "id_strategy": id_strategy,
+            "skip_ocr_pages": skip_ocr_pages,
+        }.items():
+            if value is not None:
+                merged_metadata.setdefault(key, value)
         return self._post_multipart(
             "/doc/parse",
             {
+                "doc_id": doc_id,
                 "generate_summary": str(generate_summary).lower(),
+                "summary_mode": summary_mode,
+                "document_profile": profile,
                 "extract_tables": str(extract_tables).lower(),
                 "force_ocr": str(force_ocr).lower(),
+                "id_strategy": id_strategy,
+                "skip_ocr_pages": skip_ocr_pages if isinstance(skip_ocr_pages, str) else None,
                 "tags": _tags_param(tags),
+                "metadata": _metadata_param(merged_metadata),
             },
             path,
         )
+
+    def ensure_doc(self, value: str | Path, **parse_kwargs: Any) -> str:
+        """Return a doc_id, parsing ``value`` first when it is a local file path."""
+        text = str(value)
+        path = Path(text).expanduser()
+        if path.exists() and path.is_file():
+            return str(self.parse(path, **parse_kwargs)["doc_id"])
+        if _doc_id_like(text):
+            return text
+        raise ValueError(f"not a doc_id or readable file path: {value}")
 
     def search(
         self,
@@ -189,6 +249,31 @@ class LarkScoutClient:
             file_type=file_type,
             limit=limit,
         )
+
+    def search_text(
+        self,
+        query: str,
+        *,
+        doc_id: str | None = None,
+        scope: str = "all",
+        tags: str | None = None,
+        file_type: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Search full text and/or section text across the document library."""
+        return self._get(
+            "/doc/library/search_text",
+            q=query,
+            doc_id=doc_id,
+            scope=scope,
+            tags=tags,
+            file_type=file_type,
+            limit=limit,
+        )
+
+    def get_manifest(self, doc_id: str) -> dict[str, Any]:
+        """Retrieve a document manifest."""
+        return self._get(f"/doc/library/{doc_id}/manifest")
 
     def get_digest(self, doc_id: str) -> dict[str, Any]:
         """Retrieve the digest (~200 tokens) for a document.
@@ -224,6 +309,10 @@ class LarkScoutClient:
         """
         return self._get(f"/doc/library/{doc_id}/brief")
 
+    def get_full(self, doc_id: str) -> dict[str, Any]:
+        """Retrieve the full document text."""
+        return self._get(f"/doc/library/{doc_id}/full")
+
     def list_sections(self, doc_id: str) -> dict[str, Any]:
         """List all sections of a document with their sids and metadata.
 
@@ -234,6 +323,48 @@ class LarkScoutClient:
             dict with ``doc_id`` and ``sections`` list.
         """
         return self._get(f"/doc/library/{doc_id}/sections")
+
+    def search_sections(
+        self,
+        doc_id: str,
+        query: str,
+        *,
+        limit: int = 20,
+        include_content: bool = False,
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """Search within one document's sections and return sid/page provenance."""
+        return self._post_json(
+            f"/doc/library/{doc_id}/search_sections",
+            {
+                "q": query,
+                "limit": limit,
+                "include_content": include_content,
+                "case_sensitive": case_sensitive,
+            },
+        )
+
+    def chunk_doc(
+        self,
+        doc_id: str,
+        *,
+        max_tokens_per_chunk: int = 4000,
+        overlap_tokens: int = 200,
+        merge_short_sections: bool = True,
+        merge_threshold_tokens: int = 500,
+        include_text: bool = True,
+    ) -> dict[str, Any]:
+        """Build generic section-boundary chunks for a document."""
+        return self._post_json(
+            f"/doc/library/{doc_id}/chunks",
+            {
+                "max_tokens_per_chunk": max_tokens_per_chunk,
+                "overlap_tokens": overlap_tokens,
+                "merge_short_sections": merge_short_sections,
+                "merge_threshold_tokens": merge_threshold_tokens,
+                "include_text": include_text,
+            },
+        )
 
     def health(self) -> dict[str, Any]:
         """Return the service health status.
@@ -331,22 +462,59 @@ class AsyncLarkScoutClient:
         file_path: str | Path,
         *,
         generate_summary: bool = True,
+        summary_mode: str | None = None,
+        profile: str | None = None,
         extract_tables: bool = True,
         tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        doc_type: str | None = None,
+        project_id: str | None = None,
+        source_role: str | None = None,
+        id_strategy: str | None = None,
+        skip_ocr_pages: str | list[int | str] | None = None,
+        doc_id: str | None = None,
         force_ocr: bool = False,
     ) -> dict[str, Any]:
         """Upload and parse a document (PDF, DOCX, XLSX, or CSV)."""
         path = Path(file_path)
+        merged_metadata = dict(metadata or {})
+        for key, value in {
+            "summary_mode": summary_mode,
+            "document_profile": profile,
+            "doc_type": doc_type,
+            "project_id": project_id,
+            "source_role": source_role,
+            "id_strategy": id_strategy,
+            "skip_ocr_pages": skip_ocr_pages,
+        }.items():
+            if value is not None:
+                merged_metadata.setdefault(key, value)
         return await self._post_multipart(
             "/doc/parse",
             {
+                "doc_id": doc_id,
                 "generate_summary": str(generate_summary).lower(),
+                "summary_mode": summary_mode,
+                "document_profile": profile,
                 "extract_tables": str(extract_tables).lower(),
                 "force_ocr": str(force_ocr).lower(),
+                "id_strategy": id_strategy,
+                "skip_ocr_pages": skip_ocr_pages if isinstance(skip_ocr_pages, str) else None,
                 "tags": _tags_param(tags),
+                "metadata": _metadata_param(merged_metadata),
             },
             path,
         )
+
+    async def ensure_doc(self, value: str | Path, **parse_kwargs: Any) -> str:
+        """Return a doc_id, parsing ``value`` first when it is a local file path."""
+        text = str(value)
+        path = Path(text).expanduser()
+        if path.exists() and path.is_file():
+            return str((await self.parse(path, **parse_kwargs))["doc_id"])
+        if _doc_id_like(text):
+            return text
+        raise ValueError(f"not a doc_id or readable file path: {value}")
 
     async def search(
         self,
@@ -365,6 +533,31 @@ class AsyncLarkScoutClient:
             limit=limit,
         )
 
+    async def search_text(
+        self,
+        query: str,
+        *,
+        doc_id: str | None = None,
+        scope: str = "all",
+        tags: str | None = None,
+        file_type: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Search full text and/or section text across the document library."""
+        return await self._get(
+            "/doc/library/search_text",
+            q=query,
+            doc_id=doc_id,
+            scope=scope,
+            tags=tags,
+            file_type=file_type,
+            limit=limit,
+        )
+
+    async def get_manifest(self, doc_id: str) -> dict[str, Any]:
+        """Retrieve a document manifest."""
+        return await self._get(f"/doc/library/{doc_id}/manifest")
+
     async def get_digest(self, doc_id: str) -> dict[str, Any]:
         """Retrieve the digest (~200 tokens) for a document."""
         return await self._get(f"/doc/library/{doc_id}/digest")
@@ -377,9 +570,55 @@ class AsyncLarkScoutClient:
         """Retrieve the brief (~1500 tokens) for a document."""
         return await self._get(f"/doc/library/{doc_id}/brief")
 
+    async def get_full(self, doc_id: str) -> dict[str, Any]:
+        """Retrieve the full document text."""
+        return await self._get(f"/doc/library/{doc_id}/full")
+
     async def list_sections(self, doc_id: str) -> dict[str, Any]:
         """List all sections of a document with their sids and metadata."""
         return await self._get(f"/doc/library/{doc_id}/sections")
+
+    async def search_sections(
+        self,
+        doc_id: str,
+        query: str,
+        *,
+        limit: int = 20,
+        include_content: bool = False,
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """Search within one document's sections and return sid/page provenance."""
+        return await self._post_json(
+            f"/doc/library/{doc_id}/search_sections",
+            {
+                "q": query,
+                "limit": limit,
+                "include_content": include_content,
+                "case_sensitive": case_sensitive,
+            },
+        )
+
+    async def chunk_doc(
+        self,
+        doc_id: str,
+        *,
+        max_tokens_per_chunk: int = 4000,
+        overlap_tokens: int = 200,
+        merge_short_sections: bool = True,
+        merge_threshold_tokens: int = 500,
+        include_text: bool = True,
+    ) -> dict[str, Any]:
+        """Build generic section-boundary chunks for a document."""
+        return await self._post_json(
+            f"/doc/library/{doc_id}/chunks",
+            {
+                "max_tokens_per_chunk": max_tokens_per_chunk,
+                "overlap_tokens": overlap_tokens,
+                "merge_short_sections": merge_short_sections,
+                "merge_threshold_tokens": merge_threshold_tokens,
+                "include_text": include_text,
+            },
+        )
 
     async def health(self) -> dict[str, Any]:
         """Return the service health status."""

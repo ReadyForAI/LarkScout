@@ -122,7 +122,7 @@ class TestGeminiProvider:
             result = p.ocr(image_bytes, page_num=1)
 
         assert result == "extracted text"
-        mock_client.models.generate_content.assert_called_once()
+        assert mock_client.models.generate_content.call_count == 2
 
 
 # ── AC-3: OpenAI-compat provider ──────────────────────────────────────────────
@@ -223,6 +223,7 @@ class TestOpenAICompatProvider:
         ), "Expected a multipart (list) content for vision"
         image_part = messages[0]["content"][1]
         assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
+        assert mock_client.chat.completions.create.call_count == 2
 
     def test_openai_compat_ocr_uses_dedicated_ocr_model_when_set(self, monkeypatch):
         monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
@@ -243,6 +244,24 @@ class TestOpenAICompatProvider:
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["model"] == "glm-4.6v"
+
+    def test_openai_compat_ocr_proofread_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LARKSCOUT_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LARKSCOUT_OCR_PROOFREAD", "false")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="page text"))]
+        )
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            p = get_provider()
+            p.ocr(b"\x89PNG", page_num=2)
+
+        assert mock_client.chat.completions.create.call_count == 1
 
     def test_openai_compat_ocr_supports_plain_base64_mode(self, monkeypatch):
         monkeypatch.setenv("LARKSCOUT_LLM_PROVIDER", "openai")

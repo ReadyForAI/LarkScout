@@ -410,6 +410,43 @@ class TestLibrarySearchText:
         assert resp.json()["total"] == 0
 
 
+class TestLibrarySectionSearchAndChunks:
+    def test_search_sections_returns_section_provenance(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_doc(Path(tmp))
+            with patch("larkscout_docreader._get_docs_dir", return_value=Path(tmp)):
+                resp = client.post(
+                    "/doc/library/DOC-001/search_sections",
+                    json={"q": "payment", "include_content": True},
+                )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        first = data["results"][0]
+        assert first["sid"] == "abc123"
+        assert first["page_start"] == 1
+        assert "payment" in first["snippet"].lower()
+        assert "Customer ACME" in first["content"]
+
+    def test_chunk_document_uses_section_boundaries(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_doc(Path(tmp))
+            with patch("larkscout_docreader._get_docs_dir", return_value=Path(tmp)):
+                resp = client.post(
+                    "/doc/library/DOC-001/chunks",
+                    json={"max_tokens_per_chunk": 4000, "include_text": False},
+                )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["doc_id"] == "DOC-001"
+        assert data["chunk_count"] >= 1
+        first = data["chunks"][0]
+        assert first["chunk_id"] == "chunk-0001"
+        assert first["section_ids"]
+        assert first["provenance"][0]["doc_id"] == "DOC-001"
+        assert "text" not in first
+
+
 # ---------------------------------------------------------------------------
 # Rate limiting (429)
 # ---------------------------------------------------------------------------

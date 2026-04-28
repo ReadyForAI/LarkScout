@@ -253,6 +253,36 @@ class TestManifestDocreaderFormat:
             assert manifest["file_type"] == "pdf"
             assert manifest["source"] == "upload"
 
+    def test_rewrite_removes_stale_generated_section_files(self):
+        from larkscout_docreader import ParsedDocument, Section, write_output_extract_only
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            first = ParsedDocument(
+                filename="test.pdf",
+                file_type="pdf",
+                total_pages=1,
+                pages=[],
+                sections=[
+                    Section(index=1, title="Old", level=1, text="old", page_range="1-1", sid="old"),
+                ],
+            )
+            second = ParsedDocument(
+                filename="test.pdf",
+                file_type="pdf",
+                total_pages=1,
+                pages=[],
+                sections=[
+                    Section(index=1, title="New", level=1, text="new", page_range="1-1", sid="new"),
+                ],
+            )
+
+            write_output_extract_only("DOC-012", first, docs_dir, tags=[], source="upload")
+            write_output_extract_only("DOC-012", second, docs_dir, tags=[], source="upload")
+
+            section_names = sorted(p.name for p in (docs_dir / "DOC-012" / "sections").iterdir())
+            assert section_names == ["01-new-New.md"]
+
     def test_docreader_manifest_includes_metadata_and_source_file(self):
         from larkscout_docreader import write_output
 
