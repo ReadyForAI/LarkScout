@@ -21,6 +21,8 @@ dependencies = [
     "openai>=1.0.0",
     "Pillow>=10.4.0",
     "numpy>=1.26.0",
+    "paddlepaddle>=2.6.0",
+    "paddleocr>=2.7.0",
     "httpx>=0.27.0",
 ]
 
@@ -50,6 +52,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v"
+asyncio_mode = "auto"
 markers = [
     "live: requires a running LarkScout server (localhost:9898) and network access",
     "live_llm: requires a running server AND a configured LLM API key",

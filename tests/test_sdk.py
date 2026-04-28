@@ -95,6 +95,35 @@ class TestSyncClient:
         assert "search" in call_kwargs.args[0]
         assert call_kwargs.kwargs["params"]["q"] == "revenue"
 
+    def test_parse_accepts_skill_metadata_options(self, sync_client, tmp_path):
+        client, mock_http, mock_resp = sync_client
+        sample = tmp_path / "tender.pdf"
+        sample.write_bytes(b"%PDF-1.4")
+        mock_resp.json.return_value = {"doc_id": "DOC-001"}
+
+        result = client.parse(
+            sample,
+            summary_mode="defer",
+            profile="tender_cn",
+            metadata={"app": "bid-manage"},
+            project_id="P-001",
+            source_role="tender_file",
+            id_strategy="source_filename",
+            skip_ocr_pages=[1, "3-4"],
+        )
+
+        assert result["doc_id"] == "DOC-001"
+        data = mock_http.post.call_args.kwargs["data"]
+        assert data["summary_mode"] == "defer"
+        assert data["document_profile"] == "tender_cn"
+        assert data["id_strategy"] == "source_filename"
+        assert "bid-manage" in data["metadata"]
+        assert "tender_file" in data["metadata"]
+
+    def test_ensure_doc_returns_existing_id(self, sync_client):
+        client, _, _ = sync_client
+        assert client.ensure_doc("DOC-001") == "DOC-001"
+
     def test_get_digest(self, sync_client):
         client, mock_http, mock_resp = sync_client
         mock_resp.json.return_value = {"doc_id": "DOC-001", "content": "# Summary"}
@@ -108,6 +137,23 @@ class TestSyncClient:
         result = client.get_section("DOC-001", "abc")
         assert result["sid"] == "abc"
         assert "DOC-001/section/abc" in mock_http.get.call_args.args[0]
+
+    def test_skill_support_helpers(self, sync_client):
+        client, mock_http, mock_resp = sync_client
+        mock_resp.json.return_value = {"ok": True}
+
+        client.get_manifest("DOC-001")
+        assert "DOC-001/manifest" in mock_http.get.call_args.args[0]
+
+        client.search_sections("DOC-001", "payment", include_content=True)
+        post_call = mock_http.post.call_args
+        assert "DOC-001/search_sections" in post_call.args[0]
+        assert post_call.kwargs["json"]["include_content"] is True
+
+        client.chunk_doc("DOC-001", include_text=False)
+        post_call = mock_http.post.call_args
+        assert "DOC-001/chunks" in post_call.args[0]
+        assert post_call.kwargs["json"]["include_text"] is False
 
     def test_context_manager_closes(self, monkeypatch):
         import sys

@@ -23,6 +23,24 @@ from providers.vendor_profiles import get_vendor_profile
 
 logger = logging.getLogger(__name__)
 
+_OCR_TRANSCRIBE_PROMPT = (
+    "Transcribe this document page exactly as written. "
+    "Preserve names, numbers, dates, account numbers, email addresses, and punctuation exactly. "
+    "Do not summarize, translate, infer, normalize, or correct the source. "
+    "Ignore only obvious scanner borders or decorative watermarks. "
+    "If the page contains a table, return the table as a complete GitHub-flavored Markdown table. "
+    "Return only the transcribed page text."
+)
+
+_OCR_PROOFREAD_PROMPT = (
+    "Proofread the following OCR draft against the document page image. "
+    "Fix OCR mistakes only where the image clearly supports the correction. "
+    "Pay extra attention to company names, amounts, percentages, dates, account numbers, email addresses, and table cells. "
+    "Keep the same layout style, including Markdown tables where present. "
+    "Return only the corrected page text.\n\n"
+    "OCR draft:\n{draft}"
+)
+
 
 class OpenAICompatProvider(LLMProvider):
     """LLM provider backed by the official OpenAI SDK."""
@@ -57,6 +75,12 @@ class OpenAICompatProvider(LLMProvider):
             os.environ.get("LARKSCOUT_OCR_EXTRA_BODY_JSON"),
             env_name="LARKSCOUT_OCR_EXTRA_BODY_JSON",
         )
+        self._ocr_proofread = os.environ.get("LARKSCOUT_OCR_PROOFREAD", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
 
         if not self._api_key:
             raise RuntimeError(
@@ -176,17 +200,19 @@ class OpenAICompatProvider(LLMProvider):
             extra_body=self._chat_extra_body,
         )
 
-    def ocr(self, image_bytes: bytes, page_num: int) -> str:
+    def ocr(self, image_bytes: bytes, page_num: int, proofread: bool | None = None) -> str:
         """OCR a page image via the OpenAI vision endpoint (base64-encoded)."""
+        image_part = self._build_ocr_image_part(image_bytes)
+        do_proofread = self._ocr_proofread if proofread is None else proofread
         messages = [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "Extract all text from this image. Return only the extracted text, no commentary.",
+                        "text": _OCR_TRANSCRIBE_PROMPT,
                     },
-                    self._build_ocr_image_part(image_bytes),
+                    image_part,
                 ],
             }
         ]
@@ -196,6 +222,27 @@ class OpenAICompatProvider(LLMProvider):
             model=self._ocr_model,
             extra_body=self._ocr_extra_body,
         )
+        if do_proofread and result and not result.startswith("["):
+            review_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": _OCR_PROOFREAD_PROMPT.format(draft=result),
+                        },
+                        image_part,
+                    ],
+                }
+            ]
+            reviewed = self._chat(
+                review_messages,
+                max_retries=1,
+                model=self._ocr_model,
+                extra_body=self._ocr_extra_body,
+            )
+            if reviewed and not reviewed.startswith("["):
+                result = reviewed
         if result.startswith("["):
             logger.warning("OpenAI-compat OCR may have failed for page %d", page_num)
         return result

@@ -1,0 +1,138 @@
+{
+  "profile": "contract_cn",
+  "groups": [
+    {
+      "id": "quotation_block",
+      "aliases": ["客户名称", "报价日期", "报价有效期"],
+      "page_scope": [3],
+      "crop": {
+        "x0": 0.05,
+        "y0": 0.16,
+        "x1": 0.97,
+        "y1": 0.66
+      },
+      "start_alias": "1. 软件产品",
+      "end_alias": "2. 合同价款的支付方式",
+      "replace_mode": "block_between_aliases"
+    },
+    {
+      "id": "acceptance_header",
+      "aliases": ["项目验收报告", "附件《验收的内容、标准和范围》"],
+      "page_scope": [11],
+      "crop": {
+        "x0": 0.06,
+        "y0": 0.05,
+        "x1": 0.95,
+        "y1": 0.34
+      },
+      "replace_mode": "replace_entire_page"
+    }
+  ],
+  "fields": [
+    {
+      "id": "contract_no",
+      "aliases": ["合同编号"],
+      "pattern": "合同编号[：:\\s\\[]+([^\\n\\]]+)"
+    },
+    {
+      "id": "sign_date",
+      "aliases": ["签订时间", "签订日期"],
+      "pattern": "签订(?:时间|日期)[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "sign_place",
+      "aliases": ["签订地点"],
+      "pattern": "签订地点[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_a_name",
+      "aliases": ["甲方：", "甲方:"],
+      "page_scope": [1, 2],
+      "pattern": "(?:^|\\n)甲方[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_b_name",
+      "aliases": ["乙方：", "乙方:"],
+      "page_scope": [1, 2],
+      "pattern": "(?:^|\\n)乙方[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "customer_name",
+      "aliases": ["客户名称"],
+      "page_scope": [3, 11],
+      "pattern": "客户名称\\s*[：:|]?\\s*\\|?\\s*([^\\n|]+(?:有限公司|股份有限公司|有限责任公司))"
+    },
+    {
+      "id": "party_a_phone",
+      "aliases": ["电 话"],
+      "page_scope": [1, 2],
+      "pattern": "甲方[\\s\\S]{0,160}?电\\s*话[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_b_phone",
+      "aliases": ["电 话"],
+      "page_scope": [1, 2],
+      "pattern": "乙方[\\s\\S]{0,220}?电\\s*话[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_a_address",
+      "aliases": ["通讯地址"],
+      "page_scope": [1, 2],
+      "pattern": "甲方[\\s\\S]{0,240}?通讯地址[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_b_address",
+      "aliases": ["通讯地址"],
+      "page_scope": [1, 2],
+      "pattern": "乙方[\\s\\S]{0,260}?通讯地址[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_a_bank",
+      "aliases": ["开户银行"],
+      "page_scope": [1, 2],
+      "pattern": "甲方[\\s\\S]{0,240}?开户银行[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_b_bank",
+      "aliases": ["开户银行"],
+      "page_scope": [1, 2],
+      "pattern": "乙方[\\s\\S]{0,260}?开户银行[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_a_account",
+      "aliases": ["账  号", "账号"],
+      "page_scope": [1, 2],
+      "pattern": "甲方[\\s\\S]{0,280}?账\\s*号[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "party_b_account",
+      "aliases": ["账  号", "账号"],
+      "page_scope": [1, 2],
+      "pattern": "乙方[\\s\\S]{0,320}?账\\s*号[：:]\\s*([^\\n]+)"
+    },
+    {
+      "id": "total_amount",
+      "aliases": ["合同总价款", "合计"],
+      "page_scope": [3, 4],
+      "pattern": "合同总价款[^¥\\n]*¥\\s*([\\d,]+(?:\\.\\d+)?)"
+    },
+    {
+      "id": "total_amount_upper",
+      "aliases": ["柒拾万元整", "大写人民币"],
+      "page_scope": [3, 4],
+      "pattern": "合同总价款[^\\n]*大写[：:]?\\s*人民币\\s*([零壹贰叁肆伍陆柒捌玖拾佰仟萬亿元角分整正]+)"
+    },
+    {
+      "id": "prepayment_amount",
+      "aliases": ["预付款"],
+      "page_scope": [3, 4],
+      "pattern": "预付款[^¥\\n]*¥\\s*([\\d,]+(?:\\.\\d+)?)"
+    },
+    {
+      "id": "prepayment_amount_upper",
+      "aliases": ["预付款", "大写"],
+      "page_scope": [3, 4],
+      "pattern": "预付款[\\s\\S]{0,120}?大写[：:]?\\s*人民币\\s*([零壹贰叁肆伍陆柒捌玖拾佰仟萬亿元角分整正]+)"
+    }
+  ]
+}
