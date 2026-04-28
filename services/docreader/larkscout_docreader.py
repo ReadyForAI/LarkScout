@@ -5,8 +5,8 @@
 # ///
 
 import asyncio
-import io
 import hashlib
+import io
 import json
 import logging
 import os
@@ -2298,7 +2298,6 @@ def write_output(
 ):
     doc_dir = output_dir / doc_id
     sections_dir = doc_dir / "sections"
-    tables_dir = doc_dir / "tables"
     doc_dir.mkdir(parents=True, exist_ok=True)
     _reset_generated_output_dirs(doc_dir)
     sections_dir.mkdir(exist_ok=True)
@@ -3049,7 +3048,7 @@ def _build_section_entry(sec: Section, summary_preview: str = "") -> dict[str, A
 def _build_table_entries(parsed: ParsedDocument) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for i, (page_num, table_md) in enumerate(
-        ((p.page_num, t) for p in parsed.pages for t in p.tables),
+        ((p.page_num, table) for p in parsed.pages for table in p.tables),
         1,
     ):
         text_hash = hashlib.sha256(table_md.encode("utf-8", errors="ignore")).hexdigest()
