@@ -1,0 +1,6 @@
+# Apple Silicon / ARM local-development OCR baseline.
+# PaddleOCR 3.x + PP-OCRv5 currently crashes in linuxkit/aarch64 Docker during
+# model initialization, so ARM uses the mature 2.x stack until verified stable.
+numpy>=1.26.0,<2.0.0
+paddlepaddle==2.6.2
+paddleocr==2.10.0

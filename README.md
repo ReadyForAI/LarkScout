@@ -58,7 +58,7 @@ python larkscout_server.py     # listens on port 9898
 
 ### Docker
 
-The `docker-compose.yml` provides a single-service setup with a persistent named volume for the document library.
+The `docker-compose.yml` provides a single-service setup. By default, the document library is bind-mounted to the current user's `~/.larkscout/docs` directory on the host.
 
 ```yaml
 # docker-compose.yml (excerpt)
@@ -68,7 +68,7 @@ services:
     ports:
       - "9898:9898"
     volumes:
-      - larkscout-docs:/root/.larkscout/docs   # document library persists across restarts
+      - ${LARKSCOUT_HOST_DOCS_DIR:-${HOME}/.larkscout/docs}:/root/.larkscout/docs
 ```
 
 **Environment variables (pass via `.env` or `docker compose` `environment` block):**
@@ -215,6 +215,9 @@ LarkScout is configured entirely through environment variables. See the table in
 | `PORT` | `9898` | HTTP listening port |
 | `LANG` | `en` | UI language (`en` or `zh`) |
 | `LARKSCOUT_DOC_ID_STRATEGY` | `counter` | Document directory naming strategy: `counter` keeps `DOC-xxx`; `source_filename` derives a safe directory name from the uploaded filename stem |
+| `LARKSCOUT_SUMMARY_BATCH_CONCURRENCY` | `1` | Maximum concurrent section-summary LLM batches per document |
+| `LARKSCOUT_SUMMARY_REQUEST_MIN_INTERVAL_SEC` | `2.0` | Minimum spacing between summary LLM requests across the service |
+| `LARKSCOUT_SUMMARY_SECTION_DETAIL_LIMIT` | `10` | Documents above this section count skip per-section LLM summaries and generate document-level summaries from section excerpts |
 
 ### For AI Agents
 
@@ -276,7 +279,7 @@ python larkscout_server.py     # 监听 9898 端口
 
 ### Docker 配置
 
-`docker-compose.yml` 提供单服务部署方案，文档库数据通过 named volume 持久化。
+`docker-compose.yml` 提供单服务部署方案。默认会把文档库 bind mount 到宿主机当前用户的 `~/.larkscout/docs` 目录。
 
 ```yaml
 # docker-compose.yml（节选）
@@ -286,7 +289,7 @@ services:
     ports:
       - "9898:9898"
     volumes:
-      - larkscout-docs:/root/.larkscout/docs   # 重启后文档库数据不丢失
+      - ${LARKSCOUT_HOST_DOCS_DIR:-${HOME}/.larkscout/docs}:/root/.larkscout/docs
 ```
 
 **环境变量（通过 `.env` 文件或 `docker compose` 的 `environment` 块传入）：**
@@ -431,6 +434,9 @@ LarkScout 所有配置均通过环境变量管理。LLM 相关配置见上方 **
 | `PORT` | `9898` | HTTP 监听端口 |
 | `LANG` | `en` | 界面语言（`en` 英文 / `zh` 中文） |
 | `LARKSCOUT_DOC_ID_STRATEGY` | `counter` | 文档目录命名策略：`counter` 保持 `DOC-xxx`；`source_filename` 基于上传文件名生成安全目录名 |
+| `LARKSCOUT_SUMMARY_BATCH_CONCURRENCY` | `1` | 单文档 section 摘要的最大 LLM batch 并发数 |
+| `LARKSCOUT_SUMMARY_REQUEST_MIN_INTERVAL_SEC` | `2.0` | 全服务摘要 LLM 请求之间的最小间隔秒数 |
+| `LARKSCOUT_SUMMARY_SECTION_DETAIL_LIMIT` | `10` | 超过该 section 数量后跳过逐 section LLM 摘要，改用 section 摘录生成文档级摘要 |
 
 ### 接入 AI Agent
 

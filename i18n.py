@@ -126,7 +126,7 @@ PROMPTS = {
 
 MESSAGES = {
     "zh": {
-        "unsupported_format": "不支持的格式: {fmt}（支持 .pdf 和 .docx）",
+        "unsupported_format": "不支持的格式: {fmt}",
         "file_save_failed": "文件保存失败: {err}",
         "parse_failed": "解析失败: {err}",
         "write_failed": "写入失败: {err}",
@@ -138,6 +138,8 @@ MESSAGES = {
         "tables_dir_not_found": "表格目录不存在: {doc_id}",
         "table_not_found": "表格不存在: {table_id}",
         "file_open_failed": "无法打开文件: {path}",
+        "office_converter_missing": "缺少 LibreOffice/soffice，无法转换老式 Office 文件",
+        "office_conversion_failed": "Office 文件转换失败: {src} -> .{dst}: {err}",
         "gemini_not_installed": "请安装 google-genai: pip install google-genai",
         "gemini_key_missing": "请设置 GEMINI_API_KEY 或 GOOGLE_API_KEY 环境变量",
         "ocr_failed": "[OCR 失败: 第 {page} 页]",
@@ -149,7 +151,7 @@ MESSAGES = {
         "table_truncated": "[... 共 {total} 行，已显示前 {shown} 行 ...]",
     },
     "en": {
-        "unsupported_format": "Unsupported format: {fmt} (supported: .pdf, .docx)",
+        "unsupported_format": "Unsupported format: {fmt}",
         "file_save_failed": "File save failed: {err}",
         "parse_failed": "Parse failed: {err}",
         "write_failed": "Write failed: {err}",
@@ -161,6 +163,8 @@ MESSAGES = {
         "tables_dir_not_found": "Tables directory not found: {doc_id}",
         "table_not_found": "Table not found: {table_id}",
         "file_open_failed": "Cannot open file: {path}",
+        "office_converter_missing": "LibreOffice/soffice is required to convert legacy Office files",
+        "office_conversion_failed": "Office conversion failed: {src} -> .{dst}: {err}",
         "gemini_not_installed": "Please install google-genai: pip install google-genai",
         "gemini_key_missing": "Please set GEMINI_API_KEY or GOOGLE_API_KEY environment variable",
         "ocr_failed": "[OCR failed: page {page}]",
@@ -232,6 +236,17 @@ def init_locale(env_var: str = "LANG") -> str:
     return _locale
 
 
+def _normalize_locale(locale: str | None) -> str:
+    if not locale:
+        return _locale
+    value = locale.lower()
+    if value.startswith("zh"):
+        return "zh"
+    if value.startswith("en"):
+        return "en"
+    return _locale
+
+
 def t(key: str, **kwargs) -> str:
     """Translate a user-facing message."""
     msg = MESSAGES.get(_locale, MESSAGES["en"]).get(key)
@@ -240,17 +255,29 @@ def t(key: str, **kwargs) -> str:
     return msg.format(**kwargs) if kwargs else msg
 
 
-def prompt(key: str, **kwargs) -> str:
-    """Get a localized LLM prompt."""
-    p = PROMPTS.get(_locale, PROMPTS["en"]).get(key)
+def prompt_for_locale(locale: str | None, key: str, **kwargs) -> str:
+    """Get an LLM prompt for an explicit locale."""
+    resolved = _normalize_locale(locale)
+    p = PROMPTS.get(resolved, PROMPTS["en"]).get(key)
     if p is None:
         p = PROMPTS["en"].get(key, "")
     return p.format(**kwargs) if kwargs else p
 
 
-def tmpl(key: str, **kwargs) -> str:
-    """Get a localized output template."""
-    tpl = TEMPLATES.get(_locale, TEMPLATES["en"]).get(key)
+def prompt(key: str, **kwargs) -> str:
+    """Get a localized LLM prompt."""
+    return prompt_for_locale(_locale, key, **kwargs)
+
+
+def tmpl_for_locale(locale: str | None, key: str, **kwargs) -> str:
+    """Get an output template for an explicit locale."""
+    resolved = _normalize_locale(locale)
+    tpl = TEMPLATES.get(resolved, TEMPLATES["en"]).get(key)
     if tpl is None:
         tpl = TEMPLATES["en"].get(key, "")
     return tpl.format(**kwargs) if kwargs else tpl
+
+
+def tmpl(key: str, **kwargs) -> str:
+    """Get a localized output template."""
+    return tmpl_for_locale(_locale, key, **kwargs)

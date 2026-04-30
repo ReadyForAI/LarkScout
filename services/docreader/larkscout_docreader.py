@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["markitdown[pdf,docx,pptx,xlsx]", "pymupdf", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart", "paddleocr", "paddlepaddle"]
+# dependencies = ["markitdown[pdf,docx,pptx,xlsx,xls]", "pymupdf", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart", "paddleocr", "paddlepaddle"]
 # ///
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
 import logging
 import os
 import re
+import selectors
+import shlex
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +30,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from i18n import init_locale, prompt, t, tmpl
+from i18n import init_locale, prompt_for_locale, t, tmpl, tmpl_for_locale
 
 init_locale()
 
@@ -39,7 +44,24 @@ MAX_PARSE_ROWS = int(os.environ.get("LARKSCOUT_MAX_PARSE_ROWS", "100000"))
 _MAX_CONCURRENT_PARSE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_PARSE", "2"))
 _parse_sem = asyncio.Semaphore(_MAX_CONCURRENT_PARSE)
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".html", ".htm"}
+SUPPORTED_FORMATS = [
+    "pdf",
+    "doc",
+    "docx",
+    "ppt",
+    "pptx",
+    "xls",
+    "xlsx",
+    "csv",
+    "html",
+    "htm",
+    "txt",
+    "text",
+    "json",
+    "jsonl",
+    "xml",
+]
+SUPPORTED_EXTENSIONS = {f".{fmt}" for fmt in SUPPORTED_FORMATS}
 DOCUMENT_PROFILE_CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs" / "document_profiles"
 FIELD_OCR_CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs" / "field_profiles"
 
@@ -69,9 +91,70 @@ def _convert_to_markdown(filepath: Path) -> str:
         raise RuntimeError(t("file_open_failed", path=str(filepath))) from e
 
 
+def _office_converter_binary() -> str:
+    binary = shutil.which("soffice") or shutil.which("libreoffice")
+    if not binary:
+        raise RuntimeError(t("office_converter_missing"))
+    return binary
+
+
+def _convert_legacy_office(filepath: Path, target_ext: str) -> Path:
+    """Convert legacy binary Office files (.doc/.ppt) to modern OOXML files."""
+    target_ext = target_ext.lower().lstrip(".")
+    out_dir = filepath.parent / f"{filepath.stem}.{target_ext}.converted"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    user_install = filepath.parent / "libreoffice-profile"
+    user_install.mkdir(parents=True, exist_ok=True)
+    timeout = int(os.environ.get("LARKSCOUT_OFFICE_CONVERT_TIMEOUT_SEC", "120"))
+    cmd = [
+        _office_converter_binary(),
+        "--headless",
+        "--nologo",
+        "--nofirststartwizard",
+        f"-env:UserInstallation=file://{user_install}",
+        "--convert-to",
+        target_ext,
+        "--outdir",
+        str(out_dir),
+        str(filepath),
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    converted = out_dir / f"{filepath.stem}.{target_ext}"
+    if proc.returncode != 0 or not converted.exists():
+        details = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(t("office_conversion_failed", src=filepath.suffix, dst=target_ext, err=details))
+    return converted
+
+
 def _count_markdown_tables(text: str) -> int:
     """Count distinct Markdown tables by counting separator rows (| --- | --- |)."""
     return len(re.findall(r"^\|[\s\-:|]+\|$", text, re.MULTILINE))
+
+
+def _detect_text_locale(text: str) -> str:
+    sample = text[:20000]
+    cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
+    alpha = sum(1 for ch in sample if ch.isascii() and ch.isalpha())
+    return "zh" if cjk >= 20 or cjk > alpha else "en"
+
+
+def _parsed_document_locale(parsed: "ParsedDocument") -> str:
+    value = str(parsed.metadata.get("summary_locale") or parsed.metadata.get("language") or "").strip()
+    if value.startswith(("zh", "en")):
+        return value[:2]
+    sample_parts = [parsed.filename]
+    sample_parts.extend(sec.title for sec in parsed.sections[:5])
+    sample_parts.extend(sec.text[:1000] for sec in parsed.sections[:5])
+    locale = _detect_text_locale("\n".join(sample_parts))
+    parsed.metadata["summary_locale"] = locale
+    return locale
 
 
 # ═══════════════════════════════════════════
@@ -195,6 +278,13 @@ class SummaryPolicy:
 
 
 @dataclass(frozen=True)
+class SectionPolicy:
+    toc_max_level: int = 2
+    suppress_arabic_clause_headings_when_formal_chinese: bool = False
+    formal_chinese_min_headings: int = 4
+
+
+@dataclass(frozen=True)
 class DocumentProfile:
     name: str
     classification: ClassificationPolicy = ClassificationPolicy()
@@ -204,6 +294,7 @@ class DocumentProfile:
     cache_policy: CachePolicy = CachePolicy()
     processing_policy: ProcessingPolicy = ProcessingPolicy()
     summary_policy: SummaryPolicy = SummaryPolicy()
+    section_policy: SectionPolicy = SectionPolicy()
     groups: tuple[FieldGroup, ...] = ()
     fields: tuple[FieldRule, ...] = ()
 
@@ -224,11 +315,23 @@ def gemini_ocr(image_bytes: bytes, page_num: int, *, proofread: bool | None = No
         return t("ocr_failed", page=page_num)
 
 
+def _is_ocr_failed_text(text: str | None) -> bool:
+    return bool(text and text.strip().startswith("[OCR failed"))
+
+
 def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
     """Generate summary via the active LLM provider."""
     from providers import get_provider
 
-    return get_provider().summarize(text, summarize_prompt, max_retries=max_retries)
+    with _summary_llm_lock:
+        now = time.monotonic()
+        wait_sec = _summary_llm_next_allowed_at - now
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        try:
+            return get_provider().summarize(text, summarize_prompt, max_retries=max_retries)
+        finally:
+            _set_next_summary_llm_allowed_at()
 
 
 # ═══════════════════════════════════════════
@@ -267,6 +370,35 @@ DEFERRED_SUMMARY_MAX_ATTEMPTS = max(
     1,
     int(os.environ.get("LARKSCOUT_DEFERRED_SUMMARY_MAX_ATTEMPTS", "3")),
 )
+SUMMARY_BATCH_CONCURRENCY = max(
+    1,
+    int(os.environ.get("LARKSCOUT_SUMMARY_BATCH_CONCURRENCY", "1")),
+)
+SUMMARY_REQUEST_MIN_INTERVAL_SEC = max(
+    0.0,
+    float(os.environ.get("LARKSCOUT_SUMMARY_REQUEST_MIN_INTERVAL_SEC", "2.0")),
+)
+SUMMARY_SECTION_DETAIL_LIMIT = max(
+    1,
+    int(os.environ.get("LARKSCOUT_SUMMARY_SECTION_DETAIL_LIMIT", "10")),
+)
+SUMMARY_BRIEF_SECTION_EXCERPT_CHARS = max(
+    200,
+    int(os.environ.get("LARKSCOUT_SUMMARY_BRIEF_SECTION_EXCERPT_CHARS", "1200")),
+)
+SUMMARY_BRIEF_MAX_INPUT_CHARS = max(
+    4000,
+    int(os.environ.get("LARKSCOUT_SUMMARY_BRIEF_MAX_INPUT_CHARS", "32000")),
+)
+_summary_llm_lock = threading.Lock()
+_summary_llm_next_allowed_at = 0.0
+
+
+def _set_next_summary_llm_allowed_at() -> None:
+    global _summary_llm_next_allowed_at
+    _summary_llm_next_allowed_at = (
+        time.monotonic() + SUMMARY_REQUEST_MIN_INTERVAL_SEC
+    )
 _TABLE_HEADER_TERMS = {
     "序号",
     "名称",
@@ -397,72 +529,139 @@ def _ocr_cache_key(image_bytes: bytes) -> str:
     return hashlib.sha1(image_bytes).hexdigest()[:16]
 
 
-_paddle_ocr = None
-_paddle_ocr_lock = threading.Lock()
-_paddle_ocr_ready = threading.Event()
-_paddle_ocr_initializing = threading.Event()
+_local_ocr_worker: subprocess.Popen[str] | None = None
+_local_ocr_worker_lock = threading.Lock()
+_local_ocr_worker_ready = threading.Event()
+_local_ocr_worker_initializing = threading.Event()
+_local_ocr_disabled_until = 0.0
 _deferred_summary_sem = threading.BoundedSemaphore(DEFERRED_SUMMARY_MAX_CONCURRENT)
 DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC = float(
     os.environ.get("LARKSCOUT_DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC", "30")
 )
+LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC = float(
+    os.environ.get("LARKSCOUT_LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", "180")
+)
+LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC = float(
+    os.environ.get("LARKSCOUT_LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", "180")
+)
+LOCAL_OCR_CIRCUIT_BREAKER_SEC = float(
+    os.environ.get("LARKSCOUT_LOCAL_OCR_CIRCUIT_BREAKER_SEC", "120")
+)
 
 
-def _get_paddle_ocr():
-    global _paddle_ocr
-    if _paddle_ocr is None:
-        with _paddle_ocr_lock:
-            if _paddle_ocr is None:
-                os.environ.setdefault("FLAGS_enable_pir_api", "0")
-                os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-                _paddle_ocr_initializing.set()
-                try:
-                    from paddleocr import PaddleOCR
-                except ImportError as exc:
-                    _paddle_ocr_initializing.clear()
-                    raise RuntimeError(
-                        f"PaddleOCR backend import failed: {exc}"
-                    ) from exc
-                try:
-                    _paddle_ocr = PaddleOCR(
-                        use_doc_orientation_classify=False,
-                        use_doc_unwarping=False,
-                        use_textline_orientation=False,
-                        text_detection_model_name=os.environ.get(
-                            "LARKSCOUT_LOCAL_OCR_DET_MODEL", "PP-OCRv5_mobile_det"
-                        ),
-                        text_recognition_model_name=os.environ.get(
-                            "LARKSCOUT_LOCAL_OCR_REC_MODEL", "PP-OCRv5_mobile_rec"
-                        ),
-                    )
-                    _paddle_ocr_ready.set()
-                finally:
-                    _paddle_ocr_initializing.clear()
-    return _paddle_ocr
+def _local_ocr_worker_command() -> list[str]:
+    raw = os.environ.get("LARKSCOUT_LOCAL_OCR_WORKER_CMD", "").strip()
+    if raw:
+        return shlex.split(raw)
+    worker = Path(__file__).with_name("paddle_ocr_worker.py")
+    return [sys.executable, str(worker)]
 
 
-def _flatten_paddle_ocr_result(result: Any) -> str:
-    lines: list[str] = []
-    blocks = result if isinstance(result, list) else [result]
-    for block in blocks:
-        if isinstance(block, dict):
-            texts = block.get("rec_texts") or []
-            for text in texts:
-                value = str(text).strip()
-                if value:
-                    lines.append(value)
-            continue
-        if isinstance(block, list):
-            for item in block:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-                payload = item[1]
-                if isinstance(payload, (list, tuple)) and payload:
-                    text = str(payload[0]).strip()
-                else:
-                    text = str(payload).strip()
-                if text:
-                    lines.append(text)
-    return "\n".join(lines).strip()
+def _drain_local_ocr_worker_stderr(proc: subprocess.Popen[str]) -> None:
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        value = line.rstrip()
+        if value:
+            logger.info("[local-ocr-worker] %s", value)
+
+
+def _read_local_ocr_worker_message(proc: subprocess.Popen[str], timeout: float) -> dict[str, Any]:
+    if proc.stdout is None:
+        raise RuntimeError("local OCR worker stdout is unavailable")
+    deadline = time.monotonic() + max(timeout, 0.1)
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"local OCR worker exited with code {proc.returncode}")
+            remaining = max(deadline - time.monotonic(), 0.1)
+            events = selector.select(timeout=remaining)
+            if not events:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError(f"local OCR worker closed stdout with code {proc.poll()}")
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("Ignoring non-JSON local OCR worker output: %s", line.rstrip())
+                continue
+            if isinstance(message, dict):
+                return message
+        raise TimeoutError(f"local OCR worker timed out after {timeout:.1f}s")
+    finally:
+        selector.close()
+
+
+def _mark_local_ocr_worker_unhealthy(reason: str) -> None:
+    global _local_ocr_disabled_until
+    _local_ocr_disabled_until = time.monotonic() + max(LOCAL_OCR_CIRCUIT_BREAKER_SEC, 0)
+    logger.warning("Local OCR worker marked unhealthy: %s", reason)
+
+
+def _stop_local_ocr_worker() -> None:
+    global _local_ocr_worker
+    proc = _local_ocr_worker
+    _local_ocr_worker = None
+    _local_ocr_worker_ready.clear()
+    if not proc:
+        return
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def _get_local_ocr_worker() -> subprocess.Popen[str]:
+    global _local_ocr_worker
+    if _local_ocr_disabled_until > time.monotonic():
+        raise RuntimeError("local OCR worker is temporarily disabled after a crash")
+    if _local_ocr_worker is not None and _local_ocr_worker.poll() is None:
+        return _local_ocr_worker
+    if _local_ocr_worker is not None:
+        _stop_local_ocr_worker()
+
+    _local_ocr_worker_initializing.set()
+    try:
+        cmd = _local_ocr_worker_command()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        _local_ocr_worker = proc
+        threading.Thread(
+            target=_drain_local_ocr_worker_stderr,
+            args=(proc,),
+            daemon=True,
+        ).start()
+        message = _read_local_ocr_worker_message(
+            proc, timeout=LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC
+        )
+        if message.get("type") != "ready":
+            error = message.get("error") or message
+            _stop_local_ocr_worker()
+            raise RuntimeError(f"local OCR worker startup failed: {error}")
+        _local_ocr_worker_ready.set()
+        return proc
+    except Exception as exc:
+        _stop_local_ocr_worker()
+        _mark_local_ocr_worker_unhealthy(str(exc))
+        raise
+    finally:
+        _local_ocr_worker_initializing.clear()
 
 
 def local_ocr(image_bytes: bytes, page_num: int, backend: str) -> str:
@@ -471,23 +670,35 @@ def local_ocr(image_bytes: bytes, page_num: int, backend: str) -> str:
         return ""
     if name != "paddleocr":
         raise RuntimeError(f"unsupported local OCR backend: {backend}")
-    try:
-        import numpy as np
-        from PIL import Image
-
-        engine = _get_paddle_ocr()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        result = engine.predict(
-            np.asarray(image),
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
-        text = _flatten_paddle_ocr_result(result)
-        return text or t("ocr_failed", page=page_num)
-    except Exception as exc:
-        logger.warning("Local OCR unavailable for page %d via %s: %s", page_num, backend, exc)
-        return t("ocr_failed", page=page_num)
+    with _local_ocr_worker_lock:
+        try:
+            proc = _get_local_ocr_worker()
+            if proc.stdin is None:
+                raise RuntimeError("local OCR worker stdin is unavailable")
+            request = {
+                "page_num": page_num,
+                "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+            }
+            proc.stdin.write(json.dumps(request) + "\n")
+            proc.stdin.flush()
+            response = _read_local_ocr_worker_message(
+                proc, timeout=LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC
+            )
+            if not response.get("ok"):
+                logger.warning(
+                    "Local OCR worker failed page %d via %s: %s",
+                    page_num,
+                    backend,
+                    response.get("error") or response,
+                )
+                return t("ocr_failed", page=page_num)
+            text = str(response.get("text") or "").strip()
+            return text or t("ocr_failed", page=page_num)
+        except Exception as exc:
+            _stop_local_ocr_worker()
+            _mark_local_ocr_worker_unhealthy(str(exc))
+            logger.warning("Local OCR unavailable for page %d via %s: %s", page_num, backend, exc)
+            return t("ocr_failed", page=page_num)
 
 
 def _remove_footer_page_number(lines: list[str], page_num: int, total_pages: int) -> list[str]:
@@ -552,6 +763,12 @@ def _cleanup_ocr_text(text: str, *, source_filename: str | None = None) -> str:
         "软件采贝": "软件采购",
         "合同采贝": "合同采购",
         "软件东统": "软件系统",
+        "基调研云": "基调听云",
+        "基调所元": "基调听云",
+        "营通探针": "普通探针",
+        "邮付申请": "邮件申请",
+        "lava Agent": "Java Agent",
+        "语吉探针": "语言探针",
         "则特殊开发部分应符\n合需求说明书": "则特殊开发部分应符合需求说明书",
     }
     for src, dst in replacements.items():
@@ -625,7 +842,10 @@ def _extract_tables_from_ocr_text(text: str, page_num: int, total_pages: int) ->
                 table_lines.append(lines[i])
                 i += 1
             table_text = "\n".join(table_lines).strip()
-            tables.append(table_text)
+            if len(table_lines) > 2:
+                tables.append(table_text)
+            else:
+                body_parts.append(line)
             continue
 
         if _looks_like_plain_table_header(line):
@@ -727,6 +947,31 @@ def _normalize_amount_phrases(text: str) -> str:
     return _UPPER_AMOUNT_RE.sub(repl, text)
 
 
+def _looks_like_signature_watermark_line(line: str) -> bool:
+    compact = re.sub(r"\s+", "", line.strip())
+    if not compact:
+        return False
+    if set(compact) <= {"万", "翼", "签"} and "万翼" in compact:
+        return True
+    residue = compact
+    for token in ("万翼签", "万翼", "翼签"):
+        residue = residue.replace(token, "")
+    return not residue and len(compact) >= 2
+
+
+def _cleanup_extracted_text_noise(text: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if _looks_like_signature_watermark_line(stripped):
+            continue
+        if stripped.upper() == "TINGYUN.COM":
+            continue
+        cleaned.append(re.sub(r"(\d+)\s*月/个", r"\1 元/个", line.rstrip()))
+    return "\n".join(cleaned).strip()
+
+
 def _collect_company_names(blocks: list[str]) -> list[str]:
     names: set[str] = set()
     for block in blocks:
@@ -781,8 +1026,11 @@ def _apply_company_name_replacements(text: str, replacements: dict[str, str]) ->
 
 def _normalize_document_text(pages: list[PageContent]) -> None:
     for page in pages:
-        page.text = _normalize_amount_phrases(page.text)
-        page.tables = [_normalize_amount_phrases(table) for table in page.tables]
+        page.text = _cleanup_extracted_text_noise(_normalize_amount_phrases(page.text))
+        page.tables = [
+            _cleanup_extracted_text_noise(_normalize_amount_phrases(table))
+            for table in page.tables
+        ]
 
 
 def _load_document_profile(profile_name: str | None, config_path: str | None) -> DocumentProfile | None:
@@ -816,6 +1064,7 @@ def _load_document_profile(profile_name: str | None, config_path: str | None) ->
     cache_raw = raw.get("cache_policy") if isinstance(raw.get("cache_policy"), dict) else {}
     processing_raw = raw.get("processing_policy") if isinstance(raw.get("processing_policy"), dict) else {}
     summary_raw = raw.get("summary_policy") if isinstance(raw.get("summary_policy"), dict) else {}
+    section_raw = raw.get("section_policy") if isinstance(raw.get("section_policy"), dict) else {}
 
     groups: list[FieldGroup] = []
     for item in raw.get("groups", []):
@@ -934,6 +1183,16 @@ def _load_document_profile(profile_name: str | None, config_path: str | None) ->
                 if str(v).strip()
             ),
         ),
+        section_policy=SectionPolicy(
+            toc_max_level=max(1, int(section_raw.get("toc_max_level", 2))),
+            suppress_arabic_clause_headings_when_formal_chinese=bool(
+                section_raw.get("suppress_arabic_clause_headings_when_formal_chinese", False)
+            ),
+            formal_chinese_min_headings=max(
+                1,
+                int(section_raw.get("formal_chinese_min_headings", 4)),
+            ),
+        ),
         groups=tuple(groups),
         fields=tuple(fields),
     )
@@ -1006,10 +1265,12 @@ def _replace_blob_segment(text: str, group: FieldGroup, replacement: str) -> str
     if group.replace_mode == "replace_entire_page":
         return replacement.strip()
 
-    if not group.start_alias:
-        return replacement.strip()
-
-    start = text.find(group.start_alias)
+    start = -1
+    if group.start_alias:
+        start = text.find(group.start_alias)
+    if start < 0:
+        starts = [text.find(alias) for alias in group.aliases if alias and text.find(alias) >= 0]
+        start = min(starts) if starts else -1
     if start < 0:
         return text
 
@@ -1019,6 +1280,16 @@ def _replace_blob_segment(text: str, group: FieldGroup, replacement: str) -> str
         if found >= 0:
             end = found
     return (text[:start].rstrip() + "\n\n" + replacement.strip() + "\n\n" + text[end:].lstrip()).strip()
+
+
+def _prepend_source_contract_no_if_missing(text: str, source_filename: str | None) -> str:
+    contract_no = _source_filename_contract_no(source_filename)
+    if not contract_no:
+        return text.strip()
+    normalized = re.sub(r"\s+", "", text)
+    if contract_no in normalized:
+        return text.strip()
+    return f"{contract_no}\n{text.strip()}".strip()
 
 
 def _extract_profile_fields(
@@ -1122,6 +1393,8 @@ def _apply_field_focused_ocr(
                 if not region_text or region_text.startswith("["):
                     continue
                 region_text = _cleanup_ocr_text(region_text, source_filename=filepath.name)
+                if page.page_num == 1 and group.replace_mode == "replace_entire_page":
+                    region_text = _prepend_source_contract_no_if_missing(region_text, filepath.name)
 
                 replace_source = page.text.strip()
                 replaced = _replace_blob_segment(replace_source, group, region_text)
@@ -1221,14 +1494,19 @@ def _set_summary_metadata(
     parsed.metadata = metadata
 
 
-def _summary_placeholder_text(status: str, error: str | None = None) -> str:
+def _summary_placeholder_text(
+    status: str, error: str | None = None, locale: str | None = None
+) -> str:
+    output_locale = "zh" if str(locale or "").lower().startswith("zh") else "en"
     if status == "running":
-        return "(Summary running)"
+        return "(摘要生成中)" if output_locale == "zh" else "(Summary running)"
     if status == "failed":
         if error:
+            if output_locale == "zh":
+                return f"(摘要生成失败: {error})"
             return f"(Summary failed: {error})"
-        return "(Summary failed)"
-    return t("summary_pending")
+        return "(摘要生成失败)" if output_locale == "zh" else "(Summary failed)"
+    return "(摘要待生成)" if output_locale == "zh" else "(Summary pending)"
 
 
 def _current_summary_attempts(parsed: ParsedDocument) -> int:
@@ -1469,7 +1747,7 @@ def parse_pdf(
     def _usable_page_text(raw_text: str, enhanced_text: str | None) -> str:
         if not enhanced_text:
             return raw_text
-        if enhanced_text.startswith("[OCR failed"):
+        if _is_ocr_failed_text(enhanced_text):
             return raw_text or enhanced_text
         return enhanced_text
 
@@ -1642,12 +1920,20 @@ def parse_pdf(
                 )
             if ck_path.exists():
                 cached = ck_path.read_text(encoding="utf-8")
-                if page_num in llm_ocr_set:
-                    llm_ocr_results[page_num] = cached
+                if _is_ocr_failed_text(cached):
+                    logger.info(
+                        "Page %d/%d: ignoring failed %s OCR cache",
+                        page_num,
+                        total_pages,
+                        cache_key,
+                    )
                 else:
-                    local_ocr_results[page_num] = cached
-                logger.info("Page %d/%d: %s OCR cache hit", page_num, total_pages, cache_key)
-                continue
+                    if page_num in llm_ocr_set:
+                        llm_ocr_results[page_num] = cached
+                    else:
+                        local_ocr_results[page_num] = cached
+                    logger.info("Page %d/%d: %s OCR cache hit", page_num, total_pages, cache_key)
+                    continue
         if page_num in llm_ocr_set:
             llm_tasks.append((page_num, img_bytes))
         else:
@@ -1656,7 +1942,6 @@ def parse_pdf(
     doc.close()
 
     if local_tasks:
-        _get_paddle_ocr()
         logger.info(
             "Concurrent local OCR: %d pages (%d workers, backend=%s)...",
             len(local_tasks),
@@ -1675,6 +1960,9 @@ def parse_pdf(
                 local_ocr_results[pn] = result
                 logger.info(f"Page {pn}/{total_pages}: local OCR done")
                 if cache_dir and profile and profile.cache_policy.page_ocr:
+                    if _is_ocr_failed_text(result):
+                        logger.info("Page %d/%d: not caching failed local OCR result", pn, total_pages)
+                        continue
                     cache_path = _ocr_cache_variant_path(
                         cache_dir,
                         f"ocr_p{pn:04d}.local-{ocr_plan['local_backend']}.{_ocr_cache_key(img_b)}.txt",
@@ -1751,9 +2039,13 @@ def parse_pdf(
 
     # Section splitting: prefer TOC when available
     if toc:
-        sections = _split_sections_from_toc(pages, toc)
+        sections = _split_sections_from_toc(
+            pages,
+            toc,
+            section_policy=profile.section_policy if profile else None,
+        )
     else:
-        sections = _split_sections(pages)
+        sections = _split_sections(pages, section_policy=profile.section_policy if profile else None)
 
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
@@ -1793,14 +2085,16 @@ def parse_pdf(
 # ═══════════════════════════════════════════
 
 
-def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
+def parse_word(
+    filepath: Path, extract_tables: bool = True, profile: DocumentProfile | None = None
+) -> ParsedDocument:
     logger.info(f"Parsing Word: {filepath.name}")
     markdown_text = _convert_to_markdown(filepath)
     logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
 
     est_pages = max(1, len(markdown_text) // 3000)
     pages = [PageContent(page_num=1, text=markdown_text)]
-    sections = _split_sections(pages)
+    sections = _split_sections(pages, section_policy=profile.section_policy if profile else None)
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
@@ -1811,11 +2105,12 @@ def parse_word(filepath: Path, extract_tables: bool = True) -> ParsedDocument:
     )
     return ParsedDocument(
         filename=filepath.name,
-        file_type="docx",
+        file_type=filepath.suffix.lower().lstrip(".") or "docx",
         total_pages=est_pages,
         pages=pages,
         sections=sections,
         table_count=table_count,
+        metadata={"document_profile": profile.name if profile else None},
     )
 
 
@@ -1891,7 +2186,7 @@ def parse_xlsx(filepath: Path) -> ParsedDocument:
     logger.info(f"XLSX parse complete: {len(sections)} sheets, {table_count} tables")
     result = ParsedDocument(
         filename=filepath.name,
-        file_type="xlsx",
+        file_type=filepath.suffix.lower().lstrip(".") or "xlsx",
         total_pages=max(len(pages), 1),
         pages=pages,
         sections=sections,
@@ -1943,7 +2238,7 @@ def parse_csv(filepath: Path) -> ParsedDocument:
     )
 
 
-def parse_generic(filepath: Path) -> ParsedDocument:
+def parse_generic(filepath: Path, profile: DocumentProfile | None = None) -> ParsedDocument:
     """Parse any MarkItDown-supported format (PPTX, HTML, etc.)."""
     ext = filepath.suffix.lower()
     file_type = ext.lstrip(".")
@@ -1953,7 +2248,7 @@ def parse_generic(filepath: Path) -> ParsedDocument:
 
     est_pages = max(1, len(markdown_text) // 3000)
     pages = [PageContent(page_num=1, text=markdown_text)]
-    sections = _split_sections(pages)
+    sections = _split_sections(pages, section_policy=profile.section_policy if profile else None)
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
@@ -1967,6 +2262,7 @@ def parse_generic(filepath: Path) -> ParsedDocument:
         pages=pages,
         sections=sections,
         table_count=table_count,
+        metadata={"document_profile": profile.name if profile else None},
     )
 
 
@@ -1977,6 +2273,7 @@ def parse_generic(filepath: Path) -> ParsedDocument:
 HEADING_PATTERNS = [
     re.compile(r"^第[一二三四五六七八九十\d]+[章节部分篇]\s*[、:：]?\s*.+"),
     re.compile(r"^[（(]?[一二三四五六七八九十]+[）)]?[、.．]\s*.+"),
+    re.compile(r"^\d{1,2}\s*[-－]\s*\d{1,2}\s*(?![-\d])\S.{1,}"),
     re.compile(r"^\d+(\.\d+)*[.、．)\s]\s*.{2,}"),
     re.compile(r"^(?=.{8,60}$)[A-Z][A-Za-z0-9/&()'-]*(?: [A-Z][A-Za-z0-9/&()'-]*){0,5}$"),
     re.compile(r"^[A-Z][A-Z\s]{5,}$"),
@@ -1984,38 +2281,303 @@ HEADING_PATTERNS = [
 ]
 
 
-def _is_heading(text: str) -> int:
-    text = text.strip()
+def _looks_like_ocr_chrome_heading(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", text.strip()).upper()
+    if compact in {
+        "GF FUTURES",
+        "GFF",
+        "FUTURES",
+        "TINGYUN.COM",
+        "UTURE",
+        "LF",
+    }:
+        return True
+    if re.fullmatch(r"(?:GF\s*)?FUTURES?", compact):
+        return True
+    return False
+
+
+def _looks_like_numeric_identifier_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if re.fullmatch(r"[0-9][0-9\s-]{5,}[0-9]", stripped):
+        return True
+    return False
+
+
+def _looks_like_numeric_table_value(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    compact = re.sub(r"\s+", "", stripped)
+    if re.match(r"^\d{4}年\d{1,2}月", compact):
+        return True
+    if re.match(r"^\d+(?:[,.，]\d+)*(?:\.\d+)?(?:元|月|年|日|个|%|％|探针)", compact):
+        return True
+    if re.match(r"^[￥¥]\d+(?:[,.，]\d+)*(?:\.\d+)?", compact):
+        return True
+    return False
+
+
+def _numeric_heading_level(text: str) -> int:
+    stripped = _strip_heading_markup(text)
+    if re.match(r"^\d{1,2}(?:\.\d{1,2}){2,}(?:[.、．)）\s]|$)", stripped):
+        return -1
+    dotted = re.match(r"^(\d{1,2}\.\d{1,2})(?:[.、．)）\s]*)(.{2,})$", stripped)
+    if dotted:
+        title = dotted.group(2).strip()
+        if len(title) > 48:
+            return -1
+        if len(title) > 12 and re.search(r"[，。；;]", title):
+            return -1
+        if title.endswith(("。", "；", ";")):
+            return -1
+        return 2
+    top = re.match(r"^(\d{1,2})([.、．)）])\s*(.{2,})$", stripped)
+    if top:
+        delimiter = top.group(2)
+        title = top.group(3).strip()
+        if delimiter == "、" and len(title) > 12:
+            return -1
+        if len(title) > 24:
+            return -1
+        return 2 if delimiter == "、" else 1
+    return 0
+
+
+def _is_heading(text: str, *, ocr_mode: bool = False) -> int:
+    text = _strip_heading_markup(text)
     if not text or len(text) > 100:
+        return 0
+    if _looks_like_numeric_identifier_heading(text):
+        return 0
+    if _looks_like_numeric_table_value(text):
         return 0
     if _looks_like_plain_table_row(text) or _looks_like_markdown_table_row(text):
         return 0
+    numeric_level = _numeric_heading_level(text)
+    if numeric_level < 0:
+        return 0
+    if numeric_level > 0:
+        return numeric_level
+    if ocr_mode:
+        if _looks_like_ocr_chrome_heading(text):
+            return 0
+        # OCR output for scanned contracts often turns every numbered sub-clause
+        # into a tiny section. Keep top-level clauses as boundaries and leave
+        # nested clauses inside their parent section.
+        if re.match(r"^\d+\.\d+(?:\.\d+)*[.、．)\s]?", text):
+            return 0
     for i, pattern in enumerate(HEADING_PATTERNS):
         if pattern.match(text):
             return 1 if i < 2 else 2
     return 0
 
 
-def _split_sections_from_toc(pages: list[PageContent], toc: list) -> list[Section]:
+def _strip_heading_markup(text: str) -> str:
+    stripped = text.strip()
+    stripped = re.sub(r"^(?:#{1,6}\s*)", "", stripped)
+    stripped = re.sub(r"^\*{1,3}(.+?)\*{1,3}$", r"\1", stripped)
+    stripped = re.sub(r"^_{1,3}(.+?)_{1,3}$", r"\1", stripped)
+    return stripped.strip()
+
+
+def _toc_has_dense_same_page_entries(toc: list) -> bool:
+    page_counts: dict[int, int] = {}
+    for entry in toc:
+        try:
+            level, _title, page_num = entry
+        except ValueError:
+            continue
+        if int(level) > 2:
+            continue
+        page_counts[int(page_num)] = page_counts.get(int(page_num), 0) + 1
+    return any(count > 1 for count in page_counts.values())
+
+
+def _normalize_heading_key(text: str) -> str:
+    return re.sub(r"[\s.．、:：)）\-_]+", "", text).lower()
+
+
+def _line_index_for_toc_title(lines: list[str], title: str, *, start_at: int = 0) -> int | None:
+    wanted = _normalize_heading_key(title)
+    if not wanted:
+        return None
+    for idx in range(max(start_at, 0), len(lines)):
+        line_key = _normalize_heading_key(lines[idx])
+        if not line_key:
+            continue
+        if line_key == wanted or line_key.startswith(wanted) or wanted.startswith(line_key):
+            return idx
+    return None
+
+
+def _toc_chapter_prefix(title: str) -> str | None:
+    match = re.match(r"^\s*(\d{1,2})(?:[.、．)]|\s)", title)
+    return match.group(1) if match else None
+
+
+def _toc_parent_for_child(child_title: str, parents: dict[str, str]) -> str | None:
+    match = re.match(r"^\s*(\d{1,2})\.\d{1,2}", child_title)
+    if not match:
+        return None
+    return parents.get(match.group(1))
+
+
+def _prepare_toc_section_boundaries(
+    toc: list, *, max_level: int = 2
+) -> list[dict[str, Any]]:
+    """Keep configured TOC boundaries and attach level-1 titles to their first child."""
+    parents: dict[str, str] = {}
+    boundaries: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    max_level = max(1, max_level)
+    for entry in toc:
+        try:
+            level, title, page_num = entry
+        except ValueError:
+            continue
+        level = int(level)
+        page_num = int(page_num)
+        title = str(title).strip()
+        if not title:
+            continue
+        if level == 1 and max_level > 1:
+            prefix = _toc_chapter_prefix(title)
+            if prefix:
+                parents[prefix] = title
+            continue
+        if level > max_level:
+            continue
+        key = (page_num, _normalize_heading_key(title))
+        if key in seen:
+            continue
+        seen.add(key)
+        boundaries.append(
+            {
+                "level": level,
+                "title": title,
+                "page": page_num,
+                "parent": _toc_parent_for_child(title, parents),
+            }
+        )
+    return boundaries
+
+
+def _compact_toc_for_section_boundaries(toc: list, *, max_level: int = 2) -> list[list[Any]]:
+    compact: list[list[Any]] = []
+    seen_pages: set[int] = set()
+    max_level = max(1, max_level)
+    for idx, entry in enumerate(toc):
+        try:
+            level, title, page_num = entry
+        except ValueError:
+            continue
+        level = int(level)
+        page_num = int(page_num)
+        if level > max_level:
+            continue
+        next_entry = toc[idx + 1] if idx + 1 < len(toc) else None
+        if next_entry:
+            try:
+                next_level, _next_title, next_page = next_entry
+            except ValueError:
+                next_level, next_page = 0, -1
+            if level == 1 and int(next_level) == 2 and int(next_page) == page_num:
+                continue
+        if page_num in seen_pages:
+            continue
+        seen_pages.add(page_num)
+        compact.append([level, str(title), page_num])
+    return compact
+
+
+def _split_sections_from_toc(
+    pages: list[PageContent],
+    toc: list,
+    section_policy: SectionPolicy | None = None,
+) -> list[Section]:
     """Split sections using PDF TOC."""
     if not toc or not pages:
-        return _split_sections(pages)
+        return _split_sections(pages, section_policy=section_policy)
+    policy = section_policy or SectionPolicy()
+    boundaries = _prepare_toc_section_boundaries(toc, max_level=policy.toc_max_level)
+    if len(boundaries) < 2:
+        if _toc_has_dense_same_page_entries(toc):
+            toc = _compact_toc_for_section_boundaries(toc, max_level=policy.toc_max_level)
+            logger.info("PDF TOC compacted to %s page-level section boundaries", len(toc))
+            if len(toc) < 2:
+                return _split_sections(pages, section_policy=section_policy)
+            boundaries = [
+                {"level": int(level), "title": str(title), "page": int(page_num), "parent": None}
+                for level, title, page_num in toc
+            ]
+        else:
+            boundaries = [
+                {"level": int(level), "title": str(title), "page": int(page_num), "parent": None}
+                for level, title, page_num in toc
+                if int(level) <= policy.toc_max_level
+            ]
+    if len(boundaries) < 2:
+        return _split_sections(pages, section_policy=section_policy)
 
     page_texts: dict[int, str] = {}
+    page_lines: dict[int, list[str]] = {}
     for p in pages:
         t = p.text
         if p.tables and not p.tables_in_text:
             t += "\n\n" + "\n\n".join(p.tables)
         page_texts[p.page_num] = t
+        page_lines[p.page_num] = [line.strip() for line in t.splitlines() if line.strip()]
 
     max_page = max(p.page_num for p in pages)
     sections: list[Section] = []
+    first_start_page = max(1, int(boundaries[0]["page"]))
+    preface_parts = [
+        page_texts[pn].strip()
+        for pn in range(1, first_start_page)
+        if page_texts.get(pn, "").strip()
+    ]
+    if preface_parts:
+        title = "前言/目录" if _detect_text_locale("\n".join(preface_parts)) == "zh" else "Preface / TOC"
+        sections.append(
+            Section(
+                index=1,
+                title=title,
+                level=1,
+                text="\n\n".join(preface_parts).strip(),
+                page_range=f"p.1-{first_start_page - 1}",
+            )
+        )
 
-    for i, (level, title, start_page) in enumerate(toc):
-        end_page = toc[i + 1][2] - 1 if i + 1 < len(toc) else max_page
+    for i, boundary in enumerate(boundaries):
+        level = int(boundary["level"])
+        title = str(boundary["title"])
+        start_page = int(boundary["page"])
+        next_boundary = boundaries[i + 1] if i + 1 < len(boundaries) else None
+        next_page = int(next_boundary["page"]) if next_boundary else max_page + 1
+        end_page = next_page - 1 if next_boundary else max_page
         end_page = max(end_page, start_page)
-        text_parts = [page_texts[pn] for pn in range(start_page, end_page + 1) if pn in page_texts]
-        text = "\n\n".join(text_parts).strip()
+        text_parts: list[str] = []
+        start_lines = page_lines.get(start_page, [])
+        start_idx = _line_index_for_toc_title(start_lines, title) or 0
+        if next_boundary and next_page == start_page:
+            next_idx = _line_index_for_toc_title(
+                start_lines, str(next_boundary["title"]), start_at=start_idx + 1
+            )
+            selected = start_lines[start_idx:next_idx] if next_idx is not None else start_lines[start_idx:]
+            text_parts.append("\n".join(selected))
+        else:
+            if start_lines:
+                text_parts.append("\n".join(start_lines[start_idx:]))
+            for pn in range(start_page + 1, end_page + 1):
+                if page_texts.get(pn, "").strip():
+                    text_parts.append(page_texts[pn].strip())
+        parent = boundary.get("parent")
+        text = "\n\n".join(part.strip() for part in text_parts if part.strip()).strip()
+        if parent and text and _normalize_heading_key(str(parent)) not in _normalize_heading_key(text[:200]):
+            text = f"{parent}\n{text}"
         if not text:
             continue
         sections.append(
@@ -2030,17 +2592,177 @@ def _split_sections_from_toc(pages: list[PageContent], toc: list) -> list[Sectio
 
     if len(sections) < 2:
         logger.warning("PDF TOC produced too few sections, falling back to regex split")
-        return _split_sections(pages)
+        return _split_sections(pages, section_policy=section_policy)
     return sections
 
 
-def _split_sections(pages: list[PageContent]) -> list[Section]:
+def _renumber_sections(sections: list[Section]) -> list[Section]:
+    for idx, sec in enumerate(sections, 1):
+        sec.index = idx
+    return sections
+
+
+def _merge_short_ocr_sections(sections: list[Section], *, min_chars: int = 20) -> list[Section]:
+    merged: list[Section] = []
+    for sec in sections:
+        if merged and sec.level > 1 and len(sec.text.strip()) < min_chars:
+            previous = merged[-1]
+            parts = [previous.text.rstrip(), sec.title.strip(), sec.text.strip()]
+            previous.text = "\n".join(part for part in parts if part).strip()
+            start, _ = _page_bounds(previous.page_range)
+            _, end = _page_bounds(sec.page_range)
+            if start and end:
+                previous.page_range = f"p.{start}-{end}"
+            continue
+        merged.append(sec)
+    return _renumber_sections(merged)
+
+
+def _merge_short_sections(sections: list[Section], *, min_chars: int = 80) -> list[Section]:
+    if not sections:
+        return sections
+    short_count = sum(1 for sec in sections if len(sec.text.strip()) < min_chars)
+    if short_count / max(len(sections), 1) < 0.35:
+        return sections
+
+    merged: list[Section] = []
+    for sec in sections:
+        if merged and sec.level > 1 and len(sec.text.strip()) < min_chars:
+            previous = merged[-1]
+            parts = [previous.text.rstrip(), sec.title.strip(), sec.text.strip()]
+            previous.text = "\n".join(part for part in parts if part).strip()
+            start, _ = _page_bounds(previous.page_range)
+            _, end = _page_bounds(sec.page_range)
+            if start and end:
+                previous.page_range = f"p.{start}-{end}"
+            continue
+        merged.append(sec)
+    return _renumber_sections(merged)
+
+
+def _numeric_heading_prefix(text: str) -> str | None:
+    stripped = text.strip()
+    dotted = re.match(r"^(\d{1,2}(?:\.\d{1,2})*)", stripped)
+    if dotted:
+        return dotted.group(1)
+    top = re.match(r"^(\d{1,2})[.、．)]", stripped)
+    if top:
+        return top.group(1)
+    return None
+
+
+def _promote_parent_sections_to_first_child(sections: list[Section]) -> list[Section]:
+    for sec in sections:
+        if _numeric_heading_level(sec.title) != 1:
+            continue
+        parent_prefix = _numeric_heading_prefix(sec.title)
+        lines = [line for line in sec.text.splitlines() if line.strip()]
+        if not lines:
+            continue
+        first_line = lines[0].strip()
+        if _numeric_heading_level(first_line) != 2:
+            continue
+        child_prefix = _numeric_heading_prefix(first_line)
+        if not parent_prefix or not child_prefix or child_prefix.split(".", 1)[0] != parent_prefix:
+            continue
+        sec.text = f"{sec.title}\n{sec.text}".strip()
+        sec.title = first_line
+        sec.level = 2
+    return sections
+
+
+def _split_leading_toc_lines(lines: list[str]) -> tuple[list[str], list[str]] | None:
+    toc_idx = next(
+        (
+            idx
+            for idx, line in enumerate(lines)
+            if _normalize_heading_key(line) in {"目录", "目次"}
+        ),
+        None,
+    )
+    if toc_idx is None:
+        return None
+    first_heading_key: str | None = None
+    first_heading_idx: int | None = None
+    for idx in range(toc_idx + 1, len(lines)):
+        line = lines[idx].strip()
+        if _is_heading(line) <= 0:
+            continue
+        first_heading_key = _normalize_heading_key(_strip_heading_markup(line))
+        first_heading_idx = idx
+        break
+    if not first_heading_key or first_heading_idx is None:
+        return None
+    for idx in range(first_heading_idx + 1, len(lines)):
+        line = lines[idx].strip()
+        if _normalize_heading_key(_strip_heading_markup(line)) == first_heading_key:
+            return lines[:idx], lines[idx:]
+    return None
+
+
+def _prefers_formal_chinese_sectioning(
+    pages: list[PageContent], *, min_headings: int = 4
+) -> bool:
+    formal_count = 0
+    arabic_count = 0
+    for page in pages[:5]:
+        for raw_line in page.text.splitlines():
+            line = _strip_heading_markup(raw_line)
+            if not line or len(line) > 120:
+                continue
+            if re.match(r"^第[一二三四五六七八九十\d]+[章节部分篇]\s*[、:：]?\s*.+", line):
+                formal_count += 1
+            elif re.match(r"^[（(]?[一二三四五六七八九十]+[）)]?[、.．]\s*.+", line):
+                formal_count += 1
+            if re.match(r"^\d{1,2}(?:\.\d{1,2})?[.、．)）\s]\s*.{2,}", line):
+                arabic_count += 1
+    return formal_count >= min_headings and arabic_count >= formal_count
+
+
+def _is_arabic_numbered_heading_candidate(text: str) -> bool:
+    stripped = _strip_heading_markup(text)
+    return bool(re.match(r"^\d{1,2}(?:\.\d{1,2})?[.、．)）\s]\s*.{2,}", stripped))
+
+
+def _split_sections(
+    pages: list[PageContent], section_policy: SectionPolicy | None = None
+) -> list[Section]:
     sections: list[Section] = []
-    current_title = tmpl("default_section_title")
+    policy = section_policy or SectionPolicy()
+    split_locale = _detect_text_locale("\n".join(p.text[:1000] for p in pages[:3]))
+    default_section_title = tmpl_for_locale(split_locale, "default_section_title")
+    full_document_title = tmpl_for_locale(split_locale, "full_document_title")
+    current_title = default_section_title
     current_level = 1
     current_lines: list[str] = []
     current_start_page = 1
     sec_index = 0
+    if len(pages) == 1:
+        original_lines = [line.strip() for line in pages[0].text.splitlines() if line.strip()]
+        toc_split = _split_leading_toc_lines(original_lines)
+        if toc_split:
+            preface_lines, body_lines = toc_split
+            sec_index = 1
+            sections.append(
+                Section(
+                    index=sec_index,
+                    title="前言/目录" if split_locale == "zh" else "Preface / TOC",
+                    level=1,
+                    text="\n".join(preface_lines).strip(),
+                    page_range="p.1-1",
+                )
+            )
+            pages = [PageContent(page_num=1, text="\n".join(body_lines))]
+    ocr_mode = bool(pages) and (
+        sum(1 for page in pages if page.is_ocr) / max(len(pages), 1)
+    ) >= 0.8
+    suppress_arabic_clause_headings = (
+        not ocr_mode
+        and policy.suppress_arabic_clause_headings_when_formal_chinese
+        and _prefers_formal_chinese_sectioning(
+            pages, min_headings=policy.formal_chinese_min_headings
+        )
+    )
 
     for page in pages:
         page_has_body = False
@@ -2049,9 +2771,12 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
             line = line.strip()
             if not line:
                 continue
-            heading_level = _is_heading(line)
-            if heading_level > 0 and not current_lines and current_title == tmpl("default_section_title"):
-                current_title = line
+            heading_level = _is_heading(line, ocr_mode=ocr_mode)
+            if suppress_arabic_clause_headings and _is_arabic_numbered_heading_candidate(line):
+                heading_level = 0
+            heading_title = _strip_heading_markup(line)
+            if heading_level > 0 and not current_lines and current_title == default_section_title:
+                current_title = heading_title
                 current_level = heading_level
                 current_start_page = page.page_num
                 continue
@@ -2070,7 +2795,7 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
                         page_range=f"p.{current_start_page}-{end_page}",
                     )
                 )
-                current_title = line
+                current_title = heading_title
                 current_level = heading_level
                 current_lines = []
                 current_start_page = page.page_num
@@ -2125,13 +2850,17 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
         sections.append(
             Section(
                 index=1,
-                title=tmpl("full_document_title"),
+                title=full_document_title,
                 level=1,
                 text=full_text,
                 page_range=f"p.1-{pages[-1].page_num if pages else 1}",
             )
         )
-    return sections
+    if ocr_mode:
+        sections = _merge_short_ocr_sections(sections)
+    else:
+        sections = _merge_short_sections(sections)
+    return _renumber_sections(_promote_parent_sections_to_first_child(sections))
 
 
 # ═══════════════════════════════════════════
@@ -2141,70 +2870,129 @@ def _split_sections(pages: list[PageContent]) -> list[Section]:
 SUMMARY_MAX_CHARS = 500
 
 
+def _summary_failed_text(text: str | None) -> bool:
+    if not text:
+        return True
+    compact = text.strip().lower()
+    return compact in {
+        "[summary generation failed]",
+        "summary generation failed",
+    }
+
+
+def _local_section_preview(sec: Section, limit: int = SUMMARY_MAX_CHARS) -> str:
+    text = re.sub(r"\s+", " ", sec.text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _sections_overview_from_text(sections: list[Section]) -> str:
+    parts: list[str] = []
+    total_chars = 0
+    for sec in sections:
+        excerpt = _local_section_preview(sec, SUMMARY_BRIEF_SECTION_EXCERPT_CHARS)
+        part = f"## {sec.title} ({sec.page_range})\n{excerpt}".strip()
+        if not part:
+            continue
+        if total_chars + len(part) > SUMMARY_BRIEF_MAX_INPUT_CHARS and parts:
+            parts.append(
+                f"\n[Truncated after {len(parts)} sections due to summary input budget]"
+            )
+            break
+        parts.append(part)
+        total_chars += len(part)
+    return "\n\n".join(parts)
+
+
+def _sections_overview_for_brief(sections: list[Section]) -> str:
+    if len(sections) > 60:
+        overview = _compress_sections_for_brief(sections)
+    else:
+        overview = "\n\n".join(
+            f"## {sec.title} ({sec.page_range})\n{sec.summary[:SUMMARY_MAX_CHARS]}"
+            for sec in sections
+            if sec.summary and not _summary_failed_text(sec.summary)
+        )
+    if overview.strip():
+        return overview
+    return _sections_overview_from_text(sections)
+
+
+def _should_skip_section_summaries(parsed: ParsedDocument) -> bool:
+    return len(parsed.sections) > SUMMARY_SECTION_DETAIL_LIMIT
+
+
 def generate_summaries(
     parsed: ParsedDocument, concurrency: int = 3, allow_single_fallback: bool = True
 ) -> tuple[str, str, list[Section]]:
     logger.info("Generating summaries...")
+    summary_locale = _parsed_document_locale(parsed)
 
-    # Dynamic batching by token estimate
-    BATCH_TOKEN_LIMIT = 10000
-    batches: list[list[Section]] = []
-    current_batch: list[Section] = []
-    current_tokens = 0
-
-    for sec in parsed.sections:
-        sec_tokens = _estimate_tokens(sec.text) + _estimate_tokens(sec.title) + 20
-        if current_tokens + sec_tokens > BATCH_TOKEN_LIMIT and current_batch:
-            batches.append(current_batch)
-            current_batch = []
-            current_tokens = 0
-        current_batch.append(sec)
-        current_tokens += sec_tokens
-    if current_batch:
-        batches.append(current_batch)
-
-    # Concurrent summarization
-    if len(batches) > 1 and concurrency > 1:
-        logger.info(f"{len(batches)} batches, {min(concurrency, len(batches))} workers")
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(batches))) as pool:
-            futures = {
-                pool.submit(_summarize_batch, batch, allow_single_fallback): batch
-                for batch in batches
-            }
-            for fut in as_completed(futures):
-                fut.result()
-    else:
-        for batch in batches:
-            _summarize_batch(batch, allow_single_fallback)
-
-    logger.info(f"{len(parsed.sections)} section summaries complete")
-
-    # Brief input compression
-    if len(parsed.sections) > 60:
-        sections_overview = _compress_sections_for_brief(parsed.sections)
-    else:
-        sections_overview = "\n\n".join(
-            f"## {sec.title} ({sec.page_range})\n{sec.summary[:SUMMARY_MAX_CHARS]}"
-            for sec in parsed.sections
-            if sec.summary
+    if _should_skip_section_summaries(parsed):
+        logger.info(
+            "Skipping per-section summaries for long document: %s sections > limit %s",
+            len(parsed.sections),
+            SUMMARY_SECTION_DETAIL_LIMIT,
         )
+        sections_overview = _sections_overview_from_text(parsed.sections)
+    else:
+        # Dynamic batching by token estimate
+        BATCH_TOKEN_LIMIT = 10000
+        batches: list[list[Section]] = []
+        current_batch: list[Section] = []
+        current_tokens = 0
+
+        for sec in parsed.sections:
+            sec_tokens = _estimate_tokens(sec.text) + _estimate_tokens(sec.title) + 20
+            if current_tokens + sec_tokens > BATCH_TOKEN_LIMIT and current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            current_batch.append(sec)
+            current_tokens += sec_tokens
+        if current_batch:
+            batches.append(current_batch)
+
+        summary_workers = min(max(1, concurrency), SUMMARY_BATCH_CONCURRENCY, len(batches))
+        if len(batches) > 1 and summary_workers > 1:
+            logger.info(f"{len(batches)} batches, {summary_workers} summary workers")
+            with ThreadPoolExecutor(max_workers=summary_workers) as pool:
+                futures = {
+                    pool.submit(_summarize_batch, batch, allow_single_fallback, summary_locale): batch
+                    for batch in batches
+                }
+                for fut in as_completed(futures):
+                    fut.result()
+        else:
+            for batch in batches:
+                _summarize_batch(batch, allow_single_fallback, summary_locale)
+
+        logger.info(f"{len(parsed.sections)} section summaries complete")
+        sections_overview = _sections_overview_for_brief(parsed.sections)
 
     brief = gemini_summarize(
         f"Document: {parsed.filename}\nTotal pages: {parsed.total_pages}\n\n{sections_overview}",
-        prompt("brief"),
+        prompt_for_locale(summary_locale, "brief"),
     )
+    if _summary_failed_text(brief):
+        raise RuntimeError("upstream brief generation failed")
     logger.info("Brief generation complete")
 
     digest = gemini_summarize(
         f"Document: {parsed.filename}\n\nBriefing:\n{brief}",
-        prompt("digest"),
+        prompt_for_locale(summary_locale, "digest"),
     )
+    if _summary_failed_text(digest):
+        raise RuntimeError("upstream digest generation failed")
     logger.info("Digest generation complete")
 
     return digest, brief, parsed.sections
 
 
-def _summarize_batch(sections: list[Section], allow_single_fallback: bool = True):
+def _summarize_batch(
+    sections: list[Section], allow_single_fallback: bool = True, summary_locale: str = "en"
+):
     """Batch summarize with JSON output + single fallback."""
     n = len(sections)
 
@@ -2212,7 +3000,7 @@ def _summarize_batch(sections: list[Section], allow_single_fallback: bool = True
         sec = sections[0]
         sec.summary = gemini_summarize(
             f"## {sec.title} ({sec.page_range})\n\n{sec.text}",
-            prompt("section_summary"),
+            prompt_for_locale(summary_locale, "section_summary"),
         )
         logger.info(f"Section {sec.index}: {sec.title[:30]}... done")
         return
@@ -2221,7 +3009,9 @@ def _summarize_batch(sections: list[Section], allow_single_fallback: bool = True
     for sec in sections:
         batch_text += f"\n\n## Section {sec.index}: {sec.title} ({sec.page_range})\n\n{sec.text}"
 
-    result = gemini_summarize(batch_text, prompt("batch_summary", n=n))
+    result = gemini_summarize(batch_text, prompt_for_locale(summary_locale, "batch_summary", n=n))
+    if _summary_failed_text(result):
+        raise RuntimeError("upstream summary generation failed")
 
     # JSON parse
     parsed_ok = False
@@ -2249,13 +3039,19 @@ def _summarize_batch(sections: list[Section], allow_single_fallback: bool = True
 
     # Fallback
     if not allow_single_fallback:
-        raise RuntimeError(f"batch summary parse failed for {n} sections")
+        logger.warning(
+            "Batch JSON parse failed for %d sections; using local section previews",
+            n,
+        )
+        for sec in sections:
+            sec.summary = _local_section_preview(sec)
+        return
 
     logger.warning(f"Batch JSON parse failed, falling back to single ({n} items)")
     for sec in sections:
         sec.summary = gemini_summarize(
             f"## {sec.title} ({sec.page_range})\n\n{sec.text}",
-            prompt("section_summary"),
+            prompt_for_locale(summary_locale, "section_summary"),
         )
         logger.info(f"Section {sec.index}: {sec.title[:30]}... done (single)")
 
@@ -2302,6 +3098,7 @@ def write_output(
     doc_dir.mkdir(parents=True, exist_ok=True)
     _reset_generated_output_dirs(doc_dir)
     sections_dir.mkdir(exist_ok=True)
+    output_locale = _parsed_document_locale(parsed)
 
     meta = {
         "doc_id": doc_id,
@@ -2334,7 +3131,8 @@ def write_output(
     _write_text(doc_dir / "digest.md", f"# {doc_id}: {parsed.filename}\n\n{digest}\n")
     logger.info("digest.md written")
 
-    brief_header = tmpl(
+    brief_header = tmpl_for_locale(
+        output_locale,
         "brief_header",
         doc_id=doc_id,
         filename=parsed.filename,
@@ -2355,7 +3153,8 @@ def write_output(
 
     for sec in parsed.sections:
         sec_filename = f"{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md"
-        sec_content = tmpl(
+        sec_content = tmpl_for_locale(
+            output_locale,
             "section_header",
             title=sec.title,
             index=sec.index,
@@ -2363,7 +3162,9 @@ def write_output(
             page_range=sec.page_range,
         )
         if sec.summary:
-            sec_content += tmpl("section_summary_line", summary=sec.summary)
+            sec_content += tmpl_for_locale(
+                output_locale, "section_summary_line", summary=sec.summary
+            )
         sec_content += sec.text + "\n"
         _write_text(sections_dir / sec_filename, sec_content)
     logger.info(f"sections/ ({len(parsed.sections)} files)")
@@ -2449,6 +3250,7 @@ def write_output_extract_only(
     doc_dir.mkdir(parents=True, exist_ok=True)
     _reset_generated_output_dirs(doc_dir)
     sections_dir.mkdir(exist_ok=True)
+    output_locale = _parsed_document_locale(parsed)
 
     meta = {
         "doc_id": doc_id,
@@ -2492,14 +3294,14 @@ def write_output_extract_only(
     if table_entries:
         _write_json(doc_dir / "tables.json", table_entries)
 
-    placeholder = summary_placeholder or t("summary_pending")
+    placeholder = summary_placeholder or _summary_placeholder_text("pending", locale=output_locale)
     _write_text(
         doc_dir / "digest.md",
-        f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{placeholder}\n",
+        f"{tmpl_for_locale(output_locale, 'digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{placeholder}\n",
     )
     _write_text(
         doc_dir / "brief.md",
-        f"{tmpl('digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{placeholder}\n",
+        f"{tmpl_for_locale(output_locale, 'digest_title', doc_id=doc_id, filename=parsed.filename)}\n\n{placeholder}\n",
     )
 
     full_text = "\n".join(sec.text for sec in parsed.sections)
@@ -2574,13 +3376,13 @@ def _generate_deferred_summary(
             raise RuntimeError(
                 f"summary attempt limit reached ({DEFERRED_SUMMARY_MAX_ATTEMPTS})"
             )
-        if _paddle_ocr_initializing.is_set() and DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC > 0:
+        if _local_ocr_worker_initializing.is_set() and DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC > 0:
             logger.info(
                 "Deferred summary waiting for local OCR init: %s (timeout=%ss)",
                 doc_id,
                 DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC,
             )
-            _paddle_ocr_ready.wait(timeout=DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC)
+            _local_ocr_worker_ready.wait(timeout=DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC)
         _deferred_summary_sem.acquire()
         acquired = True
         _set_summary_metadata(parsed, mode="defer", status="running", attempts=attempts)
@@ -2592,7 +3394,9 @@ def _generate_deferred_summary(
             source="upload",
             metadata=metadata,
             source_record=source_record,
-            summary_placeholder=_summary_placeholder_text("running"),
+            summary_placeholder=_summary_placeholder_text(
+                "running", locale=_parsed_document_locale(parsed)
+            ),
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
@@ -2635,7 +3439,9 @@ def _generate_deferred_summary(
             source="upload",
             metadata=metadata,
             source_record=source_record,
-            summary_placeholder=_summary_placeholder_text("failed", error_message),
+            summary_placeholder=_summary_placeholder_text(
+                "failed", error_message, locale=_parsed_document_locale(parsed)
+            ),
         )
     finally:
         if acquired:
@@ -2953,10 +3759,11 @@ async def _startup_prewarm_local_ocr() -> None:
     if not PREWARM_LOCAL_OCR:
         return
     try:
-        _get_paddle_ocr()
-        logger.info("Local OCR backend prewarmed")
+        with _local_ocr_worker_lock:
+            _get_local_ocr_worker()
+        logger.info("Local OCR worker prewarmed")
     except Exception as exc:
-        logger.warning("Local OCR prewarm skipped: %s", exc)
+        logger.warning("Local OCR worker prewarm skipped: %s", exc)
 
 
 def _parse_metadata_form(metadata: str | None) -> dict[str, Any]:
@@ -3548,7 +4355,7 @@ async def health():
         "ok": True,
         "version": "3.0.0",
         "docs_dir": _mask_path(_get_docs_dir()),
-        "supported_formats": ["pdf", "docx", "pptx", "xlsx", "csv", "html"],
+        "supported_formats": SUPPORTED_FORMATS,
     }
 
 
@@ -3622,9 +4429,7 @@ async def api_parse_doc(
         if suffix not in SUPPORTED_EXTENSIONS:
             raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
-        profile = None
-        if suffix == ".pdf":
-            profile = _load_document_profile(field_ocr_profile, requested_field_ocr_config)
+        profile = _load_document_profile(field_ocr_profile, requested_field_ocr_config)
         summary_mode = _resolve_summary_mode(
             profile=profile,
             parse_mode=requested_parse_mode,
@@ -3678,10 +4483,11 @@ async def api_parse_doc(
                         logger.warning("Local OCR prewarm planning skipped before parse: %s", exc)
                 if should_prewarm_local_ocr:
                     try:
-                        _get_paddle_ocr()
-                        logger.info("Local OCR backend prewarmed before PDF parse")
+                        with _local_ocr_worker_lock:
+                            _get_local_ocr_worker()
+                        logger.info("Local OCR worker prewarmed before PDF parse")
                     except Exception as exc:
-                        logger.warning("Local OCR prewarm skipped before parse: %s", exc)
+                        logger.warning("Local OCR worker prewarm skipped before parse: %s", exc)
                 parsed = await loop.run_in_executor(
                     None,
                     lambda: parse_pdf(
@@ -3699,20 +4505,25 @@ async def api_parse_doc(
                         manual_blank_pages_spec=manual_blank_pages_spec,
                     ),
                 )
-            elif suffix == ".docx":
+            elif suffix in (".doc", ".docx"):
                 parsed = await loop.run_in_executor(
                     None,
                     lambda: parse_word(
-                        tmp_path,
+                        _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path,
                         extract_tables=extract_tables,
+                        profile=profile,
                     ),
                 )
             elif suffix in (".xlsx", ".xls"):
                 parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
             elif suffix == ".csv":
                 parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
+            elif suffix == ".ppt":
+                parsed = await loop.run_in_executor(
+                    None, lambda: parse_generic(_convert_legacy_office(tmp_path, "pptx"), profile=profile)
+                )
             else:  # .pptx, .html, .htm, etc.
-                parsed = await loop.run_in_executor(None, lambda: parse_generic(tmp_path))
+                parsed = await loop.run_in_executor(None, lambda: parse_generic(tmp_path, profile=profile))
         except Exception as e:
             raise HTTPException(500, t("parse_failed", err=str(e)))
         finally:
@@ -3722,8 +4533,14 @@ async def api_parse_doc(
             except Exception:
                 pass
 
+        parsed.filename = filename
+        parsed.file_type = suffix.lstrip(".")
+        if suffix in {".doc", ".ppt"}:
+            parsed.metadata["converted_to"] = "docx" if suffix == ".doc" else "pptx"
+        parsed_locale = _parsed_document_locale(parsed)
+
         # Summarize + write
-        digest = t("summary_pending")
+        digest = _summary_placeholder_text("pending", locale=parsed_locale)
         source_record = (
             _persist_source_file(docs_dir / d_id, filename, content) if STORE_SOURCE_FILES else {}
         )
@@ -4114,7 +4931,9 @@ async def retry_summary(doc_id: str, concurrency: int = 3, force: bool = False):
         source="upload",
         metadata=metadata,
         source_record=source_record,
-        summary_placeholder=_summary_placeholder_text("pending"),
+        summary_placeholder=_summary_placeholder_text(
+            "pending", locale=_parsed_document_locale(parsed)
+        ),
     )
     worker = threading.Thread(
         target=_generate_deferred_summary,

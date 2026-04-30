@@ -308,14 +308,14 @@ def test_parse_unsupported_format_returns_422(
     base_url: str, http_client, fixtures: dict
 ) -> None:
     """Uploading an unsupported file type returns 422."""
-    # Create a tiny .txt file in memory
+    # Create a tiny unsupported binary file in memory
     import io
 
-    fake_txt = io.BytesIO(b"Hello world")
+    fake_bin = io.BytesIO(b"\x00\x01\x02")
     resp = http_client.post(
         f"{base_url}/doc/parse",
         data={"generate_summary": "false"},
-        files={"file": ("test.txt", fake_txt)},
+        files={"file": ("test.bin", fake_bin)},
     )
     assert resp.status_code == 422, (
         f"Expected 422 for unsupported format, got {resp.status_code}"

@@ -10,7 +10,7 @@ python-multipart>=0.0.9
 playwright>=1.45.0
 
 # Document parsing (MarkItDown by Microsoft)
-markitdown[pdf,docx,pptx,xlsx]>=0.1.0
+markitdown[pdf,docx,pptx,xlsx,xls]>=0.1.0
 pymupdf>=1.24.0
 
 # LLM / OCR
@@ -19,9 +19,7 @@ openai>=1.0.0
 
 # Image processing
 Pillow>=10.4.0
-numpy>=1.26.0
-paddlepaddle>=2.6.0
-paddleocr>=2.7.0
+numpy>=1.26.0,<2.0.0
 
 # HTTP client
 httpx>=0.27.0

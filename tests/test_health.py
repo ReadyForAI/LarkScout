@@ -28,3 +28,5 @@ def test_doc_health(client: TestClient) -> None:
     data = resp.json()
     assert data["ok"] is True
     assert "supported_formats" in data
+    for fmt in ("txt", "json", "jsonl", "xml", "xls", "doc", "ppt"):
+        assert fmt in data["supported_formats"]

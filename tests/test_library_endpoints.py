@@ -515,7 +515,7 @@ class TestInputValidation:
     def test_parse_unsupported_format(self, client: TestClient):
         resp = client.post(
             "/doc/parse",
-            files={"file": ("test.txt", b"hello world", "text/plain")},
+            files={"file": ("test.bin", b"\x00\x01\x02", "application/octet-stream")},
         )
         assert resp.status_code == 422
 

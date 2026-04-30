@@ -39,7 +39,7 @@
   "groups": [
     {
       "id": "cover_parties",
-      "page_scope": [1],
+      "page_scope": [1, 2],
       "aliases": [],
       "crop": {
         "x0": 0.1,
@@ -51,7 +51,7 @@
     },
     {
       "id": "quotation_block",
-      "aliases": ["客户名称", "报价日期", "报价有效期", "1. 软件产品", "合同总价款"],
+      "aliases": ["客户名称", "报价日期", "报价有效期", "1. 软件产品"],
       "crop": {
         "x0": 0.05,
         "y0": 0.12,
@@ -61,17 +61,6 @@
       "start_alias": "1. 软件产品",
       "end_alias": "2. 合同价款的支付方式",
       "replace_mode": "block_between_aliases"
-    },
-    {
-      "id": "acceptance_header",
-      "aliases": ["项目验收报告", "验收的内容、标准和范围", "附件《验收的内容、标准和范围》"],
-      "crop": {
-        "x0": 0.06,
-        "y0": 0.05,
-        "x1": 0.95,
-        "y1": 0.34
-      },
-      "replace_mode": "replace_entire_page"
     }
   ],
   "fields": [

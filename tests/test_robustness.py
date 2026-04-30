@@ -1,8 +1,11 @@
 """Robustness tests for TASK-018: row limits, rate limiting, health masking, OCR retry, atomic writes."""
 
 import csv
+import importlib.util
 import os
+import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -59,6 +62,88 @@ class TestXLSXParse:
 
 class TestPDFParse:
     """PDF parsing should preserve page-level location hints."""
+
+    def test_paddle_worker_uses_v2_api_for_paddleocr_2x(self, monkeypatch):
+        worker_path = Path(__file__).parents[1] / "services" / "docreader" / "paddle_ocr_worker.py"
+        spec = importlib.util.spec_from_file_location("paddle_ocr_worker_test_v2", worker_path)
+        assert spec is not None and spec.loader is not None
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+
+        class LegacyPaddleOCR:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def ocr(self, image_array, cls=False):
+                return [[[None, ("甲方：测试公司", 0.99)]]]
+
+        paddleocr_module = types.SimpleNamespace(PaddleOCR=LegacyPaddleOCR)
+        monkeypatch.setitem(sys.modules, "paddleocr", paddleocr_module)
+        monkeypatch.setattr(worker.importlib.metadata, "version", lambda name: "2.10.0")
+
+        engine, api_version = worker._build_engine()
+        text = worker._flatten_paddle_ocr_result(worker._predict(engine, api_version, object()))
+
+        assert api_version == "v2"
+        assert engine.kwargs["lang"] == "ch"
+        assert "text_detection_model_name" not in engine.kwargs
+        assert text == "甲方：测试公司"
+
+    def test_local_ocr_uses_isolated_worker(self, tmp_path, monkeypatch):
+        import larkscout_docreader
+
+        worker = tmp_path / "worker.py"
+        worker.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    "print(json.dumps({'type': 'ready'}), flush=True)",
+                    "for line in sys.stdin:",
+                    "    req = json.loads(line)",
+                    "    print(json.dumps({'ok': True, 'page_num': req['page_num'], 'text': '甲方：测试公司'}, ensure_ascii=False), flush=True)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", f"{sys.executable} {worker}")
+        monkeypatch.setattr(larkscout_docreader, "_local_ocr_disabled_until", 0.0)
+        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
+
+        try:
+            text = larkscout_docreader.local_ocr(b"not-an-image", 1, "paddleocr")
+        finally:
+            larkscout_docreader._stop_local_ocr_worker()
+
+        assert text == "甲方：测试公司"
+
+    def test_local_ocr_worker_crash_does_not_crash_parent(self, tmp_path, monkeypatch):
+        import larkscout_docreader
+
+        worker = tmp_path / "worker_crash.py"
+        worker.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    "print(json.dumps({'type': 'ready'}), flush=True)",
+                    "sys.stdin.readline()",
+                    "sys.exit(139)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", f"{sys.executable} {worker}")
+        monkeypatch.setattr(larkscout_docreader, "_local_ocr_disabled_until", 0.0)
+        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_CIRCUIT_BREAKER_SEC", 0.0)
+
+        try:
+            text = larkscout_docreader.local_ocr(b"not-an-image", 1, "paddleocr")
+        finally:
+            larkscout_docreader._stop_local_ocr_worker()
+
+        assert text.startswith("[OCR failed")
 
     def test_load_document_profile_contract_cn(self):
         from larkscout_docreader import _load_document_profile
@@ -192,6 +277,100 @@ class TestPDFParse:
         assert plan["llm_ocr_pages"] == [2]
         assert plan["local_ocr_pages"] == [1, 3]
         assert plan["region_llm"] is True
+
+    def test_tender_section_split_keeps_third_level_under_second_level(self):
+        from larkscout_docreader import PageContent, _split_sections
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "3. 项目目标与范围",
+                        "3.1 项目目标",
+                        "3.1.1 全域系统监控覆盖",
+                        "覆盖 MES、BIP、CRM。",
+                        "3.1.2 智能故障发现与定位",
+                        "支持链路分析。",
+                        "3.2 项目范围",
+                        "系统管理员和运维人员。",
+                        "覆盖招标人指定的业务系统、基础资源、应用组件、数据库和前端体验监测范围。",
+                        "投标人需结合现场情况完成部署、联调、测试、培训和验收支持工作。",
+                    ]
+                ),
+            )
+        ]
+
+        sections = _split_sections(pages)
+
+        assert [section.title for section in sections] == ["3.1 项目目标", "3.2 项目范围"]
+        assert "3. 项目目标与范围" in sections[0].text
+        assert "3.1.1 全域系统监控覆盖" in sections[0].text
+        assert "3.1.2 智能故障发现与定位" in sections[0].text
+
+    def test_dense_pdf_toc_compacts_same_page_entries_without_duplicates(self):
+        from larkscout_docreader import PageContent, _split_sections_from_toc
+
+        pages = [
+            PageContent(
+                page_num=5,
+                text="\n".join(
+                    [
+                        "1. 总则",
+                        "1.1 项目概况",
+                        "项目背景说明。",
+                        "1.2 招标依据",
+                        "法规依据说明。",
+                    ]
+                ),
+            ),
+            PageContent(page_num=6, text="2. 投标人资格要求\n2.1 基本资质要求\n资质说明。"),
+        ]
+        toc = [
+            [1, "1.总则", 5],
+            [2, "1.1项目概况", 5],
+            [2, "1.2招标依据", 5],
+            [1, "2.投标人资格要求", 6],
+            [2, "2.1基本资质要求", 6],
+        ]
+
+        sections = _split_sections_from_toc(pages, toc)
+
+        assert [section.title for section in sections] == ["1.1项目概况", "2.1基本资质要求"]
+        assert len({section.text for section in sections}) == len(sections)
+
+    def test_long_document_summary_skips_per_section_llm_calls(self, monkeypatch):
+        import larkscout_docreader
+        from larkscout_docreader import ParsedDocument, Section
+
+        calls = []
+
+        def fake_summarize(text, summarize_prompt, max_retries=2):
+            calls.append(text)
+            if "Briefing:" in text:
+                return "digest"
+            return "brief"
+
+        monkeypatch.setattr(larkscout_docreader, "SUMMARY_SECTION_DETAIL_LIMIT", 2)
+        monkeypatch.setattr(larkscout_docreader, "gemini_summarize", fake_summarize)
+        parsed = ParsedDocument(
+            filename="tender.pdf",
+            file_type="pdf",
+            total_pages=3,
+            pages=[],
+            sections=[
+                Section(index=i, title=f"{i}.1 标题", level=2, text="正文" * 300, page_range=f"p.{i}-{i}")
+                for i in range(1, 5)
+            ],
+        )
+
+        digest, brief, sections = larkscout_docreader.generate_summaries(parsed, concurrency=3)
+
+        assert digest == "digest"
+        assert brief == "brief"
+        assert sections == parsed.sections
+        assert len(calls) == 2
+        assert all(not section.summary for section in parsed.sections)
 
     def test_plan_pdf_ocr_skips_detected_blank_scan_pages(self):
         from larkscout_docreader import _load_document_profile, _plan_pdf_ocr
@@ -345,6 +524,22 @@ class TestPDFParse:
 
         assert cleaned.splitlines()[0] == "兴业数字金融服务（上海）股份有限公司"
 
+    def test_cleanup_ocr_text_normalizes_product_and_numeric_noise(self):
+        from larkscout_docreader import _cleanup_ocr_text
+
+        cleaned = _cleanup_ocr_text(
+            "基调研云APM监测268个探针\n"
+            "基调所元Network监测\n"
+            "小计￥711，016.00\n"
+            "微服务只支持lava AgentV3.00+，不支持其他语吉探针"
+        )
+
+        assert "基调听云APM" in cleaned
+        assert "基调听云Network" in cleaned
+        assert "￥711，016.00" in cleaned
+        assert "Java AgentV3.00+" in cleaned
+        assert "其他语言探针" in cleaned
+
     def test_extract_profile_fields_rejects_bad_cover_values_and_uses_filename(self):
         from larkscout_docreader import PageContent, _extract_profile_fields, _load_document_profile
 
@@ -429,6 +624,25 @@ class TestPDFParse:
             )
         ]
 
+    def test_extract_tables_from_ocr_text_ignores_header_only_markdown_table(self):
+        from larkscout_docreader import _extract_tables_from_ocr_text
+
+        text, tables = _extract_tables_from_ocr_text(
+            "\n".join(
+                [
+                    "| VO.® |  | 委外服务协议 工作说明 |",
+                    "|------|---|----------------------|",
+                    "3-0 工作描述",
+                ]
+            ),
+            page_num=2,
+            total_pages=5,
+        )
+
+        assert "VO.®" in text
+        assert "3-0 工作描述" in text
+        assert tables == []
+
     def test_split_sections_does_not_treat_table_rows_as_headings(self):
         from larkscout_docreader import PageContent, _split_sections
 
@@ -459,6 +673,205 @@ class TestPDFParse:
 
         assert [sec.title for sec in sections] == ["1. 软件产品", "2. 合同价款的支付方式"]
         assert "1 平台A 1 13% ¥29,800.00" in sections[0].text
+
+    def test_split_sections_does_not_treat_price_table_values_as_headings(self):
+        from larkscout_docreader import PageContent, _split_sections
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "附件一：服务产品及价格确认书",
+                        "基调听云报价清单",
+                        "产品名称",
+                        "单价（元）服务时间",
+                        "95 元/个",
+                        "探针/月",
+                        "2024 年8 月",
+                        "5 日至2026 年8 月4 日",
+                        "每个月统计使用数量，探针每月起订数量为100 个且总数量少于",
+                        "200 个（不包含",
+                        "200 个）",
+                        "75 月/个",
+                        "每个月统计使用数量，按季度6%增值税专用发票结算付款",
+                    ]
+                ),
+            )
+        ]
+
+        sections = _split_sections(pages)
+
+        assert len(sections) == 1
+        assert "95 元/个" in sections[0].text
+        assert "2024 年8 月" in sections[0].text
+        assert "200 个（不包含" in sections[0].text
+        assert "75 月/个" in sections[0].text
+
+    def test_split_sections_ocr_mode_ignores_logo_and_nested_clauses(self):
+        from larkscout_docreader import PageContent, _split_sections
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "GF FUTURES",
+                        "广发期货",
+                        "1.服务内容",
+                        "1.1乙方向甲方提供智能业务运维技术服务。",
+                        "2.服务费用及支付方式",
+                        "2.1固定服务费用为【￥：60,000】。",
+                    ]
+                ),
+                is_ocr=True,
+            )
+        ]
+
+        sections = _split_sections(pages)
+
+        titles = [sec.title for sec in sections]
+        assert "GF FUTURES" not in titles
+        assert "1.1乙方向甲方提供智能业务运维技术服务。" not in titles
+        assert "2.1固定服务费用为【￥：60,000】。" not in titles
+        assert "1.服务内容" in titles
+        assert "2.服务费用及支付方式" in titles
+        assert "2.1固定服务费用" in next(
+            sec.text for sec in sections if sec.title == "2.服务费用及支付方式"
+        )
+
+    def test_source_contract_no_is_prepended_to_region_ocr(self):
+        from larkscout_docreader import _prepend_source_contract_no_if_missing
+
+        text = _prepend_source_contract_no_if_missing(
+            "北京基调网络股份有限公司\n技术服务合同",
+            "NBS250961.pdf",
+        )
+
+        assert text.splitlines()[0] == "NBS250961"
+
+    def test_split_sections_ocr_mode_merges_tiny_sections(self):
+        from larkscout_docreader import PageContent, _split_sections
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "1.主要条款",
+                        "这是较长的主要条款正文，包含足够信息用于形成一个 section。",
+                        "2.碎片标题",
+                        "短",
+                    ]
+                ),
+                is_ocr=True,
+            )
+        ]
+
+        sections = _split_sections(pages)
+
+        assert len(sections) == 1
+        assert "2.碎片标题" in sections[0].text
+
+    def test_split_sections_does_not_treat_account_number_as_heading(self):
+        from larkscout_docreader import PageContent, _split_sections
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "2.合同价款的支付方式",
+                        "开户行及帐号：",
+                        "626 526 390",
+                        "2.4甲方的付款方式为：银行转账。",
+                        "3.软件产品交付、质量与验收",
+                        "合同签订后90天完成交付，并按照双方确认的验收标准完成上线和最终验收。",
+                    ]
+                ),
+                is_ocr=True,
+            )
+        ]
+
+        sections = _split_sections(pages)
+
+        assert [sec.title for sec in sections] == [
+            "2.合同价款的支付方式",
+            "3.软件产品交付、质量与验收",
+        ]
+        assert "626 526 390" in sections[0].text
+
+    def test_split_sections_supports_dash_numbered_contract_headings(self):
+        from larkscout_docreader import PageContent, _split_sections
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "1-0总则",
+                        "本工作说明通过援引基础协议签署。",
+                        "2-0 术语解释和说明",
+                        "工作授权书是指联想对供应商执行特定交易的确认文件。",
+                        "400-898-9580",
+                        "3-0 工作描述",
+                        "联想委托供应商提供性能监测服务，服务内容包括网络监测、真实用户体验监测和应用性能监测。",
+                    ]
+                ),
+                is_ocr=True,
+            )
+        ]
+
+        sections = _split_sections(pages)
+
+        assert [sec.title for sec in sections] == [
+            "1-0总则",
+            "2-0 术语解释和说明",
+            "3-0 工作描述",
+        ]
+        assert "400-898-9580" in sections[1].text
+
+    def test_replace_blob_segment_falls_back_to_matching_alias(self):
+        from larkscout_docreader import FieldGroup, _replace_blob_segment
+
+        group = FieldGroup(
+            id="quotation_block",
+            aliases=("客户名称", "合同总价款"),
+            start_alias="1. 软件产品",
+            end_alias="2. 合同价款的支付方式",
+            replace_mode="block_between_aliases",
+        )
+
+        text = "页眉\n客户名称联想（北京）有限公司\n小计￥711，016.00元"
+        replaced = _replace_blob_segment(text, group, "客户名称：联想（北京）有限公司\n小计 ¥711,016.00")
+
+        assert replaced == "页眉\n\n客户名称：联想（北京）有限公司\n小计 ¥711,016.00"
+
+    def test_normalize_document_text_removes_signature_watermark_lines(self):
+        from larkscout_docreader import PageContent, _normalize_document_text
+
+        pages = [
+            PageContent(
+                page_num=1,
+                text="\n".join(
+                    [
+                        "万翼签         万翼签         万翼",
+                        "TINGYUN.COM",
+                        "甲方：深圳市万物云科技有限公司",
+                        "75 月/个",
+                        "乙方：北京基调网络股份有限公司",
+                    ]
+                ),
+            )
+        ]
+
+        _normalize_document_text(pages)
+
+        assert "万翼签" not in pages[0].text
+        assert "TINGYUN.COM" not in pages[0].text
+        assert "甲方：深圳市万物云科技有限公司" in pages[0].text
+        assert "75 元/个" in pages[0].text
+        assert "乙方：北京基调网络股份有限公司" in pages[0].text
 
 
 class TestDocIdStrategy:

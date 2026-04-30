@@ -1,6 +1,6 @@
 ---
 name: larkscout-docreader
-description: 长文档解析与阅读 HTTP API。适用于需要读取、分析或总结 Word (.docx) 或 PDF 文件的场景。支持文件上传解析、三级摘要（digest/brief/full）、按需加载 section、表格提取、metadata 持久化、source 文件引用，以及通过 HTTP API 访问文档库搜索。输出 doc-index v2 格式，并与 larkscout-browser 的网页抓取结果共享统一索引。它是 LarkScout 开源数据采集平台中的文档解析引擎。
+description: 长文档解析与阅读 HTTP API。适用于需要读取、分析或总结 PDF、Office、HTML、CSV、文本/JSON/XML 等文件的场景。支持文件上传解析、三级摘要（digest/brief/full）、按需加载 section、表格提取、metadata 持久化、source 文件引用，以及通过 HTTP API 访问文档库搜索。输出 doc-index v2 格式，并与 larkscout-browser 的网页抓取结果共享统一索引。它是 LarkScout 开源数据采集平台中的文档解析引擎。
 triggers:
   - "读取文档"
   - "解析文档"
@@ -13,18 +13,25 @@ triggers:
   - "上传文档"
   - "文档库搜索"
   - ".pdf"
+  - ".doc"
   - ".docx"
+  - ".ppt"
+  - ".pptx"
+  - ".xls"
   - ".xlsx"
   - ".csv"
-  - ".pptx"
   - ".html"
+  - ".txt"
+  - ".json"
+  - ".jsonl"
+  - ".xml"
 ---
 
 # SKILL: LarkScout DocReader（文档解析 HTTP API）
 
 ## 1. 用途
 
-适用于：文档分析、跨文档整合、研究报告提取、财务数据采集、合同审查、会议纪要处理。
+适用于：文档分析、跨文档整合、研究报告提取、财务数据采集、文档审阅、会议纪要处理。
 
 ---
 
@@ -115,13 +122,14 @@ GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer
   "ok": true,
   "version": "3.0.0",
   "docs_dir": "~/.larkscout/docs",
-  "supported_formats": ["pdf", "docx", "pptx", "xlsx", "csv", "html"]
+  "supported_formats": ["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "html", "htm", "txt", "text", "json", "jsonl", "xml"]
 }
 ```
 
 说明：
 - `docs_dir` 会显示脱敏后的路径（家目录以 `~` 表示），这是有意为之的安全设计
-- `supported_formats` 除了 `pdf` 和 `docx`，还包括 `pptx`、`xlsx`、`csv`、`html`
+- `supported_formats` 包括 PDF、Office、CSV、HTML、文本、JSON、JSONL、XML；`.doc` 和 `.ppt` 会先由服务端转换为 `.docx` / `.pptx`
+- `.doc` / `.ppt` 支持依赖服务端已安装 LibreOffice/soffice；Docker 镜像默认包含转换组件
 - 文档解析由 [MarkItDown](https://github.com/microsoft/markitdown)（Microsoft）驱动
 
 ### 4.2 上传并解析文档（核心）
@@ -133,11 +141,15 @@ GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer
 
 | Parameter             | Type   | Default    | 说明 |
 | --------------------- | ------ | ---------- | ---- |
-| `file`                | File   | (required) | 上传文件（.pdf, .docx, .pptx, .xlsx, .csv, .html） |
+| `file`                | File   | (required) | 上传文件（.pdf, .doc/.docx, .ppt/.pptx, .xls/.xlsx, .csv, .html/.htm, .txt/.text, .json/.jsonl/.xml） |
 | `doc_id`              | string | Auto-increment | 手动指定 DOC-ID |
 | `generate_summary`    | bool   | `true`     | 是否生成摘要（false = 仅提取文本） |
-| `force_ocr`           | bool   | `false`    | 对所有页面强制 OCR |
-| `ocr_pages`           | string | null       | 仅对指定页范围做 OCR，例如 `"10-30"` |
+| `summary_mode`        | string | null       | 摘要模式：`sync` / `defer` / `off`。长文档和业务 Skill 推荐 `defer` |
+| `document_profile`    | string | null       | 可选文档 profile 名称；仅在调用方明确知道可用 profile 时传入 |
+| `id_strategy`         | string | null       | DOC-ID 策略：`counter` / `source_filename` |
+| `skip_ocr_pages`      | string | null       | 已确认空白或无需 OCR 的页码，例如 `"30,104,106-108"` |
+| `force_ocr`           | bool   | `false`    | 强制使用 LLM OCR 处理全部页面；成本较高，只在明确需要视觉模型重识别整份文档时使用 |
+| `ocr_pages`           | string | null       | 指定页范围升级为 LLM OCR，例如 `"10-30"`；未指定页仍按服务端自动策略处理 |
 | `extract_tables`      | bool   | `true`     | 是否提取表格 |
 | `max_tables_per_page` | int    | `3`        | 每页最多提取的表格数量 |
 | `concurrency`         | int    | `3`        | OCR/摘要并发度 |
@@ -152,6 +164,25 @@ curl -X POST http://localhost:9898/doc/parse \
   -F "generate_summary=true" \
   -F "extract_tables=true" \
   -F 'tags=["Q3","financial"]'
+```
+
+调用方不需要依赖 Python SDK；可以直接用 `curl` 调 LarkScout 入库。LarkScout 只负责底层解析、索引和来源保留；具体业务场景、业务字段、命名规则和后续操作由上层调用方自行定义。
+
+带 metadata 的通用入库示例：
+
+```bash
+curl -X POST http://localhost:9898/doc/parse \
+  -F "file=@/path/to/document.pdf" \
+  -F "summary_mode=defer" \
+  -F "id_strategy=source_filename" \
+  -F "extract_tables=true" \
+  -F 'metadata={"display_name":"document.pdf","source_system":"manual_upload"}'
+```
+
+如果已确认部分页面为空白或不需要 OCR，可追加：
+
+```bash
+-F "skip_ocr_pages=30,104,106,108,110,112"
 ```
 
 响应示例：
@@ -204,7 +235,7 @@ curl -X POST http://localhost:9898/doc/parse \
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
-      "metadata": {"customer": "ACME", "contract_type": "MSA"},
+      "metadata": {"customer": "ACME", "category": "report"},
       "source_ref": "source/Q3-report.pdf",
       "source_filename": "Q3-report.pdf",
       "source_available": true,
@@ -450,14 +481,14 @@ GET /doc/library/{doc_id}/section/{sid} → 读取内容
 
 | Error                                              | Cause                          | Solution |
 | -------------------------------------------------- | ------------------------------ | -------- |
-| `422 unsupported format`                           | 上传了不支持的文件格式         | 检查文件格式（支持 pdf、docx、pptx、xlsx、csv、html） |
+| `422 unsupported format`                           | 上传了不支持的文件格式         | 通过 `/doc/health` 的 `supported_formats` 检查当前支持格式 |
 | `429 too many concurrent requests`                 | 触发限流                       | 等待后重试，服务端限制了并发解析数 |
 | `404 document not found`                           | doc_id 无效或文档尚未入库      | 先用 search 确认 doc_id |
 | `404 section not found`                            | sid 无效                       | 先调用 `/doc/library/{doc_id}/sections` 获取有效 sid 列表 |
 | `500 parse failed`                                 | PDF 损坏或加密                 | 提示用户检查文件 |
 | 与缺少 LLM 凭证相关的 `500 RuntimeError`           | LLM provider 凭证未配置        | 检查当前启用的 LLM provider 配置并重启服务 |
 | Parsing takes too long                             | 文件较大且包含 OCR             | 先用 `generate_summary=false` 做快速提取，再单独生成摘要 |
-| Table is empty                                     | PDF 中的表格是图片             | 使用 `force_ocr=true`，OCR 会尝试识别图片表格 |
+| Table is empty                                     | PDF 中的表格是图片或版式复杂   | 先确认正文 OCR 是否已入库；如关键表格缺失，再只对相关页使用 `ocr_pages` 或在明确接受成本时使用 `force_ocr=true` |
 | OCR 结果出现 `No image provided` 一类内容          | 视觉模型或图片输入模式不匹配   | 先检查当前 OCR 模型、vendor profile 和 OCR 图片输入模式，再决定是否重试 |
 | XLSX/CSV truncated warning in metadata             | 文件超过 `MAX_PARSE_ROWS`      | 正常现象，为安全起见大表会被截断；可检查 `metadata.truncated` |
 
@@ -474,9 +505,11 @@ GET /doc/library/{doc_id}/section/{sid} → 读取内容
 
 **OCR：**
 
-- 普通文档：不要传 `force_ocr`，服务会自动检测需要 OCR 的页面
-- 扫描文档：使用 `force_ocr=true`
-- 混合文档：使用 `ocr_pages="10-30"`（只对指定页范围 OCR）
+- 普通文档和扫描文档：默认不要传 `force_ocr`；服务会自动检测扫描页，并优先使用本地 PaddleOCR
+- 已确认空白页或无需 OCR 页：传 `skip_ocr_pages`，避免浪费解析时间
+- 只有在少数页面需要更高质量视觉识别时，传 `ocr_pages="10-30"`，将指定页升级为 LLM OCR
+- 只有在明确接受成本和耗时、且整份文档都需要视觉模型重识别时，才传 `force_ocr=true`
+- 本地 PaddleOCR 在服务端隔离 worker 进程中运行；worker 崩溃不会拖垮主服务，也不会默认自动切换到 LLM OCR
 - 如果 OCR 以某个 provider 特有的方式失败，先检查服务当前使用的 OCR 模型 / vendor 配置，不要先归因到文档本身
 
 ---

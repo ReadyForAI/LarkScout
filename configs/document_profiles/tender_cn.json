@@ -1,0 +1,16 @@
+{
+  "profile": "tender_cn",
+  "section_policy": {
+    "toc_max_level": 2,
+    "suppress_arabic_clause_headings_when_formal_chinese": true,
+    "formal_chinese_min_headings": 4
+  },
+  "summary_policy": {
+    "default_mode": "defer",
+    "async_modes": ["fast", "accurate"],
+    "sync_modes": ["full"]
+  },
+  "table_policy": {
+    "prefer_markitdown": true
+  }
+}

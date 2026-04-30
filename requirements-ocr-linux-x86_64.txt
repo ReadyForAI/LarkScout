@@ -1,0 +1,5 @@
+# Linux x86_64 production OCR baseline.
+# Keep this on the PaddleOCR 3.x line so production can use HPI/OpenVINO/TensorRT
+# optimizations. Exact patch versions should be promoted after OCR benchmark runs.
+paddlepaddle>=3.2.0,<4.0.0
+paddleocr>=3.3.0,<4.0.0

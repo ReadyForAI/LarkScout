@@ -165,6 +165,7 @@ class OpenAICompatProvider(LLMProvider):
     ) -> str:
         """Call chat.completions.create and return the assistant text."""
 
+        last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
                 kwargs = {
@@ -178,6 +179,7 @@ class OpenAICompatProvider(LLMProvider):
                 )
                 return self._message_text(resp.choices[0].message.content)
             except Exception as exc:
+                last_exc = exc
                 if attempt < max_retries:
                     logger.warning(
                         "OpenAI-compat chat retry (%d/%d): %s", attempt + 1, max_retries, exc
@@ -185,8 +187,8 @@ class OpenAICompatProvider(LLMProvider):
                     time.sleep(2**attempt)
                 else:
                     logger.error("OpenAI-compat chat failed after %d retries: %s", max_retries, exc)
-                    return "[summary generation failed]"
-        return "[summary generation failed]"
+                    raise
+        raise RuntimeError(f"OpenAI-compat chat failed: {last_exc}")
 
     def summarize(self, text: str, prompt: str, max_retries: int = 2) -> str:
         """Generate a summary via the OpenAI chat completions endpoint."""

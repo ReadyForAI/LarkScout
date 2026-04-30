@@ -1,6 +1,6 @@
 ---
 name: larkscout-docreader
-description: Long document parsing and reading HTTP API. Use when you need to read, analyze, or summarize Word (.docx) or PDF files. Supports file upload parsing, three-tier summaries (digest/brief/full), on-demand section loading, table extraction, metadata persistence, source file references, and document library search via HTTP API. Outputs doc-index v2 format, sharing a unified index with larkscout-browser web capture results. Serves as the document parsing engine for the LarkScout open-source data collection platform.
+description: Long document parsing and reading HTTP API. Use when you need to read, analyze, or summarize PDF, Office, HTML, CSV, text/JSON/XML files. Supports file upload parsing, three-tier summaries (digest/brief/full), on-demand section loading, table extraction, metadata persistence, source file references, and document library search via HTTP API. Outputs doc-index v2 format, sharing a unified index with larkscout-browser web capture results. Serves as the document parsing engine for the LarkScout open-source data collection platform.
 triggers:
   - "read document"
   - "parse document"
@@ -13,18 +13,25 @@ triggers:
   - "upload document"
   - "document library search"
   - ".pdf"
+  - ".doc"
   - ".docx"
+  - ".ppt"
+  - ".pptx"
+  - ".xls"
   - ".xlsx"
   - ".csv"
-  - ".pptx"
   - ".html"
+  - ".txt"
+  - ".json"
+  - ".jsonl"
+  - ".xml"
 ---
 
 # SKILL: LarkScout DocReader (Document Parsing HTTP API)
 
 ## 1. Purpose
 
-Use for: document analysis, cross-document consolidation, research report extraction, financial data collection, contract review, meeting minutes processing.
+Use for: document analysis, cross-document consolidation, research report extraction, financial data collection, document review, meeting minutes processing.
 
 ---
 
@@ -115,13 +122,14 @@ Response example:
   "ok": true,
   "version": "3.0.0",
   "docs_dir": "~/.larkscout/docs",
-  "supported_formats": ["pdf", "docx", "pptx", "xlsx", "csv", "html"]
+  "supported_formats": ["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "html", "htm", "txt", "text", "json", "jsonl", "xml"]
 }
 ```
 
 Notes:
 - `docs_dir` shows a masked path (`~` replaces the home directory) — this is intentional for security
-- `supported_formats` includes `pptx`, `xlsx`, `csv`, and `html` in addition to `pdf` and `docx`
+- `supported_formats` includes PDF, Office, CSV, HTML, text, JSON, JSONL, and XML; `.doc` and `.ppt` are converted server-side to `.docx` / `.pptx` before parsing
+- `.doc` / `.ppt` support requires LibreOffice/soffice on the server; the Docker image includes the conversion components by default
 - Document parsing powered by [MarkItDown](https://github.com/microsoft/markitdown) (Microsoft)
 
 ### 4.2 Upload and Parse Document (Core)
@@ -133,11 +141,15 @@ Request parameters:
 
 | Parameter             | Type   | Default    | Description                                                                             |
 | --------------------- | ------ | ---------- | --------------------------------------------------------------------------------------- |
-| `file`                | File   | (required) | File to upload (.pdf, .docx, .pptx, .xlsx, .csv, .html)                                 |
+| `file`                | File   | (required) | File to upload (.pdf, .doc/.docx, .ppt/.pptx, .xls/.xlsx, .csv, .html/.htm, .txt/.text, .json/.jsonl/.xml) |
 | `doc_id`              | string | Auto-increment | Manually specify DOC-ID                                                             |
 | `generate_summary`    | bool   | `true`     | Whether to generate summaries (false = extract text only)                               |
-| `force_ocr`           | bool   | `false`    | Force OCR on all pages                                                                  |
-| `ocr_pages`           | string | null       | OCR only specified page ranges, e.g. `"10-30"`                                          |
+| `summary_mode`        | string | null       | Summary mode: `sync` / `defer` / `off`. Use `defer` for large documents and business Skills |
+| `document_profile`    | string | null       | Optional document profile name; pass only when the caller knows an available profile    |
+| `id_strategy`         | string | null       | DOC-ID strategy: `counter` / `source_filename`                                         |
+| `skip_ocr_pages`      | string | null       | Pages confirmed blank or unnecessary for OCR, e.g. `"30,104,106-108"`                  |
+| `force_ocr`           | bool   | `false`    | Force LLM OCR on all pages. This is higher cost and should only be used when the caller explicitly needs visual re-recognition for the whole document |
+| `ocr_pages`           | string | null       | Upgrade specific page ranges to LLM OCR, e.g. `"10-30"`; unspecified pages still follow the server's automatic plan |
 | `extract_tables`      | bool   | `true`     | Whether to extract tables                                                               |
 | `max_tables_per_page` | int    | `3`        | Maximum tables to extract per page                                                      |
 | `concurrency`         | int    | `3`        | OCR/summary concurrency                                                                 |
@@ -152,6 +164,25 @@ curl -X POST http://localhost:9898/doc/parse \
   -F "generate_summary=true" \
   -F "extract_tables=true" \
   -F 'tags=["Q3","financial"]'
+```
+
+Callers do not need the Python SDK; they can call LarkScout directly with `curl`. LarkScout provides lower-level parsing, indexing, and source retention only. Business scenarios, business metadata fields, naming rules, and follow-up operations are owned by the upper-level caller.
+
+Generic ingestion example with metadata:
+
+```bash
+curl -X POST http://localhost:9898/doc/parse \
+  -F "file=@/path/to/document.pdf" \
+  -F "summary_mode=defer" \
+  -F "id_strategy=source_filename" \
+  -F "extract_tables=true" \
+  -F 'metadata={"display_name":"document.pdf","source_system":"manual_upload"}'
+```
+
+If some pages are confirmed blank or do not need OCR, append:
+
+```bash
+-F "skip_ocr_pages=30,104,106,108,110,112"
 ```
 
 Response example:
@@ -204,7 +235,7 @@ Response example:
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
-      "metadata": {"customer": "ACME", "contract_type": "MSA"},
+      "metadata": {"customer": "ACME", "category": "report"},
       "source_ref": "source/Q3-report.pdf",
       "source_filename": "Q3-report.pdf",
       "source_available": true,
@@ -450,14 +481,14 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 
 | Error                                              | Cause                          | Solution                                                                   |
 | -------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------------- |
-| `422 unsupported format`                           | Uploaded non-supported file    | Check file format (pdf, docx, pptx, xlsx, csv, html supported)            |
+| `422 unsupported format`                           | Uploaded non-supported file    | Check file format against `/doc/health` `supported_formats`               |
 | `429 too many concurrent requests`                 | Rate limit exceeded            | Wait and retry — server limits concurrent parse operations                 |
 | `404 document not found`                           | Invalid doc_id or unparsed doc | Use search to confirm doc_id first                                         |
 | `404 section not found`                            | Invalid sid                    | Call `/doc/library/{doc_id}/sections` first to get valid sid list           |
 | `500 parse failed`                                 | Corrupted or encrypted PDF     | Prompt user to check the file                                              |
 | `500 RuntimeError` about missing LLM credentials   | LLM provider credentials not configured | Check the active LLM provider settings and restart service        |
 | Parsing takes too long                             | Large file + OCR               | Use `generate_summary=false` for fast extraction first, generate summary later |
-| Table is empty                                     | Tables in PDF are images       | Use `force_ocr=true` — OCR will attempt to recognize tables in images      |
+| Table is empty                                     | Tables are images or complex layouts | First confirm text OCR was ingested; if critical table content is missing, retry only relevant pages with `ocr_pages`, or use `force_ocr=true` only when the extra cost is acceptable |
 | OCR output looks like `No image provided`          | Vision model / image input mode mismatch | Check the active OCR model, vendor profile, and OCR image input mode before retrying |
 | XLSX/CSV truncated warning in metadata             | File exceeds MAX_PARSE_ROWS    | Normal — large spreadsheets are truncated for safety; check `metadata.truncated` |
 
@@ -474,9 +505,11 @@ Use for: scenarios where the Agent performs its own analysis without needing LLM
 
 **OCR:**
 
-- Normal documents: Don't pass `force_ocr` — service auto-detects pages needing OCR
-- Scanned documents: `force_ocr=true`
-- Mixed documents: `ocr_pages="10-30"` (OCR only specified page ranges)
+- Normal and scanned documents: don't pass `force_ocr` by default. The service auto-detects scanned pages and prioritizes local PaddleOCR
+- Confirmed blank pages or pages that do not need OCR: pass `skip_ocr_pages` to avoid wasted processing time
+- When only a few pages need higher-quality visual recognition, pass `ocr_pages="10-30"` to upgrade those pages to LLM OCR
+- Use `force_ocr=true` only when the caller explicitly accepts the cost and latency of visual re-recognition for the whole document
+- Local PaddleOCR runs in an isolated server-side worker process. Worker crashes do not crash the main service and do not automatically fall back to LLM OCR by default
 - If OCR fails in a provider-specific way, first inspect the service's active OCR model / vendor configuration before blaming the document itself
 
 ---
