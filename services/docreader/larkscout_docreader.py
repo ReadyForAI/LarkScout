@@ -7,7 +7,6 @@
 import asyncio
 import base64
 import hashlib
-import io
 import json
 import logging
 import os
@@ -30,7 +29,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from i18n import init_locale, prompt_for_locale, t, tmpl, tmpl_for_locale
+from i18n import init_locale, prompt_for_locale, t, tmpl_for_locale
 
 init_locale()
 
@@ -120,8 +119,7 @@ def _convert_legacy_office(filepath: Path, target_ext: str) -> Path:
     ]
     proc = subprocess.run(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         timeout=timeout,
         check=False,

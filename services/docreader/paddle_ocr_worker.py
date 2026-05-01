@@ -9,13 +9,12 @@ stays parseable.
 from __future__ import annotations
 
 import base64
-import io
 import importlib.metadata
+import io
 import json
 import os
 import sys
 from typing import Any
-
 
 _protocol_out: Any | None = None
 

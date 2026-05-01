@@ -437,8 +437,9 @@ class TestPDFParse:
         assert _strip_section_storage_wrapper(raw) == "正文内容"
 
     def test_pdf_page_ranges_are_not_collapsed_to_page_one(self):
-        from tests.e2e.fixtures.generate_fixtures import generate_pdf
         from larkscout_docreader import _page_bounds, parse_pdf
+
+        from tests.e2e.fixtures.generate_fixtures import generate_pdf
 
         with tempfile.TemporaryDirectory() as tmp:
             path = generate_pdf(Path(tmp) / "sample.pdf")
