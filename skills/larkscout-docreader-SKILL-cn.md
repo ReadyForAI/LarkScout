@@ -155,6 +155,7 @@ GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer
 | `ocr_images`          | bool   | `false`    | 是否对已抽取的 Word 内嵌图片做 OCR |
 | `image_ocr_backend`   | string | `auto`     | 图片 OCR 后端：`auto` / `local` / `llm`；`auto` 为本地优先，失败后局部 LLM OCR |
 | `max_images`          | int    | `200`      | 单文档最多处理的内嵌图片数量 |
+| `max_ocr_images`      | int    | `80`       | 开启 `ocr_images=true` 时允许 OCR 的最大 Word 内嵌图片数量；实际 OCR 数量超过该值会返回 422 |
 | `max_tables_per_page` | int    | `3`        | 每页最多提取的表格数量 |
 | `concurrency`         | int    | `3`        | OCR/摘要并发度 |
 | `tags`                | string | null       | 标签，支持 JSON 数组（`'["Q3","financial"]'`）或逗号分隔（`"Q3,financial"`） |
@@ -183,8 +184,11 @@ curl -X POST http://localhost:9898/doc/parse \
   -F "extract_images=true" \
   -F "ocr_images=true" \
   -F "image_ocr_backend=auto" \
+  -F "max_ocr_images=80" \
   -F 'metadata={"display_name":"document.docx","source_system":"agent_upload"}'
 ```
+
+如果本次请求实际会 OCR 的图片数量超过 `max_ocr_images`，服务会拒绝执行图片 OCR。调用方应改为 `ocr_images=false` 先入库正文和图片索引，或设置较低的 `max_images` 只处理前若干张图片。
 
 该能力只输出图片来源、附近标题、section 锚点、图片文件和 OCR 文本；图片代表什么材料、是否满足业务要求，由上层工具自行判断。
 

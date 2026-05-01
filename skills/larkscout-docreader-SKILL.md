@@ -155,6 +155,7 @@ Request parameters:
 | `ocr_images`          | bool   | `false`    | Whether to OCR extracted embedded Word images                                           |
 | `image_ocr_backend`   | string | `auto`     | Image OCR backend: `auto` / `local` / `llm`; `auto` tries local OCR first and falls back to LLM OCR only for failed images |
 | `max_images`          | int    | `200`      | Maximum embedded images to process per document                                         |
+| `max_ocr_images`      | int    | `80`       | Maximum embedded Word images allowed for OCR when `ocr_images=true`; requests above this threshold return 422 |
 | `max_tables_per_page` | int    | `3`        | Maximum tables to extract per page                                                      |
 | `concurrency`         | int    | `3`        | OCR/summary concurrency                                                                 |
 | `tags`                | string | null       | Tags — JSON array (`'["Q3","financial"]'`) or comma-separated (`"Q3,financial"`)        |
@@ -183,8 +184,11 @@ curl -X POST http://localhost:9898/doc/parse \
   -F "extract_images=true" \
   -F "ocr_images=true" \
   -F "image_ocr_backend=auto" \
+  -F "max_ocr_images=80" \
   -F 'metadata={"display_name":"document.docx","source_system":"agent_upload"}'
 ```
+
+When the requested OCR image count exceeds `max_ocr_images`, the service refuses image OCR. Callers should retry with `ocr_images=false` to ingest text and the image index first, or set a lower `max_images` value to process only the first images.
 
 This only outputs image source, nearby heading, section anchor, image files, and OCR text. The upper-level caller owns all business interpretation and requirement checks.
 
