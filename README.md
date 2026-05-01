@@ -159,7 +159,7 @@ All endpoints are served on port **9898**.
 | `GET` | `/web/health` | Browser sub-app health |
 | `GET` | `/doc/health` | DocReader sub-app health (includes `docs_dir`) |
 | `POST` | `/web/capture` | Capture a URL and persist it to the document library |
-| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, PPTX, XLSX, CSV, HTML), optionally storing metadata and a source file reference |
+| `POST` | `/doc/parse` | Upload and parse a document (PDF, DOCX, PPTX, XLSX, CSV, HTML), optionally storing metadata, source file references, and embedded Word image OCR results |
 
 #### Browser Session API
 
@@ -193,6 +193,8 @@ Access documents stored by `/web/capture` and `/doc/parse`.
 | `GET` | `/doc/library/{doc_id}/sections` | List all sections with metadata |
 | `GET` | `/doc/library/{doc_id}/section/{sid}` | Full text of a single section |
 | `GET` | `/doc/library/{doc_id}/table/{table_id}` | Markdown table with column statistics |
+| `GET` | `/doc/library/{doc_id}/images` | List embedded Word images with anchors and OCR results |
+| `GET` | `/doc/library/{doc_id}/image/{image_id}` | Metadata and OCR text for one embedded Word image |
 | `GET` | `/doc/library/{doc_id}/manifest` | Provenance metadata (source, timestamps, content hash) |
 
 Full API reference: see [`skills/larkscout-browser-SKILL.md`](skills/larkscout-browser-SKILL.md) and [`skills/larkscout-docreader-SKILL.md`](skills/larkscout-docreader-SKILL.md).
@@ -378,7 +380,7 @@ LARKSCOUT_OCR_IMAGE_INPUT_MODE=plain_base64
 | `GET` | `/web/health` | Browser 子服务健康检查 |
 | `GET` | `/doc/health` | DocReader 子服务健康检查（含 `docs_dir`） |
 | `POST` | `/web/capture` | 抓取 URL 并保存到文档库 |
-| `POST` | `/doc/parse` | 上传并解析文档（PDF、DOCX、PPTX、XLSX、CSV、HTML），可附带 metadata 并保留原始文件引用 |
+| `POST` | `/doc/parse` | 上传并解析文档（PDF、DOCX、PPTX、XLSX、CSV、HTML），可附带 metadata、保留原始文件引用，并可抽取 Word 内嵌图片 OCR 结果 |
 
 #### Browser Session API
 
@@ -412,6 +414,8 @@ LARKSCOUT_OCR_IMAGE_INPUT_MODE=plain_base64
 | `GET` | `/doc/library/{doc_id}/sections` | 列出所有章节及元数据 |
 | `GET` | `/doc/library/{doc_id}/section/{sid}` | 单个章节的完整文本 |
 | `GET` | `/doc/library/{doc_id}/table/{table_id}` | 带列统计的 Markdown 表格 |
+| `GET` | `/doc/library/{doc_id}/images` | 列出 Word 内嵌图片、锚点和 OCR 结果 |
+| `GET` | `/doc/library/{doc_id}/image/{image_id}` | 单个 Word 内嵌图片的元数据和 OCR 文本 |
 | `GET` | `/doc/library/{doc_id}/manifest` | 来源元数据（来源地址、时间戳、内容哈希） |
 
 完整 API 说明见 [`skills/larkscout-browser-SKILL.md`](skills/larkscout-browser-SKILL.md) 和 [`skills/larkscout-docreader-SKILL.md`](skills/larkscout-docreader-SKILL.md)。

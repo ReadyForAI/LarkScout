@@ -151,6 +151,10 @@ Request parameters:
 | `force_ocr`           | bool   | `false`    | Force LLM OCR on all pages. This is higher cost and should only be used when the caller explicitly needs visual re-recognition for the whole document |
 | `ocr_pages`           | string | null       | Upgrade specific page ranges to LLM OCR, e.g. `"10-30"`; unspecified pages still follow the server's automatic plan |
 | `extract_tables`      | bool   | `true`     | Whether to extract tables                                                               |
+| `extract_images`      | bool   | `false`    | Whether to extract embedded Word images into `images.json` / `images/`                  |
+| `ocr_images`          | bool   | `false`    | Whether to OCR extracted embedded Word images                                           |
+| `image_ocr_backend`   | string | `auto`     | Image OCR backend: `auto` / `local` / `llm`; `auto` tries local OCR first and falls back to LLM OCR only for failed images |
+| `max_images`          | int    | `200`      | Maximum embedded images to process per document                                         |
 | `max_tables_per_page` | int    | `3`        | Maximum tables to extract per page                                                      |
 | `concurrency`         | int    | `3`        | OCR/summary concurrency                                                                 |
 | `tags`                | string | null       | Tags — JSON array (`'["Q3","financial"]'`) or comma-separated (`"Q3,financial"`)        |
@@ -167,6 +171,22 @@ curl -X POST http://localhost:9898/doc/parse \
 ```
 
 Callers do not need the Python SDK; they can call LarkScout directly with `curl`. LarkScout provides lower-level parsing, indexing, and source retention only. Business scenarios, business metadata fields, naming rules, and follow-up operations are owned by the upper-level caller.
+
+Generic ingestion example for embedded Word image recognition:
+
+```bash
+curl -X POST http://localhost:9898/doc/parse \
+  -F "file=@/path/to/document.docx" \
+  -F "summary_mode=defer" \
+  -F "id_strategy=source_filename" \
+  -F "extract_tables=true" \
+  -F "extract_images=true" \
+  -F "ocr_images=true" \
+  -F "image_ocr_backend=auto" \
+  -F 'metadata={"display_name":"document.docx","source_system":"agent_upload"}'
+```
+
+This only outputs image source, nearby heading, section anchor, image files, and OCR text. The upper-level caller owns all business interpretation and requirement checks.
 
 Generic ingestion example with metadata:
 
@@ -358,11 +378,18 @@ table_id format: `"01"` or `"table-01"`.
 
 Response: `{"doc_id": "DOC-010", "table_id": "01", "content": "# Table 1 (Page 5)\n\n| ... |"}`
 
-### 4.11 Get Manifest
+### 4.11 Read Embedded Word Image Results
+
+- `GET /doc/library/{doc_id}/images`
+- `GET /doc/library/{doc_id}/image/{image_id}`
+
+Results exist only when `/doc/parse` was called with `extract_images=true`. `image_id` format: `"001"` or `"IMG-001"`.
+
+### 4.12 Get Manifest
 
 - `GET /doc/library/{doc_id}/manifest`
 
-Returns the full manifest.json contents, including document structure, section list, path information, metadata, source file reference, and provenance.
+Returns the full manifest.json contents, including document structure, section list, image/table path information, metadata, source file reference, and provenance.
 
 ---
 
@@ -385,9 +412,14 @@ docs/
   │   ├─ sections/               ← Section slices
   │   │   ├─ 01-{sid}-{title}.md
   │   │   └─ 02-{sid}-{title}.md
-  │   └─ tables/                 ← Extracted tables
-  │       ├─ table-01.md
-  │       └─ table-02.md
+  │   ├─ tables/                 ← Extracted tables
+  │   │   ├─ table-01.md
+  │   │   └─ table-02.md
+  │   ├─ images.json             ← Embedded Word image anchors, files, and OCR metadata
+  │   └─ images/                 ← Embedded Word originals, rendered images, and OCR text
+  │       ├─ IMG-001.original.png
+  │       ├─ IMG-001.png
+  │       └─ IMG-001.ocr.txt
   │
   └─ WEB-001/                    ← Web capture results (written by LarkScout Browser, shared index)
       ├─ manifest.json

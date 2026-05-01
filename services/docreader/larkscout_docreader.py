@@ -7,17 +7,21 @@
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
+import posixpath
 import re
 import selectors
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -25,6 +29,7 @@ from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
@@ -182,6 +187,35 @@ class Section:
     page_range: str  # "p.5-12"
     summary: str = ""
     sid: str = ""  # stable ID
+    image_refs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EmbeddedImage:
+    """Embedded document image with generic anchor and OCR metadata."""
+
+    image_id: str
+    order: int
+    media_path: str
+    relationship_id: str
+    paragraph_index: int
+    paragraph_text: str = ""
+    near_heading: str = ""
+    anchor_sid: str = ""
+    section_title: str = ""
+    original_ext: str = ""
+    original_type: str = ""
+    original_bytes: bytes = b""
+    rendered_ext: str = ""
+    rendered_type: str = ""
+    rendered_bytes: bytes = b""
+    render_status: str = "not_rendered"
+    render_error: str = ""
+    ocr_enabled: bool = False
+    ocr_backend: str = ""
+    ocr_status: str = "not_requested"
+    ocr_text: str = ""
+    ocr_error: str = ""
 
 
 @dataclass
@@ -195,6 +229,7 @@ class ParsedDocument:
     sections: list[Section]
     ocr_page_count: int = 0
     table_count: int = 0
+    images: list[EmbeddedImage] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
 
@@ -2085,9 +2120,280 @@ def parse_pdf(
 # Word parsing
 # ═══════════════════════════════════════════
 
+WORD_XML_NS = {
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "v": "urn:schemas-microsoft-com:vml",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+
+_RASTER_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
+_VECTOR_IMAGE_EXTENSIONS = {".emf", ".wmf"}
+_IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".emf": "image/x-emf",
+    ".wmf": "image/x-wmf",
+}
+
+
+def _word_rel_target_to_package_path(target: str) -> str:
+    clean = target.replace("\\", "/").strip()
+    if clean.startswith("/"):
+        return posixpath.normpath(clean.lstrip("/"))
+    return posixpath.normpath(posixpath.join("word", clean))
+
+
+def _word_paragraph_text(paragraph: ET.Element) -> str:
+    parts: list[str] = []
+    for node in paragraph.findall(".//w:t", WORD_XML_NS):
+        if node.text:
+            parts.append(node.text)
+    return "".join(parts).strip()
+
+
+def _word_paragraph_style(paragraph: ET.Element) -> str:
+    style = paragraph.find("./w:pPr/w:pStyle", WORD_XML_NS)
+    if style is None:
+        return ""
+    return str(style.attrib.get(f"{{{WORD_XML_NS['w']}}}val") or "").strip()
+
+
+def _word_heading_level(text: str, style: str) -> int:
+    style_lower = style.lower()
+    if any(token in style_lower for token in ("heading", "标题", "title")):
+        match = re.search(r"([1-6])", style_lower)
+        return min(int(match.group(1)), 3) if match else 1
+    return _is_heading(text)
+
+
+def _word_image_relationships(docx_path: Path) -> dict[str, str]:
+    try:
+        with zipfile.ZipFile(docx_path) as zf:
+            rels_xml = zf.read("word/_rels/document.xml.rels")
+    except Exception:
+        return {}
+
+    root = ET.fromstring(rels_xml)
+    rels: dict[str, str] = {}
+    for rel in root.findall("rel:Relationship", WORD_XML_NS):
+        rel_id = str(rel.attrib.get("Id") or "")
+        target = str(rel.attrib.get("Target") or "")
+        rel_type = str(rel.attrib.get("Type") or "")
+        if not rel_id or not target:
+            continue
+        if "image" not in rel_type.lower() and not target.lower().startswith("media/"):
+            continue
+        rels[rel_id] = _word_rel_target_to_package_path(target)
+    return rels
+
+
+def _word_paragraph_image_rel_ids(paragraph: ET.Element) -> list[str]:
+    rel_ids: list[str] = []
+    for node in paragraph.findall(".//a:blip", WORD_XML_NS):
+        rel_id = str(node.attrib.get(f"{{{WORD_XML_NS['r']}}}embed") or "").strip()
+        if rel_id and rel_id not in rel_ids:
+            rel_ids.append(rel_id)
+    for node in paragraph.findall(".//v:imagedata", WORD_XML_NS):
+        rel_id = str(node.attrib.get(f"{{{WORD_XML_NS['r']}}}id") or "").strip()
+        if rel_id and rel_id not in rel_ids:
+            rel_ids.append(rel_id)
+    return rel_ids
+
+
+def _render_raster_image_to_png(image_bytes: bytes) -> tuple[bytes, str]:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        if img.mode not in {"RGB", "RGBA"}:
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue(), "ok"
+
+
+def _convert_vector_image_to_png(image_bytes: bytes, original_ext: str) -> tuple[bytes, str]:
+    binary = shutil.which("soffice") or shutil.which("libreoffice")
+    if not binary:
+        raise RuntimeError("office converter is not available for vector image conversion")
+    with tempfile.TemporaryDirectory(prefix="larkscout-word-image-") as tmp:
+        tmp_dir = Path(tmp)
+        src = tmp_dir / f"image{original_ext}"
+        src.write_bytes(image_bytes)
+        cmd = [
+            binary,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--convert-to",
+            "png",
+            "--outdir",
+            str(tmp_dir),
+            str(src),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+        candidates = sorted(tmp_dir.glob("*.png"))
+        if proc.returncode != 0 or not candidates:
+            details = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(details or f"failed to convert {original_ext} to png")
+        return candidates[0].read_bytes(), "ok"
+
+
+def _render_embedded_image(image_bytes: bytes, original_ext: str) -> tuple[bytes, str, str]:
+    ext = original_ext.lower()
+    if ext in _RASTER_IMAGE_EXTENSIONS:
+        rendered, status = _render_raster_image_to_png(image_bytes)
+        return rendered, ".png", status
+    if ext in _VECTOR_IMAGE_EXTENSIONS:
+        rendered, status = _convert_vector_image_to_png(image_bytes, ext)
+        return rendered, ".png", status
+    raise RuntimeError(f"unsupported embedded image format: {ext or 'unknown'}")
+
+
+def _ocr_embedded_image(image: EmbeddedImage, backend: str) -> tuple[str, str, str, str]:
+    selected = (backend or "auto").strip().lower()
+    if selected not in {"auto", "local", "llm"}:
+        selected = "auto"
+    if not image.rendered_bytes:
+        return "", selected, "failed", "image was not rendered"
+
+    if selected in {"auto", "local"}:
+        text = local_ocr(image.rendered_bytes, image.order, "paddleocr")
+        if text and not _is_ocr_failed_text(text):
+            return _cleanup_ocr_text(text), "local-paddleocr", "ok", ""
+        if selected == "local":
+            return "", "local-paddleocr", "failed", text or "local OCR returned no text"
+
+    text = gemini_ocr(image.rendered_bytes, image.order)
+    if text and not _is_ocr_failed_text(text):
+        return _cleanup_ocr_text(text), "llm", "ok", ""
+    used_backend = "llm" if selected == "llm" else "auto"
+    return "", used_backend, "failed", text or "LLM OCR returned no text"
+
+
+def _anchor_word_images_to_sections(images: list[EmbeddedImage], sections: list[Section]) -> None:
+    if not images or not sections:
+        return
+    for image in images:
+        heading_key = _normalize_heading_key(image.near_heading)
+        paragraph_key = _normalize_heading_key(image.paragraph_text)
+        selected: Section | None = None
+        for sec in sections:
+            title_key = _normalize_heading_key(sec.title)
+            text_key = _normalize_heading_key(sec.text[:1500])
+            if heading_key and (heading_key == title_key or heading_key in text_key):
+                selected = sec
+                break
+            if paragraph_key and paragraph_key in text_key:
+                selected = sec
+                break
+        if selected:
+            image.anchor_sid = selected.sid
+            image.section_title = selected.title
+            if image.image_id not in selected.image_refs:
+                selected.image_refs.append(image.image_id)
+
+
+def _extract_word_embedded_images(
+    filepath: Path,
+    *,
+    sections: list[Section],
+    ocr_images: bool = False,
+    image_ocr_backend: str = "auto",
+    max_images: int = 200,
+) -> list[EmbeddedImage]:
+    if filepath.suffix.lower() != ".docx":
+        return []
+    limit = max(0, int(max_images or 0))
+    if limit == 0:
+        return []
+    try:
+        with zipfile.ZipFile(filepath) as zf:
+            document_xml = zf.read("word/document.xml")
+            rels = _word_image_relationships(filepath)
+            root = ET.fromstring(document_xml)
+            paragraphs = root.findall(".//w:p", WORD_XML_NS)
+            images: list[EmbeddedImage] = []
+            current_heading = ""
+
+            for paragraph_index, paragraph in enumerate(paragraphs, 1):
+                paragraph_text = _word_paragraph_text(paragraph)
+                heading_level = _word_heading_level(paragraph_text, _word_paragraph_style(paragraph))
+                if paragraph_text and heading_level > 0:
+                    current_heading = _strip_heading_markup(paragraph_text)
+
+                for rel_id in _word_paragraph_image_rel_ids(paragraph):
+                    media_path = rels.get(rel_id)
+                    if not media_path:
+                        continue
+                    if len(images) >= limit:
+                        break
+                    try:
+                        original_bytes = zf.read(media_path)
+                    except KeyError:
+                        continue
+                    image_id = f"IMG-{len(images) + 1:03d}"
+                    original_ext = Path(media_path).suffix.lower()
+                    image = EmbeddedImage(
+                        image_id=image_id,
+                        order=len(images) + 1,
+                        media_path=media_path,
+                        relationship_id=rel_id,
+                        paragraph_index=paragraph_index,
+                        paragraph_text=paragraph_text,
+                        near_heading=current_heading,
+                        original_ext=original_ext,
+                        original_type=_IMAGE_MIME_BY_EXT.get(
+                            original_ext, "application/octet-stream"
+                        ),
+                        original_bytes=original_bytes,
+                    )
+                    try:
+                        rendered, rendered_ext, render_status = _render_embedded_image(
+                            image.original_bytes, image.original_ext
+                        )
+                        image.rendered_bytes = rendered
+                        image.rendered_ext = rendered_ext
+                        image.rendered_type = _IMAGE_MIME_BY_EXT.get(rendered_ext, "image/png")
+                        image.render_status = render_status
+                    except Exception as exc:
+                        image.render_status = "failed"
+                        image.render_error = str(exc)
+
+                    image.ocr_enabled = bool(ocr_images)
+                    if ocr_images:
+                        text, used_backend, status, error = _ocr_embedded_image(
+                            image, image_ocr_backend
+                        )
+                        image.ocr_backend = used_backend
+                        image.ocr_status = status
+                        image.ocr_text = text
+                        image.ocr_error = error
+                    images.append(image)
+                if len(images) >= limit:
+                    break
+    except Exception as exc:
+        logger.warning("Word embedded image extraction failed for %s: %s", filepath.name, exc)
+        return []
+
+    _anchor_word_images_to_sections(images, sections)
+    return images
+
 
 def parse_word(
-    filepath: Path, extract_tables: bool = True, profile: DocumentProfile | None = None
+    filepath: Path,
+    extract_tables: bool = True,
+    profile: DocumentProfile | None = None,
+    extract_images: bool = False,
+    ocr_images: bool = False,
+    image_ocr_backend: str = "auto",
+    max_images: int = 200,
 ) -> ParsedDocument:
     logger.info(f"Parsing Word: {filepath.name}")
     markdown_text = _convert_to_markdown(filepath)
@@ -2100,9 +2406,21 @@ def parse_word(
         sec.sid = _section_sid(sec.title, sec.text)
 
     table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
+    images = (
+        _extract_word_embedded_images(
+            filepath,
+            sections=sections,
+            ocr_images=ocr_images,
+            image_ocr_backend=image_ocr_backend,
+            max_images=max_images,
+        )
+        if extract_images
+        else []
+    )
 
     logger.info(
-        f"Parse complete: {len(sections)} sections, ~{est_pages} pages, {table_count} tables"
+        f"Parse complete: {len(sections)} sections, ~{est_pages} pages, "
+        f"{table_count} tables, {len(images)} images"
     )
     return ParsedDocument(
         filename=filepath.name,
@@ -2111,7 +2429,20 @@ def parse_word(
         pages=pages,
         sections=sections,
         table_count=table_count,
-        metadata={"document_profile": profile.name if profile else None},
+        images=images,
+        metadata={
+            "document_profile": profile.name if profile else None,
+            "word_images": {
+                "extract_enabled": bool(extract_images),
+                "ocr_enabled": bool(ocr_images),
+                "ocr_backend": image_ocr_backend if ocr_images else "",
+                "extracted": len(images),
+                "render_ok": sum(1 for image in images if image.render_status == "ok"),
+                "render_failed": sum(1 for image in images if image.render_status == "failed"),
+                "ocr_ok": sum(1 for image in images if image.ocr_status == "ok"),
+                "ocr_failed": sum(1 for image in images if image.ocr_status == "failed"),
+            },
+        },
     )
 
 
@@ -3072,11 +3403,11 @@ def _compress_sections_for_brief(sections: list[Section]) -> str:
 
 
 def _reset_generated_output_dirs(doc_dir: Path) -> None:
-    for child in ("sections", "tables"):
+    for child in ("sections", "tables", "images"):
         path = doc_dir / child
         if path.exists():
             shutil.rmtree(path)
-    for child in ("sections.json", "tables.json"):
+    for child in ("sections.json", "tables.json", "images.json"):
         path = doc_dir / child
         if path.exists():
             path.unlink()
@@ -3109,6 +3440,7 @@ def write_output(
         "section_count": len(parsed.sections),
         "ocr_page_count": parsed.ocr_page_count,
         "table_count": parsed.table_count,
+        "image_count": len(parsed.images),
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "metadata": metadata or {},
         "parse_metadata": parsed.metadata or {},
@@ -3122,6 +3454,7 @@ def write_output(
                 "page_start": _page_bounds(sec.page_range)[0],
                 "page_end": _page_bounds(sec.page_range)[1],
                 "char_count": len(sec.text),
+                "image_refs": list(sec.image_refs),
             }
             for sec in parsed.sections
         ],
@@ -3174,6 +3507,10 @@ def write_output(
     if table_entries:
         _write_json(doc_dir / "tables.json", table_entries)
         logger.info(f"tables/ ({len(table_entries)} files)")
+    image_entries = _write_images(doc_dir, parsed)
+    if image_entries:
+        _write_json(doc_dir / "images.json", image_entries)
+        logger.info(f"images/ ({len(image_entries)} files)")
 
     # v3: content_hash
     full_text = "\n".join(sec.text for sec in parsed.sections)
@@ -3198,6 +3535,8 @@ def write_output(
             "sections": "sections.json",
             "tables_dir": "tables/",
             "tables": "tables.json",
+            "images_dir": "images/",
+            "images": "images.json",
         },
         "sections": [
             _build_section_entry(
@@ -3207,6 +3546,7 @@ def write_output(
             for sec in parsed.sections
         ],
         "tables": table_entries,
+        "images": image_entries,
         "provenance": {
             "source": source,
             "source_url": original_path or str(parsed.filename),
@@ -3261,6 +3601,7 @@ def write_output_extract_only(
         "section_count": len(parsed.sections),
         "ocr_page_count": parsed.ocr_page_count,
         "table_count": parsed.table_count,
+        "image_count": len(parsed.images),
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "metadata": metadata or {},
         "parse_metadata": parsed.metadata or {},
@@ -3274,6 +3615,7 @@ def write_output_extract_only(
                 "page_start": _page_bounds(sec.page_range)[0],
                 "page_end": _page_bounds(sec.page_range)[1],
                 "char_count": len(sec.text),
+                "image_refs": list(sec.image_refs),
             }
             for sec in parsed.sections
         ],
@@ -3294,6 +3636,9 @@ def write_output_extract_only(
     table_entries = _write_tables(doc_dir, parsed)
     if table_entries:
         _write_json(doc_dir / "tables.json", table_entries)
+    image_entries = _write_images(doc_dir, parsed)
+    if image_entries:
+        _write_json(doc_dir / "images.json", image_entries)
 
     placeholder = summary_placeholder or _summary_placeholder_text("pending", locale=output_locale)
     _write_text(
@@ -3326,12 +3671,15 @@ def write_output_extract_only(
             "sections": "sections.json",
             "tables_dir": "tables/",
             "tables": "tables.json",
+            "images_dir": "images/",
+            "images": "images.json",
         },
         "sections": [
             _build_section_entry(sec, summary_preview="")
             for sec in parsed.sections
         ],
         "tables": table_entries,
+        "images": image_entries,
         "provenance": {
             "source": source,
             "source_url": str(parsed.filename),
@@ -3598,6 +3946,7 @@ STORE_SOURCE_FILES = os.environ.get("LARKSCOUT_STORE_SOURCE_FILES", "true").lowe
 
 _DOC_ID_RE = re.compile(r"^(?=.{1,80}$)(?=.*\d)[A-Za-z0-9](?:[A-Za-z0-9-]{0,78}[A-Za-z0-9])?$")
 _TABLE_ID_RE = re.compile(r"^(table-)?\d+$")
+_IMAGE_ID_RE = re.compile(r"^(IMG-)?\d{1,6}$", re.IGNORECASE)
 
 
 def _validate_doc_id(doc_id: str) -> None:
@@ -3610,6 +3959,22 @@ def _validate_table_id(table_id: str) -> None:
     """Reject table_id values that could cause path traversal."""
     if not _TABLE_ID_RE.match(table_id):
         raise HTTPException(400, f"invalid table_id: {table_id!r}")
+
+
+def _validate_image_id(image_id: str) -> None:
+    """Reject image_id values that could cause path traversal."""
+    if not _IMAGE_ID_RE.match(image_id):
+        raise HTTPException(400, f"invalid image_id: {image_id!r}")
+
+
+def _normalize_image_id(image_id: str) -> str:
+    _validate_image_id(image_id)
+    value = image_id.upper()
+    if value.startswith("IMG-"):
+        number = int(value.split("-", 1)[1])
+    else:
+        number = int(value)
+    return f"IMG-{number:03d}"
 
 
 def _get_docs_dir() -> Path:
@@ -3673,6 +4038,7 @@ class ParseResponse(BaseModel):
     total_pages: int
     section_count: int
     table_count: int
+    image_count: int = 0
     ocr_page_count: int
     digest: str
     manifest_path: str
@@ -3847,6 +4213,7 @@ def _build_section_entry(sec: Section, summary_preview: str = "") -> dict[str, A
         "token_estimate": _estimate_tokens(sec.text),
         "text_hash": f"sha256:{text_hash}",
         "table_refs": [],
+        "image_refs": list(sec.image_refs),
         "ocr_quality": None,
         "type": "text",
         "summary_preview": summary_preview,
@@ -3900,6 +4267,64 @@ def _write_tables(doc_dir: Path, parsed: ParsedDocument) -> list[dict[str, Any]]
             f"# Table {table_index} (page {page_num})\n\n{table_md}\n",
         )
     return table_entries
+
+
+def _embedded_image_entry(image: EmbeddedImage) -> dict[str, Any]:
+    original_name = f"{image.image_id}.original{image.original_ext or '.bin'}"
+    rendered_name = f"{image.image_id}{image.rendered_ext or '.png'}"
+    ocr_name = f"{image.image_id}.ocr.txt"
+    entry = {
+        "image_id": image.image_id,
+        "source": {
+            "container": "word/document.xml",
+            "media_path": image.media_path,
+            "relationship_id": image.relationship_id,
+            "paragraph_index": image.paragraph_index,
+            "order": image.order,
+        },
+        "anchor": {
+            "anchor_sid": image.anchor_sid,
+            "near_heading": image.near_heading,
+            "near_text": image.paragraph_text,
+            "section_title": image.section_title,
+        },
+        "media": {
+            "original_type": image.original_type,
+            "original_path": f"images/{original_name}",
+            "rendered_type": image.rendered_type,
+            "rendered_path": f"images/{rendered_name}" if image.rendered_bytes else "",
+            "render_status": image.render_status,
+            "render_error": image.render_error,
+        },
+        "ocr": {
+            "enabled": image.ocr_enabled,
+            "backend": image.ocr_backend,
+            "status": image.ocr_status,
+            "text_path": f"images/{ocr_name}" if image.ocr_text else "",
+            "text": image.ocr_text,
+            "error": image.ocr_error,
+        },
+    }
+    return entry
+
+
+def _write_images(doc_dir: Path, parsed: ParsedDocument) -> list[dict[str, Any]]:
+    if not parsed.images:
+        return []
+    images_dir = doc_dir / "images"
+    images_dir.mkdir(exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    for image in parsed.images:
+        original_name = f"{image.image_id}.original{image.original_ext or '.bin'}"
+        if image.original_bytes:
+            (images_dir / original_name).write_bytes(image.original_bytes)
+        if image.rendered_bytes:
+            rendered_name = f"{image.image_id}{image.rendered_ext or '.png'}"
+            (images_dir / rendered_name).write_bytes(image.rendered_bytes)
+        if image.ocr_text:
+            _write_text(images_dir / f"{image.image_id}.ocr.txt", image.ocr_text + "\n")
+        entries.append(_embedded_image_entry(image))
+    return entries
 
 
 def _safe_source_filename(filename: str) -> str:
@@ -3963,6 +4388,7 @@ def _doc_entry_from_manifest(docs_dir: Path, doc_id: str) -> dict[str, Any] | No
     source_file = manifest.get("source_file") or meta.get("source_file") or {}
     provenance = manifest.get("provenance") or {}
     sections = manifest.get("sections") if isinstance(manifest.get("sections"), list) else []
+    images = manifest.get("images") if isinstance(manifest.get("images"), list) else []
     parse_metadata = manifest.get("parse_metadata") if isinstance(manifest.get("parse_metadata"), dict) else {}
     summary_meta = parse_metadata.get("summary") if isinstance(parse_metadata.get("summary"), dict) else {}
     digest = ""
@@ -3983,6 +4409,7 @@ def _doc_entry_from_manifest(docs_dir: Path, doc_id: str) -> dict[str, Any] | No
         "sections": len(sections),
         "ocr_pages": meta.get("ocr_page_count", 0),
         "tables": meta.get("table_count", 0),
+        "images": len(images) if images else meta.get("image_count", 0),
         "digest": digest,
         "digest_path": f"docs/{doc_id}/digest.md",
         "tags": meta.get("tags", []),
@@ -4064,6 +4491,11 @@ def _load_parsed_document_from_storage(docs_dir: Path, doc_id: str) -> tuple[Par
                 text=text,
                 page_range=str(sec.get("page_range") or ""),
                 sid=str(sec.get("sid") or ""),
+                image_refs=[
+                    str(value)
+                    for value in sec.get("image_refs", [])
+                    if isinstance(value, str)
+                ],
             )
         )
 
@@ -4374,6 +4806,10 @@ async def api_parse_doc(
     force_ocr: bool = Form(False),
     ocr_pages: str | None = Form(None),
     extract_tables: bool = Form(True),
+    extract_images: bool = Form(False),
+    ocr_images: bool = Form(False),
+    image_ocr_backend: str = Form("auto"),
+    max_images: int = Form(200),
     max_tables_per_page: int = Form(3),
     concurrency: int = Form(3),
     tags: str | None = Form(None),  # JSON array string: '["Q3","financial"]'
@@ -4413,9 +4849,17 @@ async def api_parse_doc(
             "parse_mode": requested_parse_mode,
             "id_strategy": id_strategy,
             "skip_ocr_pages": skip_ocr_pages,
+            "extract_images": str(bool(extract_images)).lower() if extract_images else "",
+            "ocr_images": str(bool(ocr_images)).lower() if ocr_images else "",
+            "image_ocr_backend": image_ocr_backend if extract_images else "",
+            "max_images": str(max_images) if extract_images else "",
         }.items():
             if value:
                 parsed_metadata.setdefault(key, value)
+        selected_image_ocr_backend = (image_ocr_backend or "auto").strip().lower()
+        if selected_image_ocr_backend not in {"auto", "local", "llm"}:
+            raise HTTPException(422, "image_ocr_backend must be one of: auto, local, llm")
+        max_images = max(0, min(int(max_images), 1000))
         manual_blank_pages_spec = (
             _metadata_page_range_spec(skip_ocr_pages)
             or _metadata_page_range_spec(parsed_metadata.get("skip_ocr_pages"))
@@ -4513,6 +4957,10 @@ async def api_parse_doc(
                         _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path,
                         extract_tables=extract_tables,
                         profile=profile,
+                        extract_images=extract_images,
+                        ocr_images=ocr_images,
+                        image_ocr_backend=selected_image_ocr_backend,
+                        max_images=max_images,
                     ),
                 )
             elif suffix in (".xlsx", ".xls"):
@@ -4610,6 +5058,7 @@ async def api_parse_doc(
             total_pages=parsed.total_pages,
             section_count=len(parsed.sections),
             table_count=parsed.table_count,
+            image_count=len(parsed.images),
             ocr_page_count=parsed.ocr_page_count,
             digest=digest[:300],
             manifest_path=f"docs/{d_id}/manifest.json",
@@ -5024,6 +5473,51 @@ async def get_table(doc_id: str, table_id: str):
     if not p.exists():
         raise HTTPException(404, t("table_not_found", table_id=table_id))
     return {"doc_id": doc_id, "table_id": table_id, "content": p.read_text(encoding="utf-8")}
+
+
+@app.get("/library/{doc_id}/images")
+async def list_images(doc_id: str):
+    """List embedded images extracted from a document."""
+    _validate_doc_id(doc_id)
+    doc_dir = _get_docs_dir() / doc_id
+    manifest_path = doc_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
+    images_path = doc_dir / "images.json"
+    if not images_path.exists():
+        return {"doc_id": doc_id, "images": []}
+    images = json.loads(images_path.read_text(encoding="utf-8"))
+    if not isinstance(images, list):
+        raise HTTPException(500, f"images metadata unreadable for {doc_id}")
+    return {"doc_id": doc_id, "images": images}
+
+
+@app.get("/library/{doc_id}/image/{image_id}")
+async def get_image_record(doc_id: str, image_id: str):
+    """Read one embedded image metadata record and OCR text when available."""
+    _validate_doc_id(doc_id)
+    normalized_id = _normalize_image_id(image_id)
+    doc_dir = _get_docs_dir() / doc_id
+    images_path = doc_dir / "images.json"
+    if not images_path.exists():
+        raise HTTPException(404, f"images not found for {doc_id}")
+    images = json.loads(images_path.read_text(encoding="utf-8"))
+    if not isinstance(images, list):
+        raise HTTPException(500, f"images metadata unreadable for {doc_id}")
+    for image in images:
+        if not isinstance(image, dict) or image.get("image_id") != normalized_id:
+            continue
+        ocr = image.get("ocr") if isinstance(image.get("ocr"), dict) else {}
+        text_path = str(ocr.get("text_path") or "")
+        if text_path:
+            path = (doc_dir / text_path).resolve()
+            doc_root = doc_dir.resolve()
+            if path.is_relative_to(doc_root) and path.exists() and path.is_file():
+                image = dict(image)
+                image["ocr"] = dict(ocr)
+                image["ocr"]["text"] = path.read_text(encoding="utf-8")
+        return {"doc_id": doc_id, "image_id": normalized_id, "image": image}
+    raise HTTPException(404, f"image not found: {image_id}")
 
 
 @app.get("/library/{doc_id}/sections")
