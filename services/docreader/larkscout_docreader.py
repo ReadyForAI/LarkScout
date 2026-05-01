@@ -406,6 +406,10 @@ DEFERRED_SUMMARY_MAX_ATTEMPTS = max(
     1,
     int(os.environ.get("LARKSCOUT_DEFERRED_SUMMARY_MAX_ATTEMPTS", "3")),
 )
+WORD_IMAGE_OCR_MAX_IMAGES = max(
+    0,
+    int(os.environ.get("LARKSCOUT_WORD_IMAGE_OCR_MAX_IMAGES", "80")),
+)
 SUMMARY_BATCH_CONCURRENCY = max(
     1,
     int(os.environ.get("LARKSCOUT_SUMMARY_BATCH_CONCURRENCY", "1")),
@@ -2205,6 +2209,27 @@ def _word_paragraph_image_rel_ids(paragraph: ET.Element) -> list[str]:
         if rel_id and rel_id not in rel_ids:
             rel_ids.append(rel_id)
     return rel_ids
+
+
+def _count_word_embedded_image_references(filepath: Path) -> int:
+    """Count embedded Word image references that would be processed for image OCR."""
+    if filepath.suffix.lower() != ".docx":
+        return 0
+    try:
+        with zipfile.ZipFile(filepath) as zf:
+            document_xml = zf.read("word/document.xml")
+        rels = _word_image_relationships(filepath)
+        root = ET.fromstring(document_xml)
+    except Exception as exc:
+        logger.warning("Word embedded image count failed for %s: %s", filepath.name, exc)
+        return 0
+
+    count = 0
+    for paragraph in root.findall(".//w:p", WORD_XML_NS):
+        for rel_id in _word_paragraph_image_rel_ids(paragraph):
+            if rel_id in rels:
+                count += 1
+    return count
 
 
 def _render_raster_image_to_png(image_bytes: bytes) -> tuple[bytes, str]:
@@ -4810,6 +4835,7 @@ async def api_parse_doc(
     ocr_images: bool = Form(False),
     image_ocr_backend: str = Form("auto"),
     max_images: int = Form(200),
+    max_ocr_images: int = Form(WORD_IMAGE_OCR_MAX_IMAGES),
     max_tables_per_page: int = Form(3),
     concurrency: int = Form(3),
     tags: str | None = Form(None),  # JSON array string: '["Q3","financial"]'
@@ -4853,6 +4879,7 @@ async def api_parse_doc(
             "ocr_images": str(bool(ocr_images)).lower() if ocr_images else "",
             "image_ocr_backend": image_ocr_backend if extract_images else "",
             "max_images": str(max_images) if extract_images else "",
+            "max_ocr_images": str(max_ocr_images) if ocr_images else "",
         }.items():
             if value:
                 parsed_metadata.setdefault(key, value)
@@ -4860,6 +4887,7 @@ async def api_parse_doc(
         if selected_image_ocr_backend not in {"auto", "local", "llm"}:
             raise HTTPException(422, "image_ocr_backend must be one of: auto, local, llm")
         max_images = max(0, min(int(max_images), 1000))
+        max_ocr_images = max(0, min(int(max_ocr_images), 1000))
         manual_blank_pages_spec = (
             _metadata_page_range_spec(skip_ocr_pages)
             or _metadata_page_range_spec(parsed_metadata.get("skip_ocr_pages"))
@@ -4951,10 +4979,28 @@ async def api_parse_doc(
                     ),
                 )
             elif suffix in (".doc", ".docx"):
+                word_path = _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path
+                if extract_images and ocr_images:
+                    embedded_image_count = _count_word_embedded_image_references(word_path)
+                    requested_ocr_image_count = min(embedded_image_count, max_images)
+                    parsed_metadata.setdefault("embedded_image_count", embedded_image_count)
+                    parsed_metadata.setdefault("requested_ocr_image_count", requested_ocr_image_count)
+                    if requested_ocr_image_count > max_ocr_images:
+                        raise HTTPException(
+                            422,
+                            (
+                                "word embedded image OCR refused: "
+                                f"{requested_ocr_image_count} requested images exceeds "
+                                f"max_ocr_images={max_ocr_images} "
+                                f"(embedded_image_count={embedded_image_count}, max_images={max_images}). "
+                                "Retry with ocr_images=false, a higher max_ocr_images value, "
+                                "or a lower max_images value."
+                            ),
+                        )
                 parsed = await loop.run_in_executor(
                     None,
                     lambda: parse_word(
-                        _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path,
+                        word_path,
                         extract_tables=extract_tables,
                         profile=profile,
                         extract_images=extract_images,
@@ -4973,6 +5019,8 @@ async def api_parse_doc(
                 )
             else:  # .pptx, .html, .htm, etc.
                 parsed = await loop.run_in_executor(None, lambda: parse_generic(tmp_path, profile=profile))
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(500, t("parse_failed", err=str(e)))
         finally:
