@@ -151,6 +151,10 @@ GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer
 | `force_ocr`           | bool   | `false`    | 强制使用 LLM OCR 处理全部页面；成本较高，只在明确需要视觉模型重识别整份文档时使用 |
 | `ocr_pages`           | string | null       | 指定页范围升级为 LLM OCR，例如 `"10-30"`；未指定页仍按服务端自动策略处理 |
 | `extract_tables`      | bool   | `true`     | 是否提取表格 |
+| `extract_images`      | bool   | `false`    | 是否抽取 Word 内嵌图片并输出 `images.json` / `images/` |
+| `ocr_images`          | bool   | `false`    | 是否对已抽取的 Word 内嵌图片做 OCR |
+| `image_ocr_backend`   | string | `auto`     | 图片 OCR 后端：`auto` / `local` / `llm`；`auto` 为本地优先，失败后局部 LLM OCR |
+| `max_images`          | int    | `200`      | 单文档最多处理的内嵌图片数量 |
 | `max_tables_per_page` | int    | `3`        | 每页最多提取的表格数量 |
 | `concurrency`         | int    | `3`        | OCR/摘要并发度 |
 | `tags`                | string | null       | 标签，支持 JSON 数组（`'["Q3","financial"]'`）或逗号分隔（`"Q3,financial"`） |
@@ -167,6 +171,22 @@ curl -X POST http://localhost:9898/doc/parse \
 ```
 
 调用方不需要依赖 Python SDK；可以直接用 `curl` 调 LarkScout 入库。LarkScout 只负责底层解析、索引和来源保留；具体业务场景、业务字段、命名规则和后续操作由上层调用方自行定义。
+
+Word 内嵌图片识别的通用入库示例：
+
+```bash
+curl -X POST http://localhost:9898/doc/parse \
+  -F "file=@/path/to/document.docx" \
+  -F "summary_mode=defer" \
+  -F "id_strategy=source_filename" \
+  -F "extract_tables=true" \
+  -F "extract_images=true" \
+  -F "ocr_images=true" \
+  -F "image_ocr_backend=auto" \
+  -F 'metadata={"display_name":"document.docx","source_system":"agent_upload"}'
+```
+
+该能力只输出图片来源、附近标题、section 锚点、图片文件和 OCR 文本；图片代表什么材料、是否满足业务要求，由上层工具自行判断。
 
 带 metadata 的通用入库示例：
 
@@ -358,11 +378,18 @@ table_id 格式：`"01"` 或 `"table-01"`。
 
 响应：`{"doc_id": "DOC-010", "table_id": "01", "content": "# Table 1 (Page 5)\n\n| ... |"}`
 
-### 4.11 获取 Manifest
+### 4.11 读取 Word 内嵌图片结果
+
+- `GET /doc/library/{doc_id}/images`
+- `GET /doc/library/{doc_id}/image/{image_id}`
+
+只有调用 `/doc/parse` 时设置 `extract_images=true` 才会产生结果。`image_id` 格式为 `"001"` 或 `"IMG-001"`。
+
+### 4.12 获取 Manifest
 
 - `GET /doc/library/{doc_id}/manifest`
 
-返回完整的 `manifest.json` 内容，包括文档结构、section 列表、路径信息、metadata、source 文件引用和 provenance。
+返回完整的 `manifest.json` 内容，包括文档结构、section 列表、图片/表格路径信息、metadata、source 文件引用和 provenance。
 
 ---
 
@@ -385,9 +412,14 @@ docs/
   │   ├─ sections/               ← 按章节切分的文件
   │   │   ├─ 01-{sid}-{title}.md
   │   │   └─ 02-{sid}-{title}.md
-  │   └─ tables/                 ← 提取出的表格
-  │       ├─ table-01.md
-  │       └─ table-02.md
+  │   ├─ tables/                 ← 提取出的表格
+  │   │   ├─ table-01.md
+  │   │   └─ table-02.md
+  │   ├─ images.json             ← Word 内嵌图片的锚点、文件和 OCR 元数据
+  │   └─ images/                 ← Word 内嵌图片原图、渲染图和 OCR 文本
+  │       ├─ IMG-001.original.png
+  │       ├─ IMG-001.png
+  │       └─ IMG-001.ocr.txt
   │
   └─ WEB-001/                    ← 网页抓取结果（由 LarkScout Browser 写入，共享索引）
       ├─ manifest.json
