@@ -4,8 +4,8 @@ from services.docreader.larkscout_docreader import (
     Section,
     _load_document_profile,
     _parsed_document_locale,
-    _summary_placeholder_text,
     _split_sections,
+    _summary_placeholder_text,
     generate_summaries,
 )
 

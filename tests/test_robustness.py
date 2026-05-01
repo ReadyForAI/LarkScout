@@ -336,7 +336,11 @@ class TestPDFParse:
 
         sections = _split_sections_from_toc(pages, toc)
 
-        assert [section.title for section in sections] == ["1.1项目概况", "2.1基本资质要求"]
+        assert [section.title for section in sections] == [
+            "1.1项目概况",
+            "1.2招标依据",
+            "2.1基本资质要求",
+        ]
         assert len({section.text for section in sections}) == len(sections)
 
     def test_long_document_summary_skips_per_section_llm_calls(self, monkeypatch):
@@ -433,8 +437,9 @@ class TestPDFParse:
         assert _strip_section_storage_wrapper(raw) == "正文内容"
 
     def test_pdf_page_ranges_are_not_collapsed_to_page_one(self):
-        from fixtures.generate_fixtures import generate_pdf
         from larkscout_docreader import _page_bounds, parse_pdf
+
+        from tests.e2e.fixtures.generate_fixtures import generate_pdf
 
         with tempfile.TemporaryDirectory() as tmp:
             path = generate_pdf(Path(tmp) / "sample.pdf")
@@ -772,6 +777,12 @@ class TestPDFParse:
 
         assert len(sections) == 1
         assert "2.碎片标题" in sections[0].text
+
+    def test_is_ocr_failed_text_accepts_chinese_placeholder(self):
+        from larkscout_docreader import _is_ocr_failed_text
+
+        assert _is_ocr_failed_text("[OCR failed: page 1]")
+        assert _is_ocr_failed_text("[OCR 失败: 第 1 页]")
 
     def test_split_sections_does_not_treat_account_number_as_heading(self):
         from larkscout_docreader import PageContent, _split_sections
