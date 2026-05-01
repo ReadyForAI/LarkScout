@@ -316,7 +316,10 @@ def gemini_ocr(image_bytes: bytes, page_num: int, *, proofread: bool | None = No
 
 
 def _is_ocr_failed_text(text: str | None) -> bool:
-    return bool(text and text.strip().startswith("[OCR failed"))
+    if not text:
+        return False
+    value = text.strip()
+    return value.startswith("[OCR failed") or value.startswith("[OCR 失败")
 
 
 def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
@@ -2605,7 +2608,7 @@ def _renumber_sections(sections: list[Section]) -> list[Section]:
 def _merge_short_ocr_sections(sections: list[Section], *, min_chars: int = 20) -> list[Section]:
     merged: list[Section] = []
     for sec in sections:
-        if merged and sec.level > 1 and len(sec.text.strip()) < min_chars:
+        if merged and len(sec.text.strip()) < min_chars:
             previous = merged[-1]
             parts = [previous.text.rstrip(), sec.title.strip(), sec.text.strip()]
             previous.text = "\n".join(part for part in parts if part).strip()
