@@ -95,10 +95,18 @@ def test_extract_word_embedded_images_keeps_generic_anchor(tmp_path, monkeypatch
     image = images[0]
     assert image.image_id == "IMG-001"
     assert image.near_heading == "学历证明"
+    assert "以下图片为证明材料" in image.context_text
     assert image.anchor_sid == "s-proof"
     assert image.section_title == "学历证明"
     assert image.original_type == "image/png"
     assert image.render_status == "ok"
+    assert image.width == 80
+    assert image.height == 32
+    assert image.original_size_bytes == image_path.stat().st_size
+    assert len(image.original_sha256) == 64
+    assert len(image.average_hash) == 16
+    assert image.context_keywords == ["education_certificate"]
+    assert "personnel_material_candidate" in image.inventory_hints
     assert image.ocr_status == "ok"
     assert image.ocr_text == "普通高等学校毕业证书"
     assert sections[0].image_refs == ["IMG-001"]
@@ -217,6 +225,24 @@ def test_parse_allows_word_image_ocr_when_max_images_keeps_request_under_thresho
     assert resp.status_code == 200
     body = resp.json()
     assert body["image_count"] == 1
+    manifest = json.loads(
+        (tmp_path / "docs" / body["doc_id"] / "manifest.json").read_text(encoding="utf-8")
+    )
+    word_images = manifest["parse_metadata"]["word_images"]
+    assert word_images["embedded_image_count"] == 3
+    assert word_images["max_images"] == 1
+    assert word_images["extracted"] == 1
+    assert word_images["truncated"] is True
+    assert manifest["metadata"]["embedded_image_count"] == 3
+    assert manifest["metadata"]["requested_image_count"] == 1
+    assert manifest["metadata"]["requested_ocr_image_count"] == 1
+    assert manifest["metadata"]["image_inventory_truncated"] is True
+    assert manifest["images"][0]["inventory"]["width"] == 80
+    assert manifest["images"][0]["inventory"]["height"] == 32
+    assert manifest["images"][0]["inventory"]["context_keywords"] == [
+        "education_certificate"
+    ]
+    assert "以下图片为证明材料" in manifest["images"][0]["anchor"]["context_text"]
 
 
 def test_write_output_extract_only_writes_image_artifacts(tmp_path):
@@ -251,15 +277,26 @@ def test_write_output_extract_only_writes_image_artifacts(tmp_path):
                 media_path="word/media/image1.png",
                 relationship_id="rId9",
                 paragraph_index=3,
+                context_text="证明材料上下文",
                 near_heading="证明材料",
                 anchor_sid="s-proof",
                 section_title="证明材料",
                 original_ext=".png",
                 original_type="image/png",
                 original_bytes=png_bytes,
+                original_size_bytes=len(png_bytes),
+                original_sha256="abc123",
                 rendered_ext=".png",
                 rendered_type="image/png",
                 rendered_bytes=png_bytes,
+                rendered_size_bytes=len(png_bytes),
+                rendered_sha256="def456",
+                width=80,
+                height=32,
+                aspect_ratio=2.5,
+                average_hash="ffffffffffffffff",
+                context_keywords=["education_certificate"],
+                inventory_hints=["personnel_material_candidate"],
                 render_status="ok",
                 ocr_enabled=True,
                 ocr_backend="local-paddleocr",
@@ -284,6 +321,10 @@ def test_write_output_extract_only_writes_image_artifacts(tmp_path):
     assert manifest["sections"][0]["image_refs"] == ["IMG-001"]
     assert manifest["images"][0]["image_id"] == "IMG-001"
     assert images[0]["ocr"]["text"] == "证书 OCR 文本"
+    assert images[0]["inventory"]["width"] == 80
+    assert images[0]["anchor"]["context_text"] == "证明材料上下文"
+    assert images[0]["inventory"]["context_keywords"] == ["education_certificate"]
+    assert images[0]["inventory"]["hints"] == ["personnel_material_candidate"]
     assert (doc_dir / "images" / "IMG-001.original.png").exists()
     assert (doc_dir / "images" / "IMG-001.png").exists()
     assert (doc_dir / "images" / "IMG-001.ocr.txt").read_text(encoding="utf-8").strip() == "证书 OCR 文本"

@@ -200,15 +200,26 @@ class EmbeddedImage:
     relationship_id: str
     paragraph_index: int
     paragraph_text: str = ""
+    context_text: str = ""
     near_heading: str = ""
     anchor_sid: str = ""
     section_title: str = ""
     original_ext: str = ""
     original_type: str = ""
     original_bytes: bytes = b""
+    original_size_bytes: int = 0
+    original_sha256: str = ""
     rendered_ext: str = ""
     rendered_type: str = ""
     rendered_bytes: bytes = b""
+    rendered_size_bytes: int = 0
+    rendered_sha256: str = ""
+    width: int = 0
+    height: int = 0
+    aspect_ratio: float = 0.0
+    average_hash: str = ""
+    context_keywords: list[str] = field(default_factory=list)
+    inventory_hints: list[str] = field(default_factory=list)
     render_status: str = "not_rendered"
     render_error: str = ""
     ocr_enabled: bool = False
@@ -2146,6 +2157,22 @@ _IMAGE_MIME_BY_EXT = {
     ".wmf": "image/x-wmf",
 }
 
+_IMAGE_CONTEXT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("business_license", ("营业执照", "统一社会信用代码", "business license")),
+    ("id_card", ("身份证", "居民身份证", "identity card", "id card")),
+    ("education_certificate", ("学历", "毕业证", "毕业证书", "学信网", "电子注册备案表")),
+    ("degree_certificate", ("学位证", "学位证书")),
+    (
+        "personnel_certificate",
+        ("项目经理证书", "人员证书", "人员资质", "PMP", "信息系统项目管理师", "系统集成项目管理工程师", "软考"),
+    ),
+    ("certificate", ("证书", "资质", "认证")),
+    ("contract_copy", ("合同复印件", "合同案例", "类似案例", "业绩证明", "协议复印件")),
+    ("financial_statement", ("财务报表", "审计报告", "资产负债表", "利润表", "现金流量表")),
+    ("product_screenshot", ("产品截图", "系统截图", "功能截图", "界面截图", "截图")),
+    ("seal_or_signature", ("签字", "签章", "盖章", "公章", "印章")),
+)
+
 
 def _word_rel_target_to_package_path(target: str) -> str:
     clean = target.replace("\\", "/").strip()
@@ -2209,6 +2236,20 @@ def _word_paragraph_image_rel_ids(paragraph: ET.Element) -> list[str]:
         if rel_id and rel_id not in rel_ids:
             rel_ids.append(rel_id)
     return rel_ids
+
+
+def _word_image_context_text(
+    paragraph_texts: list[str],
+    paragraph_index: int,
+    *,
+    before: int = 4,
+    after: int = 3,
+    max_chars: int = 1200,
+) -> str:
+    start = max(0, paragraph_index - before)
+    end = min(len(paragraph_texts), paragraph_index + after + 1)
+    parts = [text for text in paragraph_texts[start:end] if text]
+    return "\n".join(parts)[:max_chars]
 
 
 def _count_word_embedded_image_references(filepath: Path) -> int:
@@ -2281,6 +2322,99 @@ def _render_embedded_image(image_bytes: bytes, original_ext: str) -> tuple[bytes
     raise RuntimeError(f"unsupported embedded image format: {ext or 'unknown'}")
 
 
+def _image_dimensions(image_bytes: bytes) -> tuple[int, int]:
+    if not image_bytes:
+        return 0, 0
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return int(img.width), int(img.height)
+    except Exception:
+        return 0, 0
+
+
+def _image_average_hash(image_bytes: bytes, hash_size: int = 8) -> str:
+    if not image_bytes:
+        return ""
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = img.convert("L").resize((hash_size, hash_size))
+            pixels = list(img.tobytes())
+    except Exception:
+        return ""
+    if not pixels:
+        return ""
+    avg = sum(pixels) / len(pixels)
+    bits = "".join("1" if px >= avg else "0" for px in pixels)
+    return f"{int(bits, 2):0{hash_size * hash_size // 4}x}"
+
+
+def _extract_image_context_keywords(*texts: str) -> list[str]:
+    haystack = "\n".join(text for text in texts if text).lower()
+    if not haystack:
+        return []
+    keywords: list[str] = []
+    for key, aliases in _IMAGE_CONTEXT_KEYWORDS:
+        if any(alias.lower() in haystack for alias in aliases):
+            keywords.append(key)
+    return keywords
+
+
+def _inventory_hints_for_image(image: EmbeddedImage) -> list[str]:
+    hints: list[str] = []
+    area = image.width * image.height
+    ratio = image.aspect_ratio
+    keyword_set = set(image.context_keywords)
+
+    if image.render_status == "failed":
+        hints.append("render_failed")
+    if image.render_status == "ok" and area > 0:
+        if area < 20_000:
+            hints.append("small_image")
+        if image.width >= 900 and image.height >= 500 and 1.2 <= ratio <= 2.4:
+            hints.append("screenshot_like")
+        if image.height >= 900 and 0.55 <= ratio <= 1.15:
+            hints.append("document_scan_like")
+
+    for key in sorted(keyword_set):
+        hints.append(f"context:{key}")
+    if {"education_certificate", "degree_certificate"} & keyword_set:
+        hints.append("personnel_material_candidate")
+    if {"business_license", "id_card", "personnel_certificate", "certificate"} & keyword_set:
+        hints.append("certificate_or_identity_candidate")
+    if "contract_copy" in keyword_set:
+        hints.append("case_contract_candidate")
+    if "financial_statement" in keyword_set:
+        hints.append("financial_material_candidate")
+    if "product_screenshot" in keyword_set:
+        hints.append("product_screenshot_candidate")
+    return list(dict.fromkeys(hints))
+
+
+def _populate_embedded_image_inventory(image: EmbeddedImage) -> None:
+    image.original_size_bytes = len(image.original_bytes)
+    image.original_sha256 = (
+        hashlib.sha256(image.original_bytes).hexdigest() if image.original_bytes else ""
+    )
+    image.rendered_size_bytes = len(image.rendered_bytes)
+    image.rendered_sha256 = (
+        hashlib.sha256(image.rendered_bytes).hexdigest() if image.rendered_bytes else ""
+    )
+    image.width, image.height = _image_dimensions(image.rendered_bytes or image.original_bytes)
+    image.aspect_ratio = round(image.width / image.height, 4) if image.height else 0.0
+    image.average_hash = _image_average_hash(image.rendered_bytes or image.original_bytes)
+    image.context_keywords = _extract_image_context_keywords(
+        image.near_heading,
+        image.paragraph_text,
+        image.context_text,
+        image.section_title,
+    )
+    image.inventory_hints = _inventory_hints_for_image(image)
+
+
 def _ocr_embedded_image(image: EmbeddedImage, backend: str) -> tuple[str, str, str, str]:
     selected = (backend or "auto").strip().lower()
     if selected not in {"auto", "local", "llm"}:
@@ -2344,11 +2478,12 @@ def _extract_word_embedded_images(
             rels = _word_image_relationships(filepath)
             root = ET.fromstring(document_xml)
             paragraphs = root.findall(".//w:p", WORD_XML_NS)
+            paragraph_texts = [_word_paragraph_text(paragraph) for paragraph in paragraphs]
             images: list[EmbeddedImage] = []
             current_heading = ""
 
             for paragraph_index, paragraph in enumerate(paragraphs, 1):
-                paragraph_text = _word_paragraph_text(paragraph)
+                paragraph_text = paragraph_texts[paragraph_index - 1]
                 heading_level = _word_heading_level(paragraph_text, _word_paragraph_style(paragraph))
                 if paragraph_text and heading_level > 0:
                     current_heading = _strip_heading_markup(paragraph_text)
@@ -2372,6 +2507,9 @@ def _extract_word_embedded_images(
                         relationship_id=rel_id,
                         paragraph_index=paragraph_index,
                         paragraph_text=paragraph_text,
+                        context_text=_word_image_context_text(
+                            paragraph_texts, paragraph_index - 1
+                        ),
                         near_heading=current_heading,
                         original_ext=original_ext,
                         original_type=_IMAGE_MIME_BY_EXT.get(
@@ -2408,6 +2546,8 @@ def _extract_word_embedded_images(
         return []
 
     _anchor_word_images_to_sections(images, sections)
+    for image in images:
+        _populate_embedded_image_inventory(image)
     return images
 
 
@@ -2431,6 +2571,7 @@ def parse_word(
         sec.sid = _section_sid(sec.title, sec.text)
 
     table_count = _count_markdown_tables(markdown_text) if extract_tables else 0
+    embedded_image_count = _count_word_embedded_image_references(filepath) if extract_images else 0
     images = (
         _extract_word_embedded_images(
             filepath,
@@ -2461,7 +2602,10 @@ def parse_word(
                 "extract_enabled": bool(extract_images),
                 "ocr_enabled": bool(ocr_images),
                 "ocr_backend": image_ocr_backend if ocr_images else "",
+                "embedded_image_count": embedded_image_count,
+                "max_images": max(0, int(max_images or 0)),
                 "extracted": len(images),
+                "truncated": bool(extract_images and embedded_image_count > len(images)),
                 "render_ok": sum(1 for image in images if image.render_status == "ok"),
                 "render_failed": sum(1 for image in images if image.render_status == "failed"),
                 "ocr_ok": sum(1 for image in images if image.ocr_status == "ok"),
@@ -4311,6 +4455,7 @@ def _embedded_image_entry(image: EmbeddedImage) -> dict[str, Any]:
             "anchor_sid": image.anchor_sid,
             "near_heading": image.near_heading,
             "near_text": image.paragraph_text,
+            "context_text": image.context_text,
             "section_title": image.section_title,
         },
         "media": {
@@ -4320,6 +4465,18 @@ def _embedded_image_entry(image: EmbeddedImage) -> dict[str, Any]:
             "rendered_path": f"images/{rendered_name}" if image.rendered_bytes else "",
             "render_status": image.render_status,
             "render_error": image.render_error,
+        },
+        "inventory": {
+            "width": image.width,
+            "height": image.height,
+            "aspect_ratio": image.aspect_ratio,
+            "original_size_bytes": image.original_size_bytes,
+            "rendered_size_bytes": image.rendered_size_bytes,
+            "original_sha256": image.original_sha256,
+            "rendered_sha256": image.rendered_sha256,
+            "average_hash": image.average_hash,
+            "context_keywords": list(image.context_keywords),
+            "hints": list(image.inventory_hints),
         },
         "ocr": {
             "enabled": image.ocr_enabled,
@@ -4980,12 +5137,20 @@ async def api_parse_doc(
                 )
             elif suffix in (".doc", ".docx"):
                 word_path = _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path
-                if extract_images and ocr_images:
+                if extract_images:
                     embedded_image_count = _count_word_embedded_image_references(word_path)
                     requested_ocr_image_count = min(embedded_image_count, max_images)
                     parsed_metadata.setdefault("embedded_image_count", embedded_image_count)
-                    parsed_metadata.setdefault("requested_ocr_image_count", requested_ocr_image_count)
-                    if requested_ocr_image_count > max_ocr_images:
+                    parsed_metadata.setdefault("requested_image_count", requested_ocr_image_count)
+                    parsed_metadata.setdefault(
+                        "image_inventory_truncated",
+                        bool(embedded_image_count > requested_ocr_image_count),
+                    )
+                    if ocr_images:
+                        parsed_metadata.setdefault(
+                            "requested_ocr_image_count", requested_ocr_image_count
+                        )
+                    if ocr_images and requested_ocr_image_count > max_ocr_images:
                         raise HTTPException(
                             422,
                             (
