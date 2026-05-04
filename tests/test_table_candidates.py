@@ -191,3 +191,111 @@ def test_write_tables_emits_structured_table_sidecar(tmp_path):
     assert entries[0]["ocr_block_refs"] == ["p1-b0001", "p1-b0002", "p1-b0003", "p1-b0004"]
     assert "| 品名 | 金额 |" in table_md
     assert table_json["rows"][1]["cells"][1]["text"] == "100"
+
+
+def test_write_tables_links_cross_page_continuation(tmp_path):
+    import json
+
+    from larkscout_docreader import (
+        OCRBlocksSidecar,
+        OCRPageBlocks,
+        ParsedDocument,
+        _write_tables,
+    )
+
+    parsed = ParsedDocument(
+        filename="scan.pdf",
+        file_type="pdf",
+        total_pages=2,
+        pages=[],
+        sections=[],
+        ocr_page_count=2,
+        table_count=0,
+        ocr_blocks=OCRBlocksSidecar(
+            doc_id="DOC-006",
+            pages=(
+                OCRPageBlocks(
+                    page=1,
+                    width=1000,
+                    height=1000,
+                    blocks=(
+                        _block("p1-b0001", "品名", (100, 740, 180, 760)),
+                        _block("p1-b0002", "金额", (300, 740, 360, 760)),
+                        _block("p1-b0003", "软件", (100, 780, 180, 800)),
+                        _block("p1-b0004", "100", (300, 780, 360, 800)),
+                    ),
+                ),
+                OCRPageBlocks(
+                    page=2,
+                    width=1000,
+                    height=1000,
+                    blocks=(
+                        _block("p2-b0001", "品名", (100, 80, 180, 100)),
+                        _block("p2-b0002", "金额", (300, 80, 360, 100)),
+                        _block("p2-b0003", "服务", (100, 120, 180, 140)),
+                        _block("p2-b0004", "200", (300, 120, 360, 140)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    entries = _write_tables(tmp_path, parsed)
+
+    table_1_json = json.loads((tmp_path / "tables" / "table-01.json").read_text(encoding="utf-8"))
+    table_2_json = json.loads((tmp_path / "tables" / "table-02.json").read_text(encoding="utf-8"))
+    assert entries[0]["continued_to"] == "table-02"
+    assert entries[1]["continued_from"] == "table-01"
+    assert table_1_json["continued_to"] == "table-02"
+    assert table_2_json["continued_from"] == "table-01"
+
+
+def test_write_tables_does_not_link_unrelated_adjacent_tables(tmp_path):
+    from larkscout_docreader import (
+        OCRBlocksSidecar,
+        OCRPageBlocks,
+        ParsedDocument,
+        _write_tables,
+    )
+
+    parsed = ParsedDocument(
+        filename="scan.pdf",
+        file_type="pdf",
+        total_pages=2,
+        pages=[],
+        sections=[],
+        ocr_page_count=2,
+        table_count=0,
+        ocr_blocks=OCRBlocksSidecar(
+            doc_id="DOC-007",
+            pages=(
+                OCRPageBlocks(
+                    page=1,
+                    width=1000,
+                    height=1000,
+                    blocks=(
+                        _block("p1-b0001", "品名", (100, 100, 180, 120)),
+                        _block("p1-b0002", "金额", (300, 100, 360, 120)),
+                        _block("p1-b0003", "软件", (100, 140, 180, 160)),
+                        _block("p1-b0004", "100", (300, 140, 360, 160)),
+                    ),
+                ),
+                OCRPageBlocks(
+                    page=2,
+                    width=1000,
+                    height=1000,
+                    blocks=(
+                        _block("p2-b0001", "条款", (100, 100, 180, 120)),
+                        _block("p2-b0002", "日期", (300, 100, 360, 120)),
+                        _block("p2-b0003", "付款", (100, 140, 180, 160)),
+                        _block("p2-b0004", "2026", (300, 140, 360, 160)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    entries = _write_tables(tmp_path, parsed)
+
+    assert entries[0]["continued_to"] is None
+    assert entries[1]["continued_from"] is None
