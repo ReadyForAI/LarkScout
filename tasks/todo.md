@@ -149,16 +149,16 @@ AC:
 
 ### P1.6 Visual Debug Artifact
 
-- [ ] Task: Add optional annotated visual debug output for OCR blocks and tables.
+- [x] Task: Add optional annotated visual debug output for OCR blocks and tables.
 
 说明:
 Borrow the OpenDataLoader idea of visual structure verification. A developer should be able to see detected blocks, table regions, and cell boxes overlaid on page images.
 
 AC:
-- [ ] Debug output is opt-in.
-- [ ] Annotated output marks OCR blocks and table regions distinctly.
-- [ ] Debug artifact location is recorded in metadata when generated.
-- [ ] Debug output is not returned by default APIs.
+- [x] Debug output is opt-in.
+- [x] Annotated output marks OCR blocks and table regions distinctly.
+- [x] Debug artifact location is recorded in metadata when generated.
+- [x] Debug output is not returned by default APIs.
 
 ### P1.7 API Discovery Endpoints
 
@@ -347,3 +347,16 @@ AC:
   - `.venv/bin/pytest tests/test_region_crop_export.py -q`: 6 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
   - `.venv/bin/pytest`: 242 passed, 15 skipped.
+
+### P1.6 Visual Debug Artifact
+
+- Branch: `task/p1-6-visual-debug-artifact`
+- Implementation:
+  - Added opt-in `generate_visual_debug_artifacts` for annotated page PNGs.
+  - Marked OCR blocks with blue rectangles and table regions with translucent orange rectangles.
+  - Wrote debug images and `derived/debug/manifest.json` with artifact locations, legend, options, and page counts.
+  - Kept default document manifest/API output unchanged unless the helper is explicitly invoked.
+- Verification:
+  - `.venv/bin/pytest tests/test_region_crop_export.py -q`: 7 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
+  - `.venv/bin/pytest`: 243 passed, 15 skipped.
