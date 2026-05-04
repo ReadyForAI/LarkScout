@@ -83,16 +83,16 @@ AC:
 
 ### P1.1 Scanned Table Candidate Detection
 
-- [ ] Task: Detect table-like regions from OCR block geometry.
+- [x] Task: Detect table-like regions from OCR block geometry.
 
 说明:
 Use generic layout signals such as repeated x positions, aligned y bands, dense numeric/text grids, and optional line/border evidence. Keep the detector document-agnostic.
 
 AC:
-- [ ] Detector returns candidate table regions with page, bbox, confidence, and block refs.
-- [ ] Candidate detection does not create business-specific table labels.
-- [ ] Non-table paragraphs and section headings are not over-classified in basic samples.
-- [ ] Detection output can be disabled or kept sidecar-only.
+- [x] Detector returns candidate table regions with page, bbox, confidence, and block refs.
+- [x] Candidate detection does not create business-specific table labels.
+- [x] Non-table paragraphs and section headings are not over-classified in basic samples.
+- [x] Detection output can be disabled or kept sidecar-only.
 
 ### P1.2 Reconstruct Rows and Columns
 
@@ -284,3 +284,15 @@ AC:
   - `.venv/bin/pytest tests/test_table_metadata.py tests/test_schema_consistency.py -q`: 21 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py -q`: 34 passed.
   - `.venv/bin/pytest`: 229 passed, 15 skipped.
+
+### P1.1 Scanned Table Candidate Detection
+
+- Branch: `task/p1-1-scanned-table-candidates`
+- Implementation:
+  - Added a conservative OCR geometry detector that clusters blocks into rows and x-position columns.
+  - Detector returns generic candidates with page, bbox, row/column counts, confidence, source, and OCR block refs.
+  - Detector is helper-only and sidecar-compatible; it is not wired into default APIs.
+- Verification:
+  - `.venv/bin/pytest tests/test_table_candidates.py tests/test_table_metadata.py -q`: 10 passed.
+  - `.venv/bin/pytest tests/test_layout_sidecar_contract.py -q`: 11 passed.
+  - `.venv/bin/pytest`: 232 passed, 15 skipped.

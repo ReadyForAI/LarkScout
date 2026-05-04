@@ -4,6 +4,8 @@
 # dependencies = ["markitdown[pdf,docx,pptx,xlsx,xls]", "pymupdf", "google-genai", "Pillow", "fastapi", "uvicorn", "python-multipart", "paddleocr", "paddlepaddle"]
 # ///
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import hashlib
@@ -165,6 +167,101 @@ def _markdown_table_dimensions(table_md: str) -> dict[str, Any]:
         "header_rows": header_rows,
         "has_header": bool(header_rows),
     }
+
+
+def _median(values: list[float], default: float = 0.0) -> float:
+    if not values:
+        return default
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _cluster_ocr_blocks_into_rows(
+    blocks: list[OCRTextBlock],
+    y_tolerance: float,
+) -> list[list[OCRTextBlock]]:
+    rows: list[list[OCRTextBlock]] = []
+    row_centers: list[float] = []
+    for block in sorted(blocks, key=lambda b: ((b.bbox[1] + b.bbox[3]) / 2, b.bbox[0])):
+        center_y = (block.bbox[1] + block.bbox[3]) / 2
+        matched_index: int | None = None
+        for idx, row_center in enumerate(row_centers):
+            if abs(center_y - row_center) <= y_tolerance:
+                matched_index = idx
+                break
+        if matched_index is None:
+            rows.append([block])
+            row_centers.append(center_y)
+            continue
+        rows[matched_index].append(block)
+        row_centers[matched_index] = (
+            row_centers[matched_index] * (len(rows[matched_index]) - 1) + center_y
+        ) / len(rows[matched_index])
+    return [sorted(row, key=lambda b: b.bbox[0]) for row in rows]
+
+
+def _count_x_clusters(blocks: list[OCRTextBlock], x_tolerance: float) -> int:
+    clusters: list[float] = []
+    for block in sorted(blocks, key=lambda b: b.bbox[0]):
+        x0 = block.bbox[0]
+        for idx, cluster_x in enumerate(clusters):
+            if abs(x0 - cluster_x) <= x_tolerance:
+                clusters[idx] = (cluster_x + x0) / 2
+                break
+        else:
+            clusters.append(x0)
+    return len(clusters)
+
+
+def _detect_table_candidates_from_ocr_blocks(
+    sidecar: OCRBlocksSidecar,
+    *,
+    min_rows: int = 2,
+    min_columns: int = 2,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for page in sidecar.pages:
+        blocks = [
+            block
+            for block in page.blocks
+            if block.text.strip() and (block.bbox[2] > block.bbox[0]) and (block.bbox[3] > block.bbox[1])
+        ]
+        if len(blocks) < min_rows * min_columns:
+            continue
+        heights = [block.bbox[3] - block.bbox[1] for block in blocks]
+        widths = [block.bbox[2] - block.bbox[0] for block in blocks]
+        rows = _cluster_ocr_blocks_into_rows(blocks, y_tolerance=max(8.0, _median(heights, 12.0) * 0.75))
+        valid_rows = [row for row in rows if len(row) >= min_columns]
+        if len(valid_rows) < min_rows:
+            continue
+        candidate_blocks = [block for row in valid_rows for block in row]
+        column_count = _count_x_clusters(
+            candidate_blocks,
+            x_tolerance=max(12.0, _median(widths, 40.0) * 0.35),
+        )
+        if column_count < min_columns:
+            continue
+        xs0 = [block.bbox[0] for block in candidate_blocks]
+        ys0 = [block.bbox[1] for block in candidate_blocks]
+        xs1 = [block.bbox[2] for block in candidate_blocks]
+        ys1 = [block.bbox[3] for block in candidate_blocks]
+        avg_confidence = sum(block.confidence for block in candidate_blocks) / len(candidate_blocks)
+        candidates.append(
+            {
+                "candidate_id": f"p{page.page}-tc{len(candidates) + 1:04d}",
+                "page": page.page,
+                "bbox": [min(xs0), min(ys0), max(xs1), max(ys1)],
+                "row_count": len(valid_rows),
+                "column_count": column_count,
+                "confidence": round(avg_confidence, 4),
+                "source": "ocr_geometry",
+                "ocr_block_refs": [block.block_id for block in candidate_blocks],
+            }
+        )
+    return candidates
 
 
 def _detect_text_locale(text: str) -> str:
