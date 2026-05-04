@@ -162,16 +162,16 @@ AC:
 
 ### P1.7 API Discovery Endpoints
 
-- [ ] Task: Expose low-token discovery for layout and table sidecars.
+- [x] Task: Expose low-token discovery for layout and table sidecars.
 
 说明:
 Consumers need to discover available sidecars and request specific artifacts without pulling large payloads by default.
 
 AC:
-- [ ] Existing digest, brief, full, sections, section, table, and manifest APIs remain compatible.
-- [ ] New layout/table sidecar access is explicit and bounded.
-- [ ] Large geometry payloads require targeted calls or local file access.
-- [ ] Response sizes remain stable for default endpoints.
+- [x] Existing digest, brief, full, sections, section, table, and manifest APIs remain compatible.
+- [x] New layout/table sidecar access is explicit and bounded.
+- [x] Large geometry payloads require targeted calls or local file access.
+- [x] Response sizes remain stable for default endpoints.
 
 ### P2.1 OpenDataLoader Comparative Spike
 
@@ -360,3 +360,16 @@ AC:
   - `.venv/bin/pytest tests/test_region_crop_export.py -q`: 7 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
   - `.venv/bin/pytest`: 243 passed, 15 skipped.
+
+### P1.7 API Discovery Endpoints
+
+- Branch: `task/p1-7-sidecar-discovery-api`
+- Implementation:
+  - Added `GET /library/{doc_id}/sidecars` for low-token sidecar discovery.
+  - Added bounded layout endpoints for page summaries and one-page OCR geometry retrieval.
+  - Added explicit structured table JSON endpoint without changing Markdown table access.
+  - Kept default manifest, digest, brief, full, section, and table responses compatible.
+- Verification:
+  - `.venv/bin/pytest tests/test_library_endpoints.py::TestLibrarySidecars -q`: 2 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 50 passed.
+  - `.venv/bin/pytest`: 245 passed, 15 skipped.
