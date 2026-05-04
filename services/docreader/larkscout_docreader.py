@@ -163,6 +163,7 @@ def _markdown_table_dimensions(table_md: str) -> dict[str, Any]:
         "row_count": len(content_rows),
         "column_count": max((len(row) for row in content_rows), default=0),
         "header_rows": header_rows,
+        "has_header": bool(header_rows),
     }
 
 
@@ -4621,6 +4622,7 @@ def _build_table_entries(parsed: ParsedDocument) -> list[dict[str, Any]]:
                 "row_count": dimensions["row_count"],
                 "column_count": dimensions["column_count"],
                 "header_rows": dimensions["header_rows"],
+                "has_header": dimensions["has_header"],
                 "source": "ocr",
                 "continued_from": None,
                 "continued_to": None,
