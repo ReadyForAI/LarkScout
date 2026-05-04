@@ -305,6 +305,7 @@ class ParsedDocument:
     table_count: int = 0
     images: list[EmbeddedImage] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    ocr_blocks: OCRBlocksSidecar | None = None
 
 
 @dataclass(frozen=True)
@@ -778,10 +779,51 @@ def _get_local_ocr_worker() -> subprocess.Popen[str]:
         _local_ocr_worker_initializing.clear()
 
 
-def local_ocr(image_bytes: bytes, page_num: int, backend: str) -> str:
+def _ocr_page_blocks_from_worker_response(
+    page_num: int,
+    response: dict[str, Any],
+    source: str,
+) -> OCRPageBlocks | None:
+    raw_blocks = response.get("blocks")
+    if not isinstance(raw_blocks, list):
+        return None
+    blocks: list[OCRTextBlock] = []
+    for index, raw in enumerate(raw_blocks):
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            bbox = tuple(_normalize_layout_bbox(raw.get("bbox") or [0, 0, 0, 0]))
+        except (TypeError, ValueError):
+            bbox = (0.0, 0.0, 0.0, 0.0)
+        order = int(raw.get("order") if raw.get("order") is not None else index)
+        line_index = int(raw.get("line_index") if raw.get("line_index") is not None else order)
+        blocks.append(
+            OCRTextBlock(
+                block_id=f"p{page_num}-b{len(blocks) + 1:04d}",
+                text=text,
+                bbox=bbox,  # type: ignore[arg-type]
+                confidence=float(raw.get("confidence") or 0.0),
+                source=source,
+                line_index=line_index,
+                order=order,
+            )
+        )
+    width = int(response.get("width") or 0)
+    height = int(response.get("height") or 0)
+    return OCRPageBlocks(page=page_num, width=width, height=height, blocks=tuple(blocks))
+
+
+def local_ocr_with_layout(
+    image_bytes: bytes,
+    page_num: int,
+    backend: str,
+) -> tuple[str, OCRPageBlocks | None]:
     name = (backend or "").strip().lower()
     if name in {"", "none"}:
-        return ""
+        return "", None
     if name != "paddleocr":
         raise RuntimeError(f"unsupported local OCR backend: {backend}")
     with _local_ocr_worker_lock:
@@ -805,14 +847,24 @@ def local_ocr(image_bytes: bytes, page_num: int, backend: str) -> str:
                     backend,
                     response.get("error") or response,
                 )
-                return t("ocr_failed", page=page_num)
+                return t("ocr_failed", page=page_num), None
             text = str(response.get("text") or "").strip()
-            return text or t("ocr_failed", page=page_num)
+            page_blocks = _ocr_page_blocks_from_worker_response(
+                page_num,
+                response,
+                source=f"local-{name}",
+            )
+            return text or t("ocr_failed", page=page_num), page_blocks
         except Exception as exc:
             _stop_local_ocr_worker()
             _mark_local_ocr_worker_unhealthy(str(exc))
             logger.warning("Local OCR unavailable for page %d via %s: %s", page_num, backend, exc)
-            return t("ocr_failed", page=page_num)
+            return t("ocr_failed", page=page_num), None
+
+
+def local_ocr(image_bytes: bytes, page_num: int, backend: str) -> str:
+    text, _page_blocks = local_ocr_with_layout(image_bytes, page_num, backend)
+    return text
 
 
 def _remove_footer_page_number(lines: list[str], page_num: int, total_pages: int) -> list[str]:
@@ -1970,6 +2022,7 @@ def parse_pdf(
     llm_ocr_set = set(ocr_plan["llm_ocr_pages"])
     local_ocr_results: dict[int, str] = {}
     llm_ocr_results: dict[int, str] = {}
+    local_ocr_layout_pages: dict[int, OCRPageBlocks] = {}
     local_tasks: list[tuple[int, bytes]] = []
     llm_tasks: list[tuple[int, bytes]] = []
     render_meta: dict[str, Any] = {
@@ -2065,13 +2118,16 @@ def parse_pdf(
 
         def _do_local_ocr(args):
             pn, img_b = args
-            return pn, img_b, local_ocr(img_b, pn, ocr_plan["local_backend"])
+            text, page_blocks = local_ocr_with_layout(img_b, pn, ocr_plan["local_backend"])
+            return pn, img_b, text, page_blocks
 
         with ThreadPoolExecutor(max_workers=LOCAL_OCR_CONCURRENCY) as pool:
             futures = {pool.submit(_do_local_ocr, task): task for task in local_tasks}
             for fut in as_completed(futures):
-                pn, img_b, result = fut.result()
+                pn, img_b, result, page_blocks = fut.result()
                 local_ocr_results[pn] = result
+                if page_blocks is not None and not _is_ocr_failed_text(result):
+                    local_ocr_layout_pages[pn] = page_blocks
                 logger.info(f"Page {pn}/{total_pages}: local OCR done")
                 if cache_dir and profile and profile.cache_policy.page_ocr:
                     if _is_ocr_failed_text(result):
@@ -2182,6 +2238,14 @@ def parse_pdf(
         sections=sections,
         ocr_page_count=ocr_count,
         table_count=table_count,
+        ocr_blocks=(
+            OCRBlocksSidecar(
+                doc_id="",
+                pages=tuple(local_ocr_layout_pages[pn] for pn in sorted(local_ocr_layout_pages)),
+            )
+            if local_ocr_layout_pages
+            else None
+        ),
         metadata={
             "document_profile": profile.name if profile else None,
             "pdf_parse_mode": selected_mode,
@@ -3639,7 +3703,7 @@ def _reset_generated_output_dirs(doc_dir: Path) -> None:
         path = doc_dir / child
         if path.exists():
             shutil.rmtree(path)
-    for child in ("sections.json", "tables.json", "images.json"):
+    for child in ("sections.json", "tables.json", "images.json", OCR_BLOCKS_SIDECAR_PATH):
         path = doc_dir / child
         if path.exists():
             path.unlink()
@@ -3743,6 +3807,17 @@ def write_output(
     if image_entries:
         _write_json(doc_dir / "images.json", image_entries)
         logger.info(f"images/ ({len(image_entries)} files)")
+    layout_entry = _build_layout_manifest_entry(available=False)
+    if parsed.ocr_blocks is not None:
+        layout_entry = _write_ocr_blocks_sidecar(
+            doc_dir,
+            OCRBlocksSidecar(
+                doc_id=doc_id,
+                pages=parsed.ocr_blocks.pages,
+                version=parsed.ocr_blocks.version,
+                coordinate_system=parsed.ocr_blocks.coordinate_system,
+            ),
+        )
 
     # v3: content_hash
     full_text = "\n".join(sec.text for sec in parsed.sections)
@@ -3769,6 +3844,7 @@ def write_output(
             "tables": "tables.json",
             "images_dir": "images/",
             "images": "images.json",
+            "ocr_blocks": layout_entry["ocr_blocks_path"],
         },
         "sections": [
             _build_section_entry(
@@ -3779,6 +3855,7 @@ def write_output(
         ],
         "tables": table_entries,
         "images": image_entries,
+        "layout": layout_entry,
         "provenance": {
             "source": source,
             "source_url": original_path or str(parsed.filename),
@@ -3871,6 +3948,17 @@ def write_output_extract_only(
     image_entries = _write_images(doc_dir, parsed)
     if image_entries:
         _write_json(doc_dir / "images.json", image_entries)
+    layout_entry = _build_layout_manifest_entry(available=False)
+    if parsed.ocr_blocks is not None:
+        layout_entry = _write_ocr_blocks_sidecar(
+            doc_dir,
+            OCRBlocksSidecar(
+                doc_id=doc_id,
+                pages=parsed.ocr_blocks.pages,
+                version=parsed.ocr_blocks.version,
+                coordinate_system=parsed.ocr_blocks.coordinate_system,
+            ),
+        )
 
     placeholder = summary_placeholder or _summary_placeholder_text("pending", locale=output_locale)
     _write_text(
@@ -3905,6 +3993,7 @@ def write_output_extract_only(
             "tables": "tables.json",
             "images_dir": "images/",
             "images": "images.json",
+            "ocr_blocks": layout_entry["ocr_blocks_path"],
         },
         "sections": [
             _build_section_entry(sec, summary_preview="")
@@ -3912,6 +4001,7 @@ def write_output_extract_only(
         ],
         "tables": table_entries,
         "images": image_entries,
+        "layout": layout_entry,
         "provenance": {
             "source": source,
             "source_url": str(parsed.filename),

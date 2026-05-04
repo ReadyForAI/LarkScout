@@ -29,17 +29,17 @@ AC:
 
 ### P0.2 Capture PaddleOCR Geometry
 
-- [ ] Task: Preserve PaddleOCR line/block coordinates and confidence during local OCR.
+- [x] Task: Preserve PaddleOCR line/block coordinates and confidence during local OCR.
 
 说明:
 Current scan OCR mostly produces text for downstream sectioning. Extend the OCR path so raw OCR geometry is normalized and written to the sidecar. This is the foundation for table reconstruction and page/region evidence.
 
 AC:
-- [ ] Local scan OCR writes `ocr_blocks.json` for pages that run OCR.
-- [ ] Text content in generated sections remains compatible with current behavior.
-- [ ] Raw OCR cache files remain usable and are not treated as the structured source of truth.
-- [ ] Blank or skipped OCR pages are represented clearly or omitted with manifest metadata.
-- [ ] Existing scanned contract tests still pass.
+- [x] Local scan OCR writes `ocr_blocks.json` for pages that run OCR.
+- [x] Text content in generated sections remains compatible with current behavior.
+- [x] Raw OCR cache files remain usable and are not treated as the structured source of truth.
+- [x] Blank or skipped OCR pages are represented clearly or omitted with manifest metadata.
+- [x] Existing scanned contract tests still pass.
 
 ### P0.3 Add Manifest Layout Metadata
 
@@ -235,3 +235,17 @@ AC:
   - `.venv/bin/pytest tests/test_schema_consistency.py tests/test_library_endpoints.py -q`: 48 passed.
   - `.venv/bin/pytest`: 216 passed, 15 skipped.
 
+### P0.2 Capture PaddleOCR Geometry
+
+- Branch: `task/p0-2-capture-paddleocr-geometry`
+- Implementation:
+  - Extended the isolated PaddleOCR worker to return text blocks with bbox/confidence.
+  - Added `local_ocr_with_layout` while keeping existing `local_ocr` text behavior compatible.
+  - Threaded local OCR page blocks through PDF parsing into `ParsedDocument.ocr_blocks`.
+  - Wrote `ocr_blocks.json` and low-token manifest `layout` metadata during output persistence.
+  - Reset stale `ocr_blocks.json` on document rewrite.
+- Verification:
+  - `.venv/bin/pytest tests/test_layout_sidecar_contract.py tests/test_robustness.py::TestPDFParse::test_local_ocr_uses_isolated_worker tests/test_robustness.py::TestPDFParse::test_local_ocr_worker_crash_does_not_crash_parent -q`: 12 passed.
+  - `.venv/bin/pytest tests/test_schema_consistency.py tests/test_library_endpoints.py -q`: 48 passed.
+  - `.venv/bin/pytest tests/test_word_embedded_images.py -q`: 6 passed.
+  - `.venv/bin/pytest`: 221 passed, 15 skipped.
