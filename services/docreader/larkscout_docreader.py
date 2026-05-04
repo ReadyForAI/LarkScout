@@ -68,6 +68,9 @@ SUPPORTED_FORMATS = [
 SUPPORTED_EXTENSIONS = {f".{fmt}" for fmt in SUPPORTED_FORMATS}
 DOCUMENT_PROFILE_CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs" / "document_profiles"
 FIELD_OCR_CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs" / "field_profiles"
+OCR_BLOCKS_SIDECAR_VERSION = 1
+OCR_BLOCKS_SIDECAR_PATH = "ocr_blocks.json"
+OCR_BLOCKS_COORDINATE_SYSTEM = "image_pixels"
 
 # Lazy-initialized MarkItDown converter
 _md_converter = None
@@ -174,6 +177,66 @@ class PageContent:
     is_ocr: bool = False
     tables: list[str] = field(default_factory=list)
     tables_in_text: bool = False
+
+
+@dataclass(frozen=True)
+class OCRTextBlock:
+    """Normalized OCR text block geometry for layout sidecars."""
+
+    block_id: str
+    text: str
+    bbox: tuple[float, float, float, float]
+    confidence: float = 0.0
+    source: str = "local_ocr"
+    line_index: int = 0
+    order: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "block_id": self.block_id,
+            "text": self.text,
+            "bbox": _normalize_layout_bbox(self.bbox),
+            "confidence": float(self.confidence),
+            "source": self.source,
+            "line_index": int(self.line_index),
+            "order": int(self.order),
+        }
+
+
+@dataclass(frozen=True)
+class OCRPageBlocks:
+    """OCR geometry for one rendered document page."""
+
+    page: int
+    width: int
+    height: int
+    blocks: tuple[OCRTextBlock, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "page": int(self.page),
+            "width": int(self.width),
+            "height": int(self.height),
+            "blocks": [block.to_dict() for block in self.blocks],
+        }
+
+
+@dataclass(frozen=True)
+class OCRBlocksSidecar:
+    """Versioned OCR geometry sidecar contract."""
+
+    doc_id: str
+    pages: tuple[OCRPageBlocks, ...] = ()
+    version: int = OCR_BLOCKS_SIDECAR_VERSION
+    coordinate_system: str = OCR_BLOCKS_COORDINATE_SYSTEM
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": int(self.version),
+            "doc_id": self.doc_id,
+            "coordinate_system": self.coordinate_system,
+            "pages": [page.to_dict() for page in self.pages],
+        }
 
 
 @dataclass
@@ -4057,6 +4120,44 @@ def _write_json(path: Path, data: dict):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def _normalize_layout_bbox(bbox: tuple[float, float, float, float] | list[float]) -> list[float]:
+    """Normalize a bbox to [x0, y0, x1, y1] floats and reject malformed geometry."""
+    if len(bbox) != 4:
+        raise ValueError("layout bbox must contain exactly four coordinates")
+    normalized = [float(v) for v in bbox]
+    x0, y0, x1, y1 = normalized
+    if x1 < x0 or y1 < y0:
+        raise ValueError("layout bbox must be ordered as [x0, y0, x1, y1]")
+    return normalized
+
+
+def _build_layout_manifest_entry(
+    *,
+    available: bool,
+    ocr_blocks_path: str = OCR_BLOCKS_SIDECAR_PATH,
+    coordinate_system: str = OCR_BLOCKS_COORDINATE_SYSTEM,
+    version: int = OCR_BLOCKS_SIDECAR_VERSION,
+) -> dict[str, Any]:
+    """Build low-token manifest metadata for layout sidecars."""
+    return {
+        "available": bool(available),
+        "ocr_blocks_path": ocr_blocks_path if available else "",
+        "version": int(version),
+        "coordinate_system": coordinate_system,
+    }
+
+
+def _write_ocr_blocks_sidecar(doc_dir: Path, sidecar: OCRBlocksSidecar) -> dict[str, Any]:
+    """Write the OCR geometry sidecar and return manifest metadata for discovery."""
+    _write_json(doc_dir / OCR_BLOCKS_SIDECAR_PATH, sidecar.to_dict())
+    return _build_layout_manifest_entry(
+        available=True,
+        ocr_blocks_path=OCR_BLOCKS_SIDECAR_PATH,
+        coordinate_system=sidecar.coordinate_system,
+        version=sidecar.version,
+    )
 
 
 def _write_bytes(path: Path, content: bytes):
