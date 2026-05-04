@@ -135,17 +135,17 @@ AC:
 
 ### P1.5 Region Re-OCR
 
-- [ ] Task: Add targeted re-OCR by page and bbox.
+- [x] Task: Add targeted re-OCR by page and bbox.
 
 说明:
 When a field, table cell, or blurred area is weak, Skills should be able to request re-recognition of a specific region. LarkScout should provide the generic operation and traceable output only.
 
 AC:
-- [ ] Re-OCR accepts page+bbox and OCR backend parameters.
-- [ ] Output is stored as a separate rerun artifact with source refs.
-- [ ] Existing document outputs are not silently overwritten.
-- [ ] Re-OCR result includes text, bbox, confidence where available, and backend metadata.
-- [ ] Tests cover successful rerun and invalid region handling.
+- [x] Re-OCR accepts page+bbox and OCR backend parameters.
+- [x] Output is stored as a separate rerun artifact with source refs.
+- [x] Existing document outputs are not silently overwritten.
+- [x] Re-OCR result includes text, bbox, confidence where available, and backend metadata.
+- [x] Tests cover successful rerun and invalid region handling.
 
 ### P1.6 Visual Debug Artifact
 
@@ -334,3 +334,16 @@ AC:
   - `.venv/bin/pytest tests/test_region_crop_export.py -q`: 4 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
   - `.venv/bin/pytest`: 240 passed, 15 skipped.
+
+### P1.5 Region Re-OCR
+
+- Branch: `task/p1-5-region-reocr`
+- Implementation:
+  - Added `rerun_region_ocr` on top of derived PDF crop export.
+  - Stored rerun text and metadata under `derived/region_ocr/` without touching canonical parse outputs.
+  - Included source refs, crop refs, backend metadata, recognized text, OCR blocks, and average confidence where available.
+  - Supported local PaddleOCR and LLM/Gemini backend selection.
+- Verification:
+  - `.venv/bin/pytest tests/test_region_crop_export.py -q`: 6 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
+  - `.venv/bin/pytest`: 242 passed, 15 skipped.
