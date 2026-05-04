@@ -110,15 +110,15 @@ AC:
 
 ### P1.3 Cross-Page Table Continuation
 
-- [ ] Task: Add heuristic continuation links for tables split across pages.
+- [x] Task: Add heuristic continuation links for tables split across pages.
 
 说明:
 Enterprise contracts and quotations often split line-item tables across pages. Detect likely continuation using adjacent page positions, compatible column structure, repeated headers, and missing/continued titles.
 
 AC:
-- [ ] Table metadata can link `continued_from` and `continued_to`.
-- [ ] Continuation logic is conservative and avoids merging unrelated tables.
-- [ ] Tests include a positive multi-page sample and a negative adjacent-table sample.
+- [x] Table metadata can link `continued_from` and `continued_to`.
+- [x] Continuation logic is conservative and avoids merging unrelated tables.
+- [x] Tests include a positive multi-page sample and a negative adjacent-table sample.
 
 ### P1.4 Region Crop Export
 
@@ -309,3 +309,15 @@ AC:
   - `.venv/bin/pytest tests/test_table_candidates.py tests/test_table_metadata.py -q`: 12 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
   - `.venv/bin/pytest`: 234 passed, 15 skipped.
+
+### P1.3 Cross-Page Table Continuation
+
+- Branch: `task/p1-3-cross-page-continuation`
+- Implementation:
+  - Added conservative continuation helpers for adjacent layout-derived tables.
+  - Linked `continued_from` and `continued_to` in table metadata and structured table JSON.
+  - Required compatible column count, horizontal alignment, and either repeated headers or page-edge continuation positioning.
+- Verification:
+  - `.venv/bin/pytest tests/test_table_candidates.py tests/test_table_metadata.py -q`: 14 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
+  - `.venv/bin/pytest`: 236 passed, 15 skipped.

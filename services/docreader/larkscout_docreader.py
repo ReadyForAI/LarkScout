@@ -341,10 +341,14 @@ def _reconstruct_table_from_candidate(
     return {
         "table_id": table_id,
         "page": page_num,
+        "page_width": page.width,
+        "page_height": page.height,
         "bbox": candidate["bbox"],
         "source": "ocr_geometry",
         "row_count": len(structured_rows),
         "column_count": len(centers),
+        "continued_from": None,
+        "continued_to": None,
         "candidate_id": candidate.get("candidate_id"),
         "rows": structured_rows,
     }
@@ -372,6 +376,95 @@ def _markdown_from_structured_table(table: dict[str, Any]) -> str:
     ]
     lines.extend("| " + " | ".join(row) + " |" for row in body)
     return "\n".join(lines)
+
+
+def _normalize_cell_text_for_match(text: Any) -> str:
+    return "".join(str(text or "").lower().split())
+
+
+def _first_row_texts(table: dict[str, Any]) -> list[str]:
+    rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+    if not rows:
+        return []
+    column_count = int(table.get("column_count") or 0)
+    values = [""] * column_count
+    for cell in rows[0].get("cells") or []:
+        column = int(cell.get("column") or 0)
+        if 1 <= column <= column_count:
+            values[column - 1] = _normalize_cell_text_for_match(cell.get("text"))
+    return values
+
+
+def _same_table_header(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_texts = _first_row_texts(left)
+    right_texts = _first_row_texts(right)
+    if len(left_texts) < 2 or len(left_texts) != len(right_texts):
+        return False
+    comparable = [(a, b) for a, b in zip(left_texts, right_texts) if a and b]
+    if len(comparable) < 2:
+        return False
+    matches = sum(1 for a, b in comparable if a == b)
+    return matches >= 2 and matches / len(comparable) >= 0.67
+
+
+def _bbox_horizontal_overlap_ratio(left: list[float], right: list[float]) -> float:
+    left_width = max(0.0, left[2] - left[0])
+    right_width = max(0.0, right[2] - right[0])
+    if left_width <= 0 or right_width <= 0:
+        return 0.0
+    overlap = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    return overlap / min(left_width, right_width)
+
+
+def _near_page_bottom(table: dict[str, Any]) -> bool:
+    bbox = table.get("bbox") or []
+    page_height = float(table.get("page_height") or 0)
+    return len(bbox) == 4 and page_height > 0 and float(bbox[3]) >= page_height * 0.72
+
+
+def _near_page_top(table: dict[str, Any]) -> bool:
+    bbox = table.get("bbox") or []
+    page_height = float(table.get("page_height") or 0)
+    return len(bbox) == 4 and page_height > 0 and float(bbox[1]) <= page_height * 0.28
+
+
+def _should_link_continued_tables(
+    left_entry: dict[str, Any],
+    left_table: dict[str, Any],
+    right_entry: dict[str, Any],
+    right_table: dict[str, Any],
+) -> bool:
+    if int(right_entry.get("page_start") or 0) != int(left_entry.get("page_end") or 0) + 1:
+        return False
+    if int(left_entry.get("column_count") or 0) < 2:
+        return False
+    if int(left_entry.get("column_count") or 0) != int(right_entry.get("column_count") or 0):
+        return False
+    left_bbox = left_entry.get("bbox")
+    right_bbox = right_entry.get("bbox")
+    if not (isinstance(left_bbox, list) and isinstance(right_bbox, list) and len(left_bbox) == 4 and len(right_bbox) == 4):
+        return False
+    min_width = max(1.0, min(float(left_bbox[2] - left_bbox[0]), float(right_bbox[2] - right_bbox[0])))
+    edge_tolerance = max(24.0, min_width * 0.15)
+    if abs(float(left_bbox[0]) - float(right_bbox[0])) > edge_tolerance:
+        return False
+    if abs(float(left_bbox[2]) - float(right_bbox[2])) > edge_tolerance:
+        return False
+    if _bbox_horizontal_overlap_ratio(left_bbox, right_bbox) < 0.75:
+        return False
+    return _same_table_header(left_table, right_table) or (_near_page_bottom(left_table) and _near_page_top(right_table))
+
+
+def _apply_table_continuation_links(
+    entries: list[tuple[dict[str, Any], dict[str, Any], str]],
+) -> None:
+    ordered = sorted(entries, key=lambda item: (int(item[0].get("page_start") or 0), int(item[0].get("index") or 0)))
+    for (left_entry, left_table, _left_md), (right_entry, right_table, _right_md) in zip(ordered, ordered[1:]):
+        if _should_link_continued_tables(left_entry, left_table, right_entry, right_table):
+            left_entry["continued_to"] = right_entry["table_id"]
+            right_entry["continued_from"] = left_entry["table_id"]
+            left_table["continued_to"] = right_entry["table_id"]
+            right_table["continued_from"] = left_entry["table_id"]
 
 
 def _detect_text_locale(text: str) -> str:
@@ -4879,6 +4972,7 @@ def _build_structured_table_entries(
             "ocr_block_refs": candidate.get("ocr_block_refs") or [],
         }
         entries.append((entry, table_json, table_md))
+    _apply_table_continuation_links(entries)
     return entries
 
 
