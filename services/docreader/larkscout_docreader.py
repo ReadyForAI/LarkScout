@@ -5597,6 +5597,65 @@ def generate_visual_debug_artifacts(
     return metadata
 
 
+def _load_ocr_sidecar_payload(doc_dir: Path, doc_id: str) -> dict[str, Any]:
+    sidecar_path = doc_dir / OCR_BLOCKS_SIDECAR_PATH
+    if not sidecar_path.exists():
+        raise HTTPException(404, f"layout sidecar not found for {doc_id}")
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(500, f"layout sidecar unreadable for {doc_id}: {exc}") from exc
+    if not isinstance(sidecar, dict):
+        raise HTTPException(500, f"layout sidecar unreadable for {doc_id}")
+    return sidecar
+
+
+def _sidecar_page_summaries(sidecar: dict[str, Any]) -> list[dict[str, Any]]:
+    pages = sidecar.get("pages") if isinstance(sidecar.get("pages"), list) else []
+    summaries: list[dict[str, Any]] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        blocks = page.get("blocks") if isinstance(page.get("blocks"), list) else []
+        summaries.append(
+            {
+                "page": int(page.get("page") or 0),
+                "width": int(page.get("width") or 0),
+                "height": int(page.get("height") or 0),
+                "block_count": len(blocks),
+            }
+        )
+    return summaries
+
+
+def _load_tables_sidecar(doc_dir: Path) -> list[dict[str, Any]]:
+    tables_path = doc_dir / "tables.json"
+    if not tables_path.exists():
+        return []
+    try:
+        tables = json.loads(tables_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(500, f"tables sidecar unreadable: {exc}") from exc
+    if not isinstance(tables, list):
+        raise HTTPException(500, "tables sidecar unreadable")
+    return [table for table in tables if isinstance(table, dict)]
+
+
+def _resolve_table_json_path(doc_dir: Path, rel_path: str) -> Path | None:
+    if not isinstance(rel_path, str):
+        return None
+    raw_path = Path(rel_path)
+    if raw_path.is_absolute() or raw_path.suffix != ".json" or ".." in raw_path.parts:
+        return None
+    tables_dir = (doc_dir / "tables").resolve()
+    path = (doc_dir / raw_path).resolve()
+    try:
+        path.relative_to(tables_dir)
+    except ValueError:
+        return None
+    return path
+
+
 def _load_doc_index(docs_dir: Path) -> list[dict[str, Any]]:
     index_path = docs_dir / "doc-index.json"
     if not index_path.exists():
@@ -6557,6 +6616,98 @@ async def get_manifest(doc_id: str):
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+@app.get("/library/{doc_id}/sidecars")
+async def discover_sidecars(doc_id: str):
+    """Discover optional sidecars without returning large geometry payloads."""
+    _validate_doc_id(doc_id)
+    doc_dir = _get_docs_dir() / doc_id
+    manifest_path = doc_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    layout = manifest.get("layout") if isinstance(manifest.get("layout"), dict) else {}
+    sidecar_path = doc_dir / OCR_BLOCKS_SIDECAR_PATH
+    layout_summary = {
+        "available": sidecar_path.exists(),
+        "path": OCR_BLOCKS_SIDECAR_PATH if sidecar_path.exists() else "",
+        "coordinate_system": layout.get("coordinate_system") or OCR_BLOCKS_COORDINATE_SYSTEM,
+        "version": int(layout.get("version") or OCR_BLOCKS_SIDECAR_VERSION),
+        "pages_endpoint": f"/library/{doc_id}/layout/pages" if sidecar_path.exists() else "",
+        "page_endpoint_template": f"/library/{doc_id}/layout/page/{{page}}" if sidecar_path.exists() else "",
+    }
+    if sidecar_path.exists():
+        sidecar = _load_ocr_sidecar_payload(doc_dir, doc_id)
+        page_summaries = _sidecar_page_summaries(sidecar)
+        layout_summary["page_count"] = len(page_summaries)
+        layout_summary["block_count"] = sum(page["block_count"] for page in page_summaries)
+    else:
+        layout_summary["page_count"] = 0
+        layout_summary["block_count"] = 0
+
+    tables = _load_tables_sidecar(doc_dir)
+    table_summaries = [
+        {
+            "table_id": str(table.get("table_id") or ""),
+            "page": table.get("page"),
+            "row_count": table.get("row_count"),
+            "column_count": table.get("column_count"),
+            "source": table.get("source"),
+            "file": table.get("file"),
+            "json_file": table.get("json_file") or "",
+            "bbox_available": bool(table.get("bbox")),
+        }
+        for table in tables
+    ]
+    return {
+        "doc_id": doc_id,
+        "layout": layout_summary,
+        "tables": {
+            "available": bool(tables),
+            "path": "tables.json" if tables else "",
+            "count": len(tables),
+            "items": table_summaries,
+            "json_endpoint_template": f"/library/{doc_id}/table/{{table_id}}/json",
+        },
+    }
+
+
+@app.get("/library/{doc_id}/layout/pages")
+async def list_layout_pages(doc_id: str):
+    """List OCR layout pages and block counts without returning block geometry."""
+    _validate_doc_id(doc_id)
+    doc_dir = _get_docs_dir() / doc_id
+    if not (doc_dir / "manifest.json").exists():
+        raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
+    sidecar = _load_ocr_sidecar_payload(doc_dir, doc_id)
+    return {
+        "doc_id": doc_id,
+        "coordinate_system": sidecar.get("coordinate_system") or OCR_BLOCKS_COORDINATE_SYSTEM,
+        "version": int(sidecar.get("version") or OCR_BLOCKS_SIDECAR_VERSION),
+        "pages": _sidecar_page_summaries(sidecar),
+    }
+
+
+@app.get("/library/{doc_id}/layout/page/{page_num}")
+async def get_layout_page(doc_id: str, page_num: int):
+    """Read OCR geometry for one page only."""
+    _validate_doc_id(doc_id)
+    if page_num < 1:
+        raise HTTPException(422, "page_num must be a 1-based positive integer")
+    doc_dir = _get_docs_dir() / doc_id
+    if not (doc_dir / "manifest.json").exists():
+        raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
+    sidecar = _load_ocr_sidecar_payload(doc_dir, doc_id)
+    for page in sidecar.get("pages") or []:
+        if isinstance(page, dict) and int(page.get("page") or 0) == page_num:
+            return {
+                "doc_id": doc_id,
+                "coordinate_system": sidecar.get("coordinate_system") or OCR_BLOCKS_COORDINATE_SYSTEM,
+                "version": int(sidecar.get("version") or OCR_BLOCKS_SIDECAR_VERSION),
+                "page": page,
+            }
+    raise HTTPException(404, f"layout page not found: {page_num}")
+
+
 @app.post("/library/{doc_id}/search_sections", response_model=SearchResponse)
 async def search_sections(doc_id: str, request: SectionSearchRequest):
     """Search within one document's section files and return sid/page provenance."""
@@ -6750,6 +6901,30 @@ async def get_table(doc_id: str, table_id: str):
     if not p.exists():
         raise HTTPException(404, t("table_not_found", table_id=table_id))
     return {"doc_id": doc_id, "table_id": table_id, "content": p.read_text(encoding="utf-8")}
+
+
+@app.get("/library/{doc_id}/table/{table_id}/json")
+async def get_table_json(doc_id: str, table_id: str):
+    """Read structured JSON for one table when available."""
+    _validate_doc_id(doc_id)
+    _validate_table_id(table_id)
+    doc_dir = _get_docs_dir() / doc_id
+    if not (doc_dir / "manifest.json").exists():
+        raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
+    tid = table_id if table_id.startswith("table-") else f"table-{table_id}"
+    for table in _load_tables_sidecar(doc_dir):
+        if table.get("table_id") != tid:
+            continue
+        json_file = str(table.get("json_file") or "")
+        path = _resolve_table_json_path(doc_dir, json_file)
+        if path is None or not path.exists():
+            raise HTTPException(404, f"table JSON not found: {table_id}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(500, f"table JSON unreadable for {table_id}: {exc}") from exc
+        return {"doc_id": doc_id, "table_id": tid, "table": payload}
+    raise HTTPException(404, f"table JSON not found: {table_id}")
 
 
 @app.get("/library/{doc_id}/images")
