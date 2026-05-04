@@ -70,16 +70,16 @@ AC:
 
 ### P0.5 Markdown Table Row/Column Counting
 
-- [ ] Task: Implement reliable row and column counting for existing Markdown tables.
+- [x] Task: Implement reliable row and column counting for existing Markdown tables.
 
 说明:
 Before reconstructing scanned tables, strengthen metadata for tables already represented as Markdown. This gives a low-risk compatibility layer and better baseline metrics.
 
 AC:
-- [ ] Markdown tables with separator rows are counted correctly.
-- [ ] Empty cells and uneven rows are handled conservatively.
-- [ ] Header row detection is captured where obvious.
-- [ ] Unit tests include normal, empty-cell, and uneven-row tables.
+- [x] Markdown tables with separator rows are counted correctly.
+- [x] Empty cells and uneven rows are handled conservatively.
+- [x] Header row detection is captured where obvious.
+- [x] Unit tests include normal, empty-cell, and uneven-row tables.
 
 ### P1.1 Scanned Table Candidate Detection
 
@@ -272,3 +272,15 @@ AC:
   - `.venv/bin/pytest tests/test_table_metadata.py tests/test_library_endpoints.py tests/test_robustness.py::TestPDFParse::test_extract_tables_from_ocr_text_keeps_table_complete tests/test_robustness.py::TestPDFParse::test_split_sections_does_not_treat_table_rows_as_headings -q`: 40 passed.
   - `.venv/bin/pytest tests/test_schema_consistency.py -q`: 14 passed.
   - `.venv/bin/pytest`: 226 passed, 15 skipped.
+
+### P0.5 Markdown Table Row/Column Counting
+
+- Branch: `task/p0-5-markdown-table-counting`
+- Implementation:
+  - Added explicit `has_header` metadata.
+  - Added separator/alignment/no-header/separator-only edge case tests.
+  - Kept row count conservative: counts content rows including header, excludes separator rows.
+- Verification:
+  - `.venv/bin/pytest tests/test_table_metadata.py tests/test_schema_consistency.py -q`: 21 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py -q`: 34 passed.
+  - `.venv/bin/pytest`: 229 passed, 15 skipped.

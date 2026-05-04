@@ -31,6 +31,7 @@ def test_build_table_entries_include_generic_metadata():
     assert entries[0]["row_count"] == 3
     assert entries[0]["column_count"] == 2
     assert entries[0]["header_rows"] == 1
+    assert entries[0]["has_header"] is True
     assert entries[0]["source"] == "ocr"
     assert entries[0]["continued_from"] is None
     assert entries[0]["continued_to"] is None
@@ -46,6 +47,46 @@ def test_markdown_table_dimensions_handle_empty_and_uneven_rows():
         "row_count": 3,
         "column_count": 3,
         "header_rows": 1,
+        "has_header": True,
+    }
+
+
+def test_markdown_table_dimensions_do_not_count_separator_rows():
+    from larkscout_docreader import _markdown_table_dimensions
+
+    dimensions = _markdown_table_dimensions(
+        "| A | B |\n| :--- | ---: |\n| 1 | 2 |\n| 3 | 4 |"
+    )
+
+    assert dimensions["row_count"] == 3
+    assert dimensions["column_count"] == 2
+    assert dimensions["header_rows"] == 1
+    assert dimensions["has_header"] is True
+
+
+def test_markdown_table_dimensions_without_separator_has_no_header():
+    from larkscout_docreader import _markdown_table_dimensions
+
+    dimensions = _markdown_table_dimensions("| 1 | 2 |\n| 3 | 4 |")
+
+    assert dimensions == {
+        "row_count": 2,
+        "column_count": 2,
+        "header_rows": 0,
+        "has_header": False,
+    }
+
+
+def test_markdown_table_dimensions_separator_only_is_empty_table():
+    from larkscout_docreader import _markdown_table_dimensions
+
+    dimensions = _markdown_table_dimensions("| --- | --- |")
+
+    assert dimensions == {
+        "row_count": 0,
+        "column_count": 0,
+        "header_rows": 0,
+        "has_header": False,
     }
 
 
@@ -105,4 +146,3 @@ def test_manifest_tables_include_metadata_without_changing_table_api(tmp_path: P
     assert (doc_dir / "tables" / "table-01.md").read_text(encoding="utf-8").endswith(
         table_md + "\n"
     )
-
