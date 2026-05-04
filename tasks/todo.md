@@ -96,17 +96,17 @@ AC:
 
 ### P1.2 Reconstruct Rows and Columns
 
-- [ ] Task: Build first-pass scanned table reconstruction from OCR blocks.
+- [x] Task: Build first-pass scanned table reconstruction from OCR blocks.
 
 说明:
 Cluster OCR blocks into rows by y overlap and infer columns from x alignment. Preserve source block references for every cell so downstream Skills can inspect evidence.
 
 AC:
-- [ ] Structured table JSON is written under `tables/table-xx.json`.
-- [ ] Each cell has row, column, text, bbox, confidence, and OCR block refs.
-- [ ] Generated Markdown is available for low-token LLM usage.
-- [ ] Multi-line cells are merged when geometry strongly supports it.
-- [ ] Unit tests cover row clustering and column inference.
+- [x] Structured table JSON is written under `tables/table-xx.json`.
+- [x] Each cell has row, column, text, bbox, confidence, and OCR block refs.
+- [x] Generated Markdown is available for low-token LLM usage.
+- [x] Multi-line cells are merged when geometry strongly supports it.
+- [x] Unit tests cover row clustering and column inference.
 
 ### P1.3 Cross-Page Table Continuation
 
@@ -296,3 +296,16 @@ AC:
   - `.venv/bin/pytest tests/test_table_candidates.py tests/test_table_metadata.py -q`: 10 passed.
   - `.venv/bin/pytest tests/test_layout_sidecar_contract.py -q`: 11 passed.
   - `.venv/bin/pytest`: 232 passed, 15 skipped.
+
+### P1.2 Reconstruct Rows and Columns
+
+- Branch: `task/p1-2-reconstruct-scanned-tables`
+- Implementation:
+  - Added reconstruction from OCR geometry candidates into structured table JSON.
+  - Generated Markdown table files from reconstructed rows/cells.
+  - Added `json_file`, bbox, and OCR block refs to layout-derived table entries.
+  - Integrated layout-derived table sidecars into existing `_write_tables` output while keeping Markdown table API compatible.
+- Verification:
+  - `.venv/bin/pytest tests/test_table_candidates.py tests/test_table_metadata.py -q`: 12 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
+  - `.venv/bin/pytest`: 234 passed, 15 skipped.

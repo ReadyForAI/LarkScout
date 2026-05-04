@@ -106,3 +106,88 @@ def test_detect_table_candidates_requires_multiple_rows():
 
     assert candidates == []
 
+
+def test_reconstruct_table_from_candidate_preserves_cell_refs():
+    from larkscout_docreader import (
+        OCRBlocksSidecar,
+        OCRPageBlocks,
+        _detect_table_candidates_from_ocr_blocks,
+        _markdown_from_structured_table,
+        _reconstruct_table_from_candidate,
+    )
+
+    sidecar = OCRBlocksSidecar(
+        doc_id="DOC-004",
+        pages=(
+            OCRPageBlocks(
+                page=1,
+                width=1000,
+                height=1000,
+                blocks=(
+                    _block("p1-b0001", "品名", (100, 100, 180, 120)),
+                    _block("p1-b0002", "金额", (300, 100, 360, 120)),
+                    _block("p1-b0003", "软件", (100, 140, 180, 160)),
+                    _block("p1-b0004", "100", (300, 140, 360, 160)),
+                ),
+            ),
+        ),
+    )
+    candidate = _detect_table_candidates_from_ocr_blocks(sidecar)[0]
+
+    table = _reconstruct_table_from_candidate(sidecar, candidate, "table-01")
+
+    assert table["table_id"] == "table-01"
+    assert table["page"] == 1
+    assert table["row_count"] == 2
+    assert table["column_count"] == 2
+    assert table["rows"][0]["cells"][0]["text"] == "品名"
+    assert table["rows"][0]["cells"][0]["ocr_block_refs"] == ["p1-b0001"]
+    assert table["rows"][1]["cells"][1]["text"] == "100"
+    assert _markdown_from_structured_table(table) == "| 品名 | 金额 |\n| --- | --- |\n| 软件 | 100 |"
+
+
+def test_write_tables_emits_structured_table_sidecar(tmp_path):
+    import json
+
+    from larkscout_docreader import (
+        OCRBlocksSidecar,
+        OCRPageBlocks,
+        ParsedDocument,
+        _write_tables,
+    )
+
+    parsed = ParsedDocument(
+        filename="scan.pdf",
+        file_type="pdf",
+        total_pages=1,
+        pages=[],
+        sections=[],
+        ocr_page_count=1,
+        table_count=0,
+        ocr_blocks=OCRBlocksSidecar(
+            doc_id="DOC-005",
+            pages=(
+                OCRPageBlocks(
+                    page=1,
+                    width=1000,
+                    height=1000,
+                    blocks=(
+                        _block("p1-b0001", "品名", (100, 100, 180, 120)),
+                        _block("p1-b0002", "金额", (300, 100, 360, 120)),
+                        _block("p1-b0003", "软件", (100, 140, 180, 160)),
+                        _block("p1-b0004", "100", (300, 140, 360, 160)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    entries = _write_tables(tmp_path, parsed)
+
+    table_md = (tmp_path / "tables" / "table-01.md").read_text(encoding="utf-8")
+    table_json = json.loads((tmp_path / "tables" / "table-01.json").read_text(encoding="utf-8"))
+    assert entries[0]["source"] == "layout"
+    assert entries[0]["json_file"] == "tables/table-01.json"
+    assert entries[0]["ocr_block_refs"] == ["p1-b0001", "p1-b0002", "p1-b0003", "p1-b0004"]
+    assert "| 品名 | 金额 |" in table_md
+    assert table_json["rows"][1]["cells"][1]["text"] == "100"
