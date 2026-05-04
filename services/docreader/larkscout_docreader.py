@@ -144,6 +144,28 @@ def _count_markdown_tables(text: str) -> int:
     return len(re.findall(r"^\|[\s\-:|]+\|$", text, re.MULTILINE))
 
 
+def _markdown_table_dimensions(table_md: str) -> dict[str, Any]:
+    rows: list[list[str]] = []
+    separator_indexes: set[int] = set()
+    for line in table_md.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        row_index = len(rows)
+        rows.append(cells)
+        if re.fullmatch(r"\|[\s\-:|]+\|", stripped):
+            separator_indexes.add(row_index)
+
+    content_rows = [row for idx, row in enumerate(rows) if idx not in separator_indexes]
+    header_rows = 1 if rows and 1 in separator_indexes else 0
+    return {
+        "row_count": len(content_rows),
+        "column_count": max((len(row) for row in content_rows), default=0),
+        "header_rows": header_rows,
+    }
+
+
 def _detect_text_locale(text: str) -> str:
     sample = text[:20000]
     cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
@@ -4588,6 +4610,7 @@ def _build_table_entries(parsed: ParsedDocument) -> list[dict[str, Any]]:
         1,
     ):
         text_hash = hashlib.sha256(table_md.encode("utf-8", errors="ignore")).hexdigest()
+        dimensions = _markdown_table_dimensions(table_md)
         entries.append(
             {
                 "table_id": f"table-{i:02d}",
@@ -4595,6 +4618,12 @@ def _build_table_entries(parsed: ParsedDocument) -> list[dict[str, Any]]:
                 "page": page_num,
                 "page_start": page_num,
                 "page_end": page_num,
+                "row_count": dimensions["row_count"],
+                "column_count": dimensions["column_count"],
+                "header_rows": dimensions["header_rows"],
+                "source": "ocr",
+                "continued_from": None,
+                "continued_to": None,
                 "char_count": len(table_md),
                 "token_estimate": _estimate_tokens(table_md),
                 "text_hash": f"sha256:{text_hash}",

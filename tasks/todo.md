@@ -56,17 +56,17 @@ AC:
 
 ### P0.4 Table Metadata Compatibility Layer
 
-- [ ] Task: Add generic table metadata while preserving current Markdown table behavior.
+- [x] Task: Add generic table metadata while preserving current Markdown table behavior.
 
 说明:
 LarkScout should continue serving existing table Markdown, but each table should gain stable metadata such as page range, row count, column count, source, and continuation links when detectable.
 
 AC:
-- [ ] Existing `/library/{doc_id}/table/{table_id}` behavior is preserved.
-- [ ] Table records include `table_id`, `page_start`, `page_end`, `row_count`, `column_count`, and `source`.
-- [ ] Metadata supports `continued_from` and `continued_to`.
-- [ ] Table body is not duplicated back into normal section text.
-- [ ] Existing table-related tests still pass.
+- [x] Existing `/library/{doc_id}/table/{table_id}` behavior is preserved.
+- [x] Table records include `table_id`, `page_start`, `page_end`, `row_count`, `column_count`, and `source`.
+- [x] Metadata supports `continued_from` and `continued_to`.
+- [x] Table body is not duplicated back into normal section text.
+- [x] Existing table-related tests still pass.
 
 ### P0.5 Markdown Table Row/Column Counting
 
@@ -260,3 +260,15 @@ AC:
   - `.venv/bin/pytest tests/test_layout_sidecar_contract.py tests/test_schema_consistency.py tests/test_library_endpoints.py -q`: 59 passed.
   - `.venv/bin/pytest tests/test_word_embedded_images.py -q`: 6 passed.
   - `.venv/bin/pytest`: 222 passed, 15 skipped.
+
+### P0.4 Table Metadata Compatibility Layer
+
+- Branch: `task/p0-4-table-metadata-compat`
+- Implementation:
+  - Added generic table metadata fields while preserving Markdown table files and existing table endpoint behavior.
+  - Added conservative Markdown table dimension helper for row/column/header metadata.
+  - Added `source`, `continued_from`, and `continued_to` fields to table records.
+- Verification:
+  - `.venv/bin/pytest tests/test_table_metadata.py tests/test_library_endpoints.py tests/test_robustness.py::TestPDFParse::test_extract_tables_from_ocr_text_keeps_table_complete tests/test_robustness.py::TestPDFParse::test_split_sections_does_not_treat_table_rows_as_headings -q`: 40 passed.
+  - `.venv/bin/pytest tests/test_schema_consistency.py -q`: 14 passed.
+  - `.venv/bin/pytest`: 226 passed, 15 skipped.
