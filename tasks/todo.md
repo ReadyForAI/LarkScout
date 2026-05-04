@@ -201,25 +201,32 @@ AC:
 
 ### P2.3 Real Document Validation Batch
 
-- [ ] Task: Validate on known real scanned contract samples.
+- [x] Task: Validate on known real scanned contract samples.
 
 说明:
 Use existing local samples such as NBS220667, NBS220952, NBS230310, and NBS250523 to verify that geometry and table output improves practical downstream extraction.
 
 AC:
-- [ ] Reparse selected samples and confirm OCR/page counts remain sane.
-- [ ] Confirm blank-page behavior still works.
-- [ ] Confirm table sidecars exist where table-like regions are present.
-- [ ] Confirm section text quality does not regress on known corrected OCR noise cases.
-- [ ] Save sample findings and remaining gaps in `docs/`.
+- [x] Reparse selected samples and confirm OCR/page counts remain sane.
+- [x] Confirm blank-page behavior still works.
+- [x] Confirm table sidecars exist where table-like regions are present.
+- [x] Confirm section text quality does not regress on known corrected OCR noise cases.
+- [x] Save sample findings and remaining gaps in `docs/`.
+
+Execution:
+- [x] Inventory available local samples and note substitutions for missing suggested IDs.
+- [x] Run a bounded real-document validation batch in `/private/tmp` without mutating the production docs library.
+- [x] Capture per-document page, OCR, layout sidecar, table sidecar, blank-page, and text-quality observations.
+- [x] Add focused regression tests for the validation/reporting checks.
+- [x] Document findings and remaining gaps under `docs/`.
 
 ## Review Checklist
 
-- [ ] Root cause addressed: table failures are tackled via geometry and structure, not business-field hacks.
-- [ ] Simplicity checked: sidecars are explicit and low-token APIs remain stable.
-- [ ] Compatibility checked: existing APIs and tests continue to pass.
-- [ ] Elegance checked: data model is generic enough for contracts, invoices, quotations, and statements.
-- [ ] Verification complete: unit, regression, sample-document, and payload-size checks are run before marking done.
+- [x] Root cause addressed: table failures are tackled via geometry and structure, not business-field hacks.
+- [x] Simplicity checked: sidecars are explicit and low-token APIs remain stable.
+- [x] Compatibility checked: existing APIs and tests continue to pass.
+- [x] Elegance checked: data model is generic enough for contracts, invoices, quotations, and statements.
+- [x] Verification complete: unit, regression, sample-document, and payload-size checks are run before marking done.
 
 ## Review Notes
 
@@ -404,3 +411,20 @@ AC:
   - `parse_pdf` + `write_output_extract_only` for `NBS260336.pdf`: 68.118s, 5 OCR pages, 4 local OCR sidecar pages, 254 OCR blocks, LLM page fell back after network connection error.
   - `python3 scripts/sidecar_metrics.py /private/tmp/larkscout-sidecar-metrics METRIC-NBS260336-P1`: OCR sidecar 95,690 bytes, default payload 45,652 bytes, no default geometry inline.
   - `.venv/bin/pytest`: 247 passed, 15 skipped.
+
+### P2.3 Real Document Validation Batch
+
+- Branch: `task/p2-3-real-document-validation-batch`
+- Implementation:
+  - Added `scripts/real_doc_validation.py` for repeatable real-output checks.
+  - Added tests for sidecar/table success and blank/noise/default-payload regression detection.
+  - Added `docs/real-document-validation-batch.md` with sample substitutions, commands, findings, and gaps.
+  - Confirmed suggested IDs `NBS220667`, `NBS220952`, and `NBS230310` were not present locally; used `NBS250523`, `NBS260336`, and existing `NBS250932` baseline.
+- Verification:
+  - `.venv/bin/pytest tests/test_real_doc_validation.py -q`: 2 passed.
+  - `python3 scripts/real_doc_validation.py /Users/grace/.larkscout/docs NBS250523 NBS250932 NBS260336 --expect-table NBS260336`: expected pre-sidecar gap for `NBS260336` structured table sidecar.
+  - `parse_pdf` + `write_output_extract_only` for `NBS260336.pdf` with `manual_blank_pages=5`: 70.706s, 5 pages, 4 OCR pages, sidecar available.
+  - `parse_pdf` + `write_output_extract_only` for `NBS250523.pdf`: 61.462s, 9 pages, 9 OCR pages, sidecar available.
+  - `python3 scripts/real_doc_validation.py /private/tmp/larkscout-real-validation VAL-NBS250523 VAL-NBS260336-BLANK5 --expect-table VAL-NBS260336-BLANK5`: passed.
+  - `python3 scripts/sidecar_metrics.py /private/tmp/larkscout-real-validation VAL-NBS250523 VAL-NBS260336-BLANK5`: OCR sidecars 201,825 bytes total, 535 OCR blocks total, no default geometry inline.
+  - `.venv/bin/pytest`: 249 passed, 15 skipped.
