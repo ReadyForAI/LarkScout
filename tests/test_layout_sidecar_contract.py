@@ -313,3 +313,40 @@ def test_write_output_extract_only_writes_ocr_blocks_and_manifest_layout(tmp_pat
     }
     assert "pages" not in manifest["layout"]
     assert "blocks" not in manifest["layout"]
+
+
+def test_write_output_extract_only_marks_layout_unavailable_without_ocr_blocks(tmp_path: Path):
+    from larkscout_docreader import ParsedDocument, Section, write_output_extract_only
+
+    parsed = ParsedDocument(
+        filename="text.pdf",
+        file_type="pdf",
+        total_pages=1,
+        pages=[],
+        sections=[
+            Section(
+                index=1,
+                title="Text",
+                level=1,
+                text="selectable text",
+                page_range="1-1",
+                sid="s_text",
+            )
+        ],
+        ocr_page_count=0,
+        table_count=0,
+    )
+
+    write_output_extract_only("DOC-021", parsed, tmp_path, tags=[], source="upload")
+
+    doc_dir = tmp_path / "DOC-021"
+    manifest = json.loads((doc_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert not (doc_dir / "ocr_blocks.json").exists()
+    assert manifest["layout"] == {
+        "available": False,
+        "ocr_blocks_path": "",
+        "version": 1,
+        "coordinate_system": "image_pixels",
+    }
+    assert manifest["paths"]["ocr_blocks"] == ""
