@@ -75,6 +75,7 @@ OCR_BLOCKS_SIDECAR_VERSION = 1
 OCR_BLOCKS_SIDECAR_PATH = "ocr_blocks.json"
 OCR_BLOCKS_COORDINATE_SYSTEM = "image_pixels"
 CROP_ARTIFACT_DIR = "derived/crops"
+REGION_OCR_ARTIFACT_DIR = "derived/region_ocr"
 
 # Lazy-initialized MarkItDown converter
 _md_converter = None
@@ -5312,6 +5313,111 @@ def export_pdf_region_crop(
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     _write_bytes(doc_dir / output_rel, png_bytes)
+    _write_json(doc_dir / metadata_rel, metadata)
+    return metadata
+
+
+def _normalize_region_ocr_backend(backend: str) -> tuple[str, str]:
+    name = (backend or "").strip().lower()
+    if name in {"", "paddleocr", "local", "local-paddleocr"}:
+        return "local", "paddleocr"
+    if name in {"llm", "gemini"}:
+        return "llm", "gemini"
+    raise HTTPException(422, "region OCR backend must be one of: paddleocr, local, llm, gemini")
+
+
+def _safe_artifact_id(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._")
+    return safe[:80] or "artifact"
+
+
+def rerun_region_ocr(
+    docs_dir: Path,
+    doc_id: str,
+    page: int,
+    bbox: list[float] | tuple[float, float, float, float],
+    *,
+    backend: str = "paddleocr",
+    dpi: int = 144,
+    coordinate_system: str = OCR_BLOCKS_COORDINATE_SYSTEM,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    backend_kind, selected_backend = _normalize_region_ocr_backend(backend)
+    requested_artifact_id = _safe_artifact_id(run_id) if run_id else None
+    if requested_artifact_id:
+        _validate_doc_id(doc_id)
+        doc_dir = docs_dir / doc_id
+        text_rel = f"{REGION_OCR_ARTIFACT_DIR}/{requested_artifact_id}.txt"
+        metadata_rel = f"{REGION_OCR_ARTIFACT_DIR}/{requested_artifact_id}.json"
+        if (doc_dir / text_rel).exists() or (doc_dir / metadata_rel).exists():
+            raise HTTPException(409, f"region OCR artifact already exists: {requested_artifact_id}")
+    crop = export_pdf_region_crop(
+        docs_dir,
+        doc_id,
+        page,
+        bbox,
+        dpi=dpi,
+        coordinate_system=coordinate_system,
+    )
+    doc_dir = docs_dir / doc_id
+    crop_path = doc_dir / crop["output_path"]
+    image_bytes = crop_path.read_bytes()
+
+    page_num = int(crop["page"])
+    page_blocks: OCRPageBlocks | None = None
+    if backend_kind == "local":
+        text, page_blocks = local_ocr_with_layout(image_bytes, page_num, selected_backend)
+    else:
+        text = gemini_ocr(image_bytes, page_num).strip()
+
+    block_dicts = [block.to_dict() for block in page_blocks.blocks] if page_blocks else []
+    confidences = [float(block.get("confidence") or 0.0) for block in block_dicts]
+    confidence = round(sum(confidences) / len(confidences), 4) if confidences else None
+
+    if requested_artifact_id:
+        artifact_id = requested_artifact_id
+    else:
+        run_hash = hashlib.sha256(
+            f"{doc_id}:{page_num}:{crop['artifact_id']}:{backend_kind}:{selected_backend}:{time.time_ns()}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
+        artifact_id = f"region-ocr-p{page_num:04d}-{run_hash}"
+    region_dir = doc_dir / REGION_OCR_ARTIFACT_DIR
+    region_dir.mkdir(parents=True, exist_ok=True)
+    text_rel = f"{REGION_OCR_ARTIFACT_DIR}/{artifact_id}.txt"
+    metadata_rel = f"{REGION_OCR_ARTIFACT_DIR}/{artifact_id}.json"
+    if (doc_dir / text_rel).exists() or (doc_dir / metadata_rel).exists():
+        raise HTTPException(409, f"region OCR artifact already exists: {artifact_id}")
+
+    metadata = {
+        "artifact_id": artifact_id,
+        "doc_id": doc_id,
+        "page": page_num,
+        "bbox": crop["bbox"],
+        "coordinate_system": crop["coordinate_system"],
+        "text": text,
+        "confidence": confidence,
+        "blocks": block_dicts,
+        "backend": {
+            "requested": backend,
+            "kind": backend_kind,
+            "selected": selected_backend,
+            "dpi": dpi,
+        },
+        "crop": {
+            "artifact_id": crop["artifact_id"],
+            "output_path": crop["output_path"],
+            "metadata_path": crop["metadata_path"],
+            "sha256": crop["sha256"],
+        },
+        "source_ref": crop.get("source_ref", ""),
+        "text_path": text_rel,
+        "metadata_path": metadata_rel,
+        "derived": True,
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _write_text(doc_dir / text_rel, text + ("\n" if text and not text.endswith("\n") else ""))
     _write_json(doc_dir / metadata_rel, metadata)
     return metadata
 
