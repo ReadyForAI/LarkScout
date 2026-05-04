@@ -122,16 +122,16 @@ AC:
 
 ### P1.4 Region Crop Export
 
-- [ ] Task: Implement page and bbox crop export for inspection and downstream Skills.
+- [x] Task: Implement page and bbox crop export for inspection and downstream Skills.
 
 说明:
 Skills need a low-level way to inspect or reprocess a document area without core deciding what the region means. Crops should be traceable to source document, page, bbox, and render settings.
 
 AC:
-- [ ] API or internal helper can export a crop by `doc_id`, `page`, and `bbox`.
-- [ ] Crop metadata records source page, bbox, coordinate system, DPI, and output path.
-- [ ] Invalid bbox/page inputs return clear errors.
-- [ ] Crop files are stored separately from canonical parse outputs or clearly marked as derived artifacts.
+- [x] API or internal helper can export a crop by `doc_id`, `page`, and `bbox`.
+- [x] Crop metadata records source page, bbox, coordinate system, DPI, and output path.
+- [x] Invalid bbox/page inputs return clear errors.
+- [x] Crop files are stored separately from canonical parse outputs or clearly marked as derived artifacts.
 
 ### P1.5 Region Re-OCR
 
@@ -321,3 +321,16 @@ AC:
   - `.venv/bin/pytest tests/test_table_candidates.py tests/test_table_metadata.py -q`: 14 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
   - `.venv/bin/pytest`: 236 passed, 15 skipped.
+
+### P1.4 Region Crop Export
+
+- Branch: `task/p1-4-region-crop-export`
+- Implementation:
+  - Added `export_pdf_region_crop` for source-backed PDF page+bbox crop export.
+  - Stored crop PNGs and metadata under `derived/crops/` to keep canonical parse outputs separate.
+  - Supported both `page_points` and OCR sidecar `image_pixels` coordinate systems.
+  - Added clear errors for invalid pages, bbox geometry, DPI, missing source files, and unavailable OCR dimensions.
+- Verification:
+  - `.venv/bin/pytest tests/test_region_crop_export.py -q`: 4 passed.
+  - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 48 passed.
+  - `.venv/bin/pytest`: 240 passed, 15 skipped.

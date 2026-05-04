@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import posixpath
 import re
@@ -73,6 +74,7 @@ FIELD_OCR_CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs" / "field_
 OCR_BLOCKS_SIDECAR_VERSION = 1
 OCR_BLOCKS_SIDECAR_PATH = "ocr_blocks.json"
 OCR_BLOCKS_COORDINATE_SYSTEM = "image_pixels"
+CROP_ARTIFACT_DIR = "derived/crops"
 
 # Lazy-initialized MarkItDown converter
 _md_converter = None
@@ -5101,6 +5103,217 @@ def _persist_source_file(doc_dir: Path, filename: str, content: bytes) -> dict[s
         "sha256": hashlib.sha256(content).hexdigest(),
         "size_bytes": len(content),
     }
+
+
+def _normalize_crop_bbox(bbox: list[float] | tuple[float, float, float, float]) -> list[float]:
+    if len(bbox) != 4:
+        raise HTTPException(422, "crop bbox must contain exactly four coordinates")
+    normalized = [float(v) for v in bbox]
+    if not all(math.isfinite(v) for v in normalized):
+        raise HTTPException(422, "crop bbox coordinates must be finite numbers")
+    x0, y0, x1, y1 = normalized
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(422, "crop bbox must have positive area ordered as [x0, y0, x1, y1]")
+    return normalized
+
+
+def _load_manifest_dict(doc_dir: Path, doc_id: str) -> dict[str, Any]:
+    manifest_path = doc_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(404, t("doc_not_found", doc_id=doc_id))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(500, f"manifest unreadable for {doc_id}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise HTTPException(500, f"manifest unreadable for {doc_id}")
+    return manifest
+
+
+def _resolve_doc_source_file(docs_dir: Path, doc_id: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    _validate_doc_id(doc_id)
+    doc_dir = docs_dir / doc_id
+    manifest = _load_manifest_dict(doc_dir, doc_id)
+    source_file = manifest.get("source_file") if isinstance(manifest.get("source_file"), dict) else {}
+    source_ref = str(source_file.get("ref") or "")
+    if not source_ref:
+        raise HTTPException(409, f"source file is not available for {doc_id}")
+    raw_ref = Path(source_ref)
+    if raw_ref.is_absolute() or ".." in raw_ref.parts or not raw_ref.parts or raw_ref.parts[0] != "source":
+        raise HTTPException(500, f"invalid source file ref for {doc_id}: {source_ref}")
+    source_path = (doc_dir / raw_ref).resolve()
+    try:
+        source_path.relative_to(doc_dir.resolve())
+    except ValueError as exc:
+        raise HTTPException(500, f"invalid source file ref for {doc_id}: {source_ref}") from exc
+    if not source_path.exists() or not source_path.is_file():
+        raise HTTPException(404, f"source file missing for {doc_id}: {source_ref}")
+    return source_path, manifest, source_file
+
+
+def _ocr_page_dimensions(doc_dir: Path, page_num: int) -> tuple[float, float] | None:
+    sidecar_path = doc_dir / OCR_BLOCKS_SIDECAR_PATH
+    if not sidecar_path.exists():
+        return None
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    pages = sidecar.get("pages") if isinstance(sidecar, dict) else []
+    if not isinstance(pages, list):
+        return None
+    for page in pages:
+        if isinstance(page, dict) and int(page.get("page") or 0) == page_num:
+            width = float(page.get("width") or 0)
+            height = float(page.get("height") or 0)
+            if width > 0 and height > 0:
+                return width, height
+    return None
+
+
+def _ensure_bbox_inside_bounds(bbox: list[float], width: float, height: float, coordinate_system: str) -> None:
+    x0, y0, x1, y1 = bbox
+    if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
+        raise HTTPException(
+            422,
+            f"crop bbox outside {coordinate_system} bounds: width={width:g}, height={height:g}",
+        )
+
+
+def _crop_clip_rect(
+    doc_dir: Path,
+    page_obj: Any,
+    page_num: int,
+    bbox: list[float],
+    coordinate_system: str,
+) -> tuple[Any, list[float], dict[str, Any]]:
+    import fitz
+
+    rect = page_obj.rect
+    if coordinate_system == "page_points":
+        _ensure_bbox_inside_bounds(bbox, float(rect.width), float(rect.height), coordinate_system)
+        clip = fitz.Rect(
+            rect.x0 + bbox[0],
+            rect.y0 + bbox[1],
+            rect.x0 + bbox[2],
+            rect.y0 + bbox[3],
+        )
+        return clip, [float(clip.x0), float(clip.y0), float(clip.x1), float(clip.y1)], {
+            "width": float(rect.width),
+            "height": float(rect.height),
+            "unit": "points",
+        }
+    if coordinate_system != OCR_BLOCKS_COORDINATE_SYSTEM:
+        raise HTTPException(422, f"unsupported crop coordinate_system: {coordinate_system}")
+    dimensions = _ocr_page_dimensions(doc_dir, page_num)
+    if dimensions is None:
+        raise HTTPException(409, f"ocr block dimensions unavailable for {doc_dir.name} page {page_num}")
+    image_width, image_height = dimensions
+    _ensure_bbox_inside_bounds(bbox, image_width, image_height, coordinate_system)
+    x_scale = float(rect.width) / image_width
+    y_scale = float(rect.height) / image_height
+    clip = fitz.Rect(
+        rect.x0 + bbox[0] * x_scale,
+        rect.y0 + bbox[1] * y_scale,
+        rect.x0 + bbox[2] * x_scale,
+        rect.y0 + bbox[3] * y_scale,
+    )
+    return clip, [float(clip.x0), float(clip.y0), float(clip.x1), float(clip.y1)], {
+        "width": image_width,
+        "height": image_height,
+        "unit": "pixels",
+    }
+
+
+def export_pdf_region_crop(
+    docs_dir: Path,
+    doc_id: str,
+    page: int,
+    bbox: list[float] | tuple[float, float, float, float],
+    *,
+    dpi: int = 144,
+    coordinate_system: str = OCR_BLOCKS_COORDINATE_SYSTEM,
+) -> dict[str, Any]:
+    import fitz
+
+    try:
+        page_num = int(page)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "page must be a 1-based positive integer") from exc
+    if page_num < 1:
+        raise HTTPException(422, "page must be a 1-based positive integer")
+    try:
+        dpi = int(dpi)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "dpi must be between 36 and 600") from exc
+    if dpi < 36 or dpi > 600:
+        raise HTTPException(422, "dpi must be between 36 and 600")
+    normalized_bbox = _normalize_crop_bbox(bbox)
+    source_path, manifest, source_file = _resolve_doc_source_file(docs_dir, doc_id)
+    if str(manifest.get("file_type") or "").lower() != "pdf" and source_path.suffix.lower() != ".pdf":
+        raise HTTPException(422, "region crop export currently supports PDF source files")
+
+    doc_dir = docs_dir / doc_id
+    try:
+        pdf = fitz.open(str(source_path))
+    except Exception as exc:
+        raise HTTPException(500, f"source PDF could not be opened for {doc_id}: {exc}") from exc
+    try:
+        if page_num > len(pdf):
+            raise HTTPException(422, f"page out of range for {doc_id}: {page_num} > {len(pdf)}")
+        page_obj = pdf[page_num - 1]
+        clip, clip_rect, source_bounds = _crop_clip_rect(
+            doc_dir,
+            page_obj,
+            page_num,
+            normalized_bbox,
+            coordinate_system,
+        )
+        scale = dpi / 72.0
+        pix = page_obj.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
+        png_bytes = pix.tobytes("png")
+    finally:
+        pdf.close()
+
+    crop_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "doc_id": doc_id,
+                "page": page_num,
+                "bbox": normalized_bbox,
+                "dpi": dpi,
+                "coordinate_system": coordinate_system,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    artifact_id = f"crop-p{page_num:04d}-{crop_hash}"
+    crops_dir = doc_dir / CROP_ARTIFACT_DIR
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    output_rel = f"{CROP_ARTIFACT_DIR}/{artifact_id}.png"
+    metadata_rel = f"{CROP_ARTIFACT_DIR}/{artifact_id}.json"
+    metadata = {
+        "artifact_id": artifact_id,
+        "doc_id": doc_id,
+        "page": page_num,
+        "bbox": normalized_bbox,
+        "coordinate_system": coordinate_system,
+        "source_bounds": source_bounds,
+        "clip_rect": clip_rect,
+        "dpi": dpi,
+        "scale": scale,
+        "output_path": output_rel,
+        "metadata_path": metadata_rel,
+        "mime_type": "image/png",
+        "size_bytes": len(png_bytes),
+        "sha256": hashlib.sha256(png_bytes).hexdigest(),
+        "source_ref": source_file.get("ref", ""),
+        "derived": True,
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _write_bytes(doc_dir / output_rel, png_bytes)
+    _write_json(doc_dir / metadata_rel, metadata)
+    return metadata
 
 
 def _load_doc_index(docs_dir: Path) -> list[dict[str, Any]]:
