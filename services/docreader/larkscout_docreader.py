@@ -264,6 +264,116 @@ def _detect_table_candidates_from_ocr_blocks(
     return candidates
 
 
+def _bbox_union(bboxes: list[tuple[float, float, float, float]]) -> list[float]:
+    return [
+        min(b[0] for b in bboxes),
+        min(b[1] for b in bboxes),
+        max(b[2] for b in bboxes),
+        max(b[3] for b in bboxes),
+    ]
+
+
+def _column_centers_for_blocks(blocks: list[OCRTextBlock], x_tolerance: float) -> list[float]:
+    centers: list[float] = []
+    for block in sorted(blocks, key=lambda b: b.bbox[0]):
+        x0 = block.bbox[0]
+        for idx, center in enumerate(centers):
+            if abs(x0 - center) <= x_tolerance:
+                centers[idx] = (center + x0) / 2
+                break
+        else:
+            centers.append(x0)
+    return centers
+
+
+def _assign_column(block: OCRTextBlock, centers: list[float]) -> int:
+    if not centers:
+        return 1
+    distances = [abs(block.bbox[0] - center) for center in centers]
+    return distances.index(min(distances)) + 1
+
+
+def _reconstruct_table_from_candidate(
+    sidecar: OCRBlocksSidecar,
+    candidate: dict[str, Any],
+    table_id: str,
+) -> dict[str, Any]:
+    page_num = int(candidate["page"])
+    page = next((p for p in sidecar.pages if p.page == page_num), None)
+    if page is None:
+        raise ValueError(f"candidate page not found in OCR blocks: {page_num}")
+    refs = set(candidate.get("ocr_block_refs") or [])
+    blocks = [block for block in page.blocks if block.block_id in refs]
+    if not blocks:
+        raise ValueError(f"candidate has no matching OCR blocks: {candidate.get('candidate_id')}")
+
+    heights = [block.bbox[3] - block.bbox[1] for block in blocks]
+    widths = [block.bbox[2] - block.bbox[0] for block in blocks]
+    rows = _cluster_ocr_blocks_into_rows(
+        blocks,
+        y_tolerance=max(8.0, _median(heights, 12.0) * 0.75),
+    )
+    centers = _column_centers_for_blocks(blocks, x_tolerance=max(12.0, _median(widths, 40.0) * 0.35))
+    structured_rows: list[dict[str, Any]] = []
+    for row_index, row_blocks in enumerate(rows, 1):
+        grouped: dict[int, list[OCRTextBlock]] = {}
+        for block in row_blocks:
+            grouped.setdefault(_assign_column(block, centers), []).append(block)
+        cells: list[dict[str, Any]] = []
+        for column in sorted(grouped):
+            cell_blocks = sorted(grouped[column], key=lambda b: (b.bbox[1], b.bbox[0]))
+            text = "\n".join(block.text for block in cell_blocks).strip()
+            confidence = sum(block.confidence for block in cell_blocks) / len(cell_blocks)
+            cells.append(
+                {
+                    "row": row_index,
+                    "column": column,
+                    "text": text,
+                    "bbox": _bbox_union([block.bbox for block in cell_blocks]),
+                    "rowspan": 1,
+                    "colspan": 1,
+                    "confidence": round(confidence, 4),
+                    "ocr_block_refs": [block.block_id for block in cell_blocks],
+                }
+            )
+        structured_rows.append({"row_index": row_index, "cells": cells})
+
+    return {
+        "table_id": table_id,
+        "page": page_num,
+        "bbox": candidate["bbox"],
+        "source": "ocr_geometry",
+        "row_count": len(structured_rows),
+        "column_count": len(centers),
+        "candidate_id": candidate.get("candidate_id"),
+        "rows": structured_rows,
+    }
+
+
+def _markdown_from_structured_table(table: dict[str, Any]) -> str:
+    column_count = int(table.get("column_count") or 0)
+    rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+    if column_count <= 0 or not rows:
+        return ""
+    markdown_rows: list[list[str]] = []
+    for row in rows:
+        values = [""] * column_count
+        for cell in row.get("cells") or []:
+            column = int(cell.get("column") or 0)
+            if 1 <= column <= column_count:
+                values[column - 1] = str(cell.get("text") or "").replace("\n", " ")
+        markdown_rows.append(values)
+    header = markdown_rows[0]
+    separator = ["---"] * column_count
+    body = markdown_rows[1:]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(separator) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines)
+
+
 def _detect_text_locale(text: str) -> str:
     sample = text[:20000]
     cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
@@ -4733,9 +4843,49 @@ def _build_table_entries(parsed: ParsedDocument) -> list[dict[str, Any]]:
     return entries
 
 
+def _build_structured_table_entries(
+    parsed: ParsedDocument,
+    start_index: int,
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    if parsed.ocr_blocks is None:
+        return []
+    entries: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    candidates = _detect_table_candidates_from_ocr_blocks(parsed.ocr_blocks)
+    for offset, candidate in enumerate(candidates, start_index):
+        table_id = f"table-{offset:02d}"
+        table_json = _reconstruct_table_from_candidate(parsed.ocr_blocks, candidate, table_id)
+        table_md = _markdown_from_structured_table(table_json)
+        text_hash = hashlib.sha256(table_md.encode("utf-8", errors="ignore")).hexdigest()
+        entry = {
+            "table_id": table_id,
+            "index": offset,
+            "page": table_json["page"],
+            "page_start": table_json["page"],
+            "page_end": table_json["page"],
+            "row_count": table_json["row_count"],
+            "column_count": table_json["column_count"],
+            "header_rows": 1 if table_json["row_count"] else 0,
+            "has_header": bool(table_json["row_count"]),
+            "source": "layout",
+            "continued_from": None,
+            "continued_to": None,
+            "char_count": len(table_md),
+            "token_estimate": _estimate_tokens(table_md),
+            "text_hash": f"sha256:{text_hash}",
+            "type": "markdown",
+            "file": f"tables/{table_id}.md",
+            "json_file": f"tables/{table_id}.json",
+            "bbox": table_json["bbox"],
+            "ocr_block_refs": candidate.get("ocr_block_refs") or [],
+        }
+        entries.append((entry, table_json, table_md))
+    return entries
+
+
 def _write_tables(doc_dir: Path, parsed: ParsedDocument) -> list[dict[str, Any]]:
     table_entries = _build_table_entries(parsed)
-    if not table_entries:
+    structured_entries = _build_structured_table_entries(parsed, start_index=len(table_entries) + 1)
+    if not table_entries and not structured_entries:
         return []
     tables_dir = doc_dir / "tables"
     tables_dir.mkdir(exist_ok=True)
@@ -4754,6 +4904,13 @@ def _write_tables(doc_dir: Path, parsed: ParsedDocument) -> list[dict[str, Any]]
             tables_dir / f"{entry['table_id']}.md",
             f"# Table {table_index} (page {page_num})\n\n{table_md}\n",
         )
+    for entry, table_json, table_md in structured_entries:
+        _write_text(
+            tables_dir / f"{entry['table_id']}.md",
+            f"# Table {entry['index']} (page {entry['page']})\n\n{table_md}\n",
+        )
+        _write_json(tables_dir / f"{entry['table_id']}.json", table_json)
+        table_entries.append(entry)
     return table_entries
 
 
