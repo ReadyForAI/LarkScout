@@ -43,16 +43,16 @@ AC:
 
 ### P0.3 Add Manifest Layout Metadata
 
-- [ ] Task: Add manifest `layout` metadata for OCR block sidecars.
+- [x] Task: Add manifest `layout` metadata for OCR block sidecars.
 
 说明:
 Expose sidecar availability without increasing token usage in normal APIs. Consumers should be able to discover whether geometry exists and where it is stored.
 
 AC:
-- [ ] Manifest includes layout availability for scan OCR outputs.
-- [ ] Manifest remains backward compatible for old documents without layout metadata.
-- [ ] API responses that expose manifest do not include the full block payload.
-- [ ] Unit tests cover documents with and without `ocr_blocks.json`.
+- [x] Manifest includes layout availability for scan OCR outputs.
+- [x] Manifest remains backward compatible for old documents without layout metadata.
+- [x] API responses that expose manifest do not include the full block payload.
+- [x] Unit tests cover documents with and without `ocr_blocks.json`.
 
 ### P0.4 Table Metadata Compatibility Layer
 
@@ -249,3 +249,14 @@ AC:
   - `.venv/bin/pytest tests/test_schema_consistency.py tests/test_library_endpoints.py -q`: 48 passed.
   - `.venv/bin/pytest tests/test_word_embedded_images.py -q`: 6 passed.
   - `.venv/bin/pytest`: 221 passed, 15 skipped.
+
+### P0.3 Manifest Layout Metadata
+
+- Branch: `task/p0-3-manifest-layout-metadata`
+- Implementation:
+  - Added explicit coverage for manifest `layout.available=false` when no OCR geometry sidecar exists.
+  - Confirmed legacy manifest endpoint compatibility remains covered by library endpoint fixtures without `layout`.
+- Verification:
+  - `.venv/bin/pytest tests/test_layout_sidecar_contract.py tests/test_schema_consistency.py tests/test_library_endpoints.py -q`: 59 passed.
+  - `.venv/bin/pytest tests/test_word_embedded_images.py -q`: 6 passed.
+  - `.venv/bin/pytest`: 222 passed, 15 skipped.
