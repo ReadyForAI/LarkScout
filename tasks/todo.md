@@ -188,16 +188,16 @@ AC:
 
 ### P2.2 Performance Guardrails
 
-- [ ] Task: Add performance and payload-size checks for sidecar generation.
+- [x] Task: Add performance and payload-size checks for sidecar generation.
 
 说明:
 OCR geometry can become large. The implementation must preserve LarkScout's low-token default behavior and avoid large response payload regressions.
 
 AC:
-- [ ] Default API payload sizes do not materially increase.
-- [ ] Sidecar generation cost is measured on representative scanned PDFs.
-- [ ] Large documents avoid inlining geometry in manifest or section outputs.
-- [ ] Tests or scripts capture basic size/performance metrics.
+- [x] Default API payload sizes do not materially increase.
+- [x] Sidecar generation cost is measured on representative scanned PDFs.
+- [x] Large documents avoid inlining geometry in manifest or section outputs.
+- [x] Tests or scripts capture basic size/performance metrics.
 
 ### P2.3 Real Document Validation Batch
 
@@ -388,3 +388,19 @@ AC:
   - `find /Users/grace/.larkscout/docs -maxdepth 3 -type f -name '*.pdf' -print`: local sample PDFs found.
   - `git diff --check`: passed.
   - `.venv/bin/pytest`: 245 passed, 15 skipped.
+
+### P2.2 Performance Guardrails
+
+- Branch: `task/p2-2-sidecar-performance-guardrails`
+- Implementation:
+  - Added `scripts/sidecar_metrics.py` for default payload and sidecar size metrics.
+  - Added tests that detect default-payload geometry regressions.
+  - Added `docs/sidecar-performance-guardrails.md` with representative local sample metrics.
+  - Measured a real scanned PDF sidecar run in `/private/tmp/larkscout-sidecar-metrics`.
+  - Recorded that the broader selected local documents are pre-sidecar outputs; P2.3 should reparse a wider batch.
+- Verification:
+  - `.venv/bin/pytest tests/test_sidecar_metrics.py -q`: 2 passed.
+  - `python3 scripts/sidecar_metrics.py /Users/grace/.larkscout/docs NBS250932 NBS260336 DOC-020`: 3 docs measured, no default geometry inline.
+  - `parse_pdf` + `write_output_extract_only` for `NBS260336.pdf`: 68.118s, 5 OCR pages, 4 local OCR sidecar pages, 254 OCR blocks, LLM page fell back after network connection error.
+  - `python3 scripts/sidecar_metrics.py /private/tmp/larkscout-sidecar-metrics METRIC-NBS260336-P1`: OCR sidecar 95,690 bytes, default payload 45,652 bytes, no default geometry inline.
+  - `.venv/bin/pytest`: 247 passed, 15 skipped.
