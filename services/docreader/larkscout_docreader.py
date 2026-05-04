@@ -76,6 +76,7 @@ OCR_BLOCKS_SIDECAR_PATH = "ocr_blocks.json"
 OCR_BLOCKS_COORDINATE_SYSTEM = "image_pixels"
 CROP_ARTIFACT_DIR = "derived/crops"
 REGION_OCR_ARTIFACT_DIR = "derived/region_ocr"
+VISUAL_DEBUG_ARTIFACT_DIR = "derived/debug"
 
 # Lazy-initialized MarkItDown converter
 _md_converter = None
@@ -5418,6 +5419,180 @@ def rerun_region_ocr(
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     _write_text(doc_dir / text_rel, text + ("\n" if text and not text.endswith("\n") else ""))
+    _write_json(doc_dir / metadata_rel, metadata)
+    return metadata
+
+
+def _load_ocr_debug_overlays(doc_dir: Path) -> dict[int, dict[str, Any]]:
+    sidecar_path = doc_dir / OCR_BLOCKS_SIDECAR_PATH
+    if not sidecar_path.exists():
+        return {}
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    overlays: dict[int, dict[str, Any]] = {}
+    for page in sidecar.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        page_num = int(page.get("page") or 0)
+        width = float(page.get("width") or 0)
+        height = float(page.get("height") or 0)
+        if page_num < 1 or width <= 0 or height <= 0:
+            continue
+        overlays[page_num] = {
+            "width": width,
+            "height": height,
+            "blocks": [block for block in (page.get("blocks") or []) if isinstance(block, dict)],
+        }
+    return overlays
+
+
+def _load_table_debug_overlays(doc_dir: Path) -> dict[int, list[dict[str, Any]]]:
+    tables_path = doc_dir / "tables.json"
+    if not tables_path.exists():
+        return {}
+    try:
+        tables = json.loads(tables_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(tables, list):
+        return {}
+    overlays: dict[int, list[dict[str, Any]]] = {}
+    for table in tables:
+        if not isinstance(table, dict) or not isinstance(table.get("bbox"), list):
+            continue
+        page_num = int(table.get("page") or table.get("page_start") or 0)
+        if page_num < 1:
+            continue
+        overlays.setdefault(page_num, []).append(table)
+    return overlays
+
+
+def _debug_bbox_to_pixels(
+    bbox: list[float],
+    *,
+    source_width: float,
+    source_height: float,
+    target_width: int,
+    target_height: int,
+) -> list[float] | None:
+    try:
+        x0, y0, x1, y1 = _normalize_layout_bbox(bbox)
+    except (TypeError, ValueError):
+        return None
+    if source_width <= 0 or source_height <= 0:
+        return None
+    return [
+        max(0.0, min(float(target_width), x0 * target_width / source_width)),
+        max(0.0, min(float(target_height), y0 * target_height / source_height)),
+        max(0.0, min(float(target_width), x1 * target_width / source_width)),
+        max(0.0, min(float(target_height), y1 * target_height / source_height)),
+    ]
+
+
+def generate_visual_debug_artifacts(
+    docs_dir: Path,
+    doc_id: str,
+    *,
+    dpi: int = 144,
+    include_ocr_blocks: bool = True,
+    include_tables: bool = True,
+) -> dict[str, Any]:
+    import fitz
+    from PIL import Image, ImageDraw
+
+    dpi = int(dpi)
+    if dpi < 36 or dpi > 600:
+        raise HTTPException(422, "dpi must be between 36 and 600")
+    source_path, _manifest, source_file = _resolve_doc_source_file(docs_dir, doc_id)
+    doc_dir = docs_dir / doc_id
+    ocr_pages = _load_ocr_debug_overlays(doc_dir) if include_ocr_blocks else {}
+    table_pages = _load_table_debug_overlays(doc_dir) if include_tables else {}
+    pages_to_render = sorted(set(ocr_pages) | set(table_pages))
+
+    debug_dir = doc_dir / VISUAL_DEBUG_ARTIFACT_DIR
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    page_entries: list[dict[str, Any]] = []
+    scale = dpi / 72.0
+    try:
+        pdf = fitz.open(str(source_path))
+    except Exception as exc:
+        raise HTTPException(500, f"source PDF could not be opened for {doc_id}: {exc}") from exc
+    try:
+        for page_num in pages_to_render:
+            if page_num > len(pdf):
+                continue
+            page_obj = pdf[page_num - 1]
+            pix = page_obj.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            draw = ImageDraw.Draw(image, "RGBA")
+            line_width = max(2, int(scale * 2))
+            ocr_page = ocr_pages.get(page_num) or {}
+            ocr_count = 0
+            for block in ocr_page.get("blocks") or []:
+                rect = _debug_bbox_to_pixels(
+                    block.get("bbox") or [],
+                    source_width=float(ocr_page.get("width") or 0),
+                    source_height=float(ocr_page.get("height") or 0),
+                    target_width=image.width,
+                    target_height=image.height,
+                )
+                if rect is None:
+                    continue
+                draw.rectangle(rect, outline=(0, 102, 255, 230), width=line_width)
+                ocr_count += 1
+            table_count = 0
+            for table in table_pages.get(page_num) or []:
+                rect = _debug_bbox_to_pixels(
+                    table.get("bbox") or [],
+                    source_width=float(ocr_page.get("width") or image.width),
+                    source_height=float(ocr_page.get("height") or image.height),
+                    target_width=image.width,
+                    target_height=image.height,
+                )
+                if rect is None:
+                    continue
+                draw.rectangle(rect, fill=(255, 128, 0, 35), outline=(255, 96, 0, 255), width=line_width + 1)
+                draw.text((rect[0] + 4, max(0, rect[1] - 14)), str(table.get("table_id") or "table"), fill=(255, 96, 0, 255))
+                table_count += 1
+            output_rel = f"{VISUAL_DEBUG_ARTIFACT_DIR}/page-{page_num:04d}.png"
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            _write_bytes(doc_dir / output_rel, buffer.getvalue())
+            page_entries.append(
+                {
+                    "page": page_num,
+                    "output_path": output_rel,
+                    "dpi": dpi,
+                    "ocr_block_count": ocr_count,
+                    "table_region_count": table_count,
+                }
+            )
+    finally:
+        pdf.close()
+
+    metadata_rel = f"{VISUAL_DEBUG_ARTIFACT_DIR}/manifest.json"
+    metadata = {
+        "doc_id": doc_id,
+        "metadata_path": metadata_rel,
+        "artifact_dir": f"{VISUAL_DEBUG_ARTIFACT_DIR}/",
+        "source_ref": source_file.get("ref", ""),
+        "derived": True,
+        "opt_in": True,
+        "coordinate_system": OCR_BLOCKS_COORDINATE_SYSTEM,
+        "legend": {
+            "ocr_blocks": "blue rectangles",
+            "tables": "orange translucent rectangles",
+        },
+        "options": {
+            "dpi": dpi,
+            "include_ocr_blocks": include_ocr_blocks,
+            "include_tables": include_tables,
+        },
+        "pages": page_entries,
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     _write_json(doc_dir / metadata_rel, metadata)
     return metadata
 
