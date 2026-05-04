@@ -175,16 +175,16 @@ AC:
 
 ### P2.1 OpenDataLoader Comparative Spike
 
-- [ ] Task: Run a limited comparison against OpenDataLoader on selected PDFs.
+- [x] Task: Run a limited comparison against OpenDataLoader on selected PDFs.
 
 说明:
 Use this as a learning spike, not a backend migration. Compare element JSON, bbox conventions, table output, Markdown fidelity, and debug artifacts against LarkScout outputs.
 
 AC:
-- [ ] Comparison uses at least one scanned contract, one invoice-like table, and one text-rich PDF.
-- [ ] Notes identify reusable data-model ideas and non-reusable dependency/runtime choices.
-- [ ] Findings are documented in `docs/` without changing production defaults.
-- [ ] No new required Java/OpenDataLoader runtime dependency is introduced by this spike.
+- [x] Comparison uses at least one scanned contract, one invoice-like table, and one text-rich PDF.
+- [x] Notes identify reusable data-model ideas and non-reusable dependency/runtime choices.
+- [x] Findings are documented in `docs/` without changing production defaults.
+- [x] No new required Java/OpenDataLoader runtime dependency is introduced by this spike.
 
 ### P2.2 Performance Guardrails
 
@@ -372,4 +372,19 @@ AC:
 - Verification:
   - `.venv/bin/pytest tests/test_library_endpoints.py::TestLibrarySidecars -q`: 2 passed.
   - `.venv/bin/pytest tests/test_library_endpoints.py tests/test_schema_consistency.py -q`: 50 passed.
+  - `.venv/bin/pytest`: 245 passed, 15 skipped.
+
+### P2.1 OpenDataLoader Comparative Spike
+
+- Branch: `task/p2-1-opendataloader-comparison-spike`
+- Implementation:
+  - Added `docs/opendataloader-comparative-spike.md`.
+  - Selected one scanned contract, one invoice-like table sample, and one text-rich PDF from the local LarkScout document library.
+  - Compared LarkScout outputs against OpenDataLoader's public README, schema, and options.
+  - Recorded that OpenDataLoader runtime execution was blocked by missing Java and missing `opendataloader-pdf` package; no dependency was added.
+- Verification:
+  - `java -version`: failed, no Java Runtime available.
+  - `python3 -m pip show opendataloader-pdf`: package not found.
+  - `find /Users/grace/.larkscout/docs -maxdepth 3 -type f -name '*.pdf' -print`: local sample PDFs found.
+  - `git diff --check`: passed.
   - `.venv/bin/pytest`: 245 passed, 15 skipped.
