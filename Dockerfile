@@ -1,8 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-trixie
 
 WORKDIR /app
 
-# Install OS-level deps required by Playwright, PyMuPDF, and legacy Office conversion
+# Install OS-level deps required by Playwright, PyMuPDF, and legacy Office conversion.
+# Several packages use the Debian 13 t64 (time_t-64) naming.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         wget \
@@ -14,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libnss3 \
         libnspr4 \
         libdbus-1-3 \
-        libatk1.0-0 \
-        libatk-bridge2.0-0 \
-        libcups2 \
+        libatk1.0-0t64 \
+        libatk-bridge2.0-0t64 \
+        libcups2t64 \
         libdrm2 \
         libxkbcommon0 \
         libxcomposite1 \
@@ -26,7 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxrandr2 \
         libxrender1 \
         libgbm1 \
-        libasound2 \
+        libasound2t64 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
         libreoffice-writer \
         libreoffice-impress \
         fonts-noto-cjk \
