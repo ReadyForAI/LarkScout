@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         ca-certificates \
         libgl1 \
-        libglib2.0-0 \
+        libglib2.0-0t64 \
         libgomp1 \
         libnss3 \
         libnspr4 \
