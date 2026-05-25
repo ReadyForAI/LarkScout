@@ -143,6 +143,7 @@ GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer
 | --------------------- | ------ | ---------- | ---- |
 | `file`                | File   | (required) | 上传文件（.pdf, .doc/.docx, .ppt/.pptx, .xls/.xlsx, .csv, .html/.htm, .txt/.text, .json/.jsonl/.xml） |
 | `doc_id`              | string | Auto-increment | 手动指定 DOC-ID |
+| `content_type`        | string | `General`  | 文档库分类：`General`、`Contract`、`Bid`、`Knowledge` |
 | `generate_summary`    | bool   | `true`     | 是否生成摘要（false = 仅提取文本） |
 | `summary_mode`        | string | null       | 摘要模式：`sync` / `defer` / `off`。长文档和业务 Skill 推荐 `defer` |
 | `document_profile`    | string | null       | 可选文档 profile 名称；仅在调用方明确知道可用 profile 时传入 |
@@ -166,6 +167,7 @@ GET /doc/library/search?q=revenue&tags=financial&file_type=pdf&metadata.customer
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@report.pdf" \
+  -F "content_type=General" \
   -F "generate_summary=true" \
   -F "extract_tables=true" \
   -F 'tags=["Q3","financial"]'
@@ -178,6 +180,7 @@ Word 内嵌图片的推荐入库方式是先抽轻量图片清单，不默认 OC
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@/path/to/document.docx" \
+  -F "content_type=Bid" \
   -F "summary_mode=defer" \
   -F "extract_tables=true" \
   -F "extract_images=true" \
@@ -191,6 +194,7 @@ curl -X POST http://localhost:9898/doc/parse \
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@/path/to/document.docx" \
+  -F "content_type=Bid" \
   -F "summary_mode=defer" \
   -F "extract_images=true" \
   -F "ocr_images=true" \
@@ -208,6 +212,7 @@ curl -X POST http://localhost:9898/doc/parse \
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@/path/to/document.pdf" \
+  -F "content_type=Contract" \
   -F "summary_mode=defer" \
   -F "extract_tables=true" \
   -F 'metadata={"display_name":"document.pdf","source_system":"manual_upload"}'
@@ -226,12 +231,14 @@ curl -X POST http://localhost:9898/doc/parse \
   "doc_id": "DOC-010",
   "filename": "report.pdf",
   "file_type": "pdf",
+  "content_type": "General",
+  "storage_path": "General/DOC-010",
   "total_pages": 45,
   "section_count": 12,
   "table_count": 8,
   "ocr_page_count": 3,
   "digest": "Q3 revenue grew 15%, net profit up 23% YoY...",
-  "manifest_path": "docs/DOC-010/manifest.json",
+  "manifest_path": "docs/General/DOC-010/manifest.json",
   "processing_time_sec": 23.5,
   "source_ref": "source/report.pdf"
 }
@@ -241,6 +248,7 @@ curl -X POST http://localhost:9898/doc/parse \
 
 - 返回里的 `digest` 已经包含摘要前 300 个字符，通常无需再额外请求 `/doc/library/{doc_id}/digest`
 - `generate_summary=false` 只提取文本和表格，不调用 LLM，速度更快但没有摘要
+- 未传 `content_type` 时默认入库到 `General`；调用方已明确业务类别时传 `Contract`、`Bid` 或 `Knowledge`
 - `metadata` 必须是 JSON object；嵌套对象会保留在 manifest 中，而浅层标量字段可用于 `/doc/library/search` 过滤
 - `source_ref` 指向文档目录内保存的上传原件，前提是 `LARKSCOUT_STORE_SOURCE_FILES=true`
 - 大文件（100+ 页 PDF）解析可能需要 30–60 秒，Agent 应设置更长的超时
@@ -254,6 +262,7 @@ curl -X POST http://localhost:9898/doc/parse \
 | `q`         | 关键词（搜索 filename、digest、tags、metadata 摘要） |
 | `tags`      | 标签过滤，逗号分隔 |
 | `file_type` | 文件类型过滤（`pdf` / `docx` / `web`） |
+| `content_type` | 分类过滤：`General`、`Contract`、`Bid`、`Knowledge` |
 | `metadata.*`| 等值 metadata 过滤，例如 `metadata.customer=ACME` |
 | `limit`     | 返回结果上限（默认 20） |
 
@@ -266,6 +275,8 @@ curl -X POST http://localhost:9898/doc/parse \
       "doc_id": "DOC-010",
       "filename": "Q3-report.pdf",
       "file_type": "pdf",
+      "content_type": "General",
+      "storage_path": "General/DOC-010",
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
@@ -291,6 +302,7 @@ curl -X POST http://localhost:9898/doc/parse \
 | `q`         | 必填查询字符串 |
 | `tags`      | 标签过滤，逗号分隔 |
 | `file_type` | 文件类型过滤 |
+| `content_type` | 分类过滤：`General`、`Contract`、`Bid`、`Knowledge` |
 | `doc_id`    | 限制到单个文档 |
 | `scope`     | `all` / `full` / `section`（默认 `all`） |
 | `limit`     | 返回结果上限（默认 20） |
@@ -305,6 +317,8 @@ curl -X POST http://localhost:9898/doc/parse \
       "doc_id": "DOC-010",
       "filename": "Q3-report.pdf",
       "file_type": "pdf",
+      "content_type": "General",
+      "storage_path": "General/DOC-010",
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
@@ -415,7 +429,24 @@ table_id 格式：`"01"` 或 `"table-01"`。
 docs/
   ├─ doc-index.json              ← 全局索引（v2 格式，与 LarkScout Browser 共享）
   │
-  ├─ DOC-001/                    ← PDF 解析结果
+  ├─ General/
+  │   └─ DOC-001/                ← 默认分类下的解析结果
+  │       ├─ .meta.json
+  │       ├─ manifest.json
+  │       ├─ source/
+  │       ├─ digest.md
+  │       ├─ brief.md
+  │       ├─ full.md
+  │       ├─ sections/
+  │       ├─ tables/
+  │       ├─ images.json
+  │       └─ images/
+  │
+  ├─ Contract/
+  ├─ Bid/
+  ├─ Knowledge/
+  │
+  ├─ DOC-001/                    ← 旧版平铺解析结果仍可读取
   │   ├─ .meta.json
   │   ├─ manifest.json           ← 包含 provenance 跟踪信息
   │   ├─ source/                 ← 原始上传文件（启用时保存）
@@ -435,18 +466,19 @@ docs/
   │       ├─ IMG-001.png
   │       └─ IMG-001.ocr.txt
   │
-  └─ WEB-001/                    ← 网页抓取结果（由 LarkScout Browser 写入，共享索引）
-      ├─ manifest.json
-      ├─ digest.md
-      ├─ sections/
-      └─ tables/
+  └─ WEB-001/                    ← 旧版平铺网页抓取结果仍可读取
+      └─ ...
 ```
+
+新入库内容会写入 `General/`、`Contract/`、`Bid/` 或 `Knowledge/`。直接读取仍使用 `doc_id`，服务会从 `doc-index.json` 或 `manifest.json` 解析分类后的 `storage_path`。
 
 **doc-index.json v2 关键字段：**
 
 | Field          | 说明 |
 | -------------- | ---- |
 | `id`           | DOC-001 / WEB-001 |
+| `content_type` | `General`、`Contract`、`Bid` 或 `Knowledge` |
+| `storage_path` | 相对文档目录，例如 `Contract/DOC-001` |
 | `source`       | `"upload"` 或 `"web_capture"` |
 | `tags`         | 标签数组 |
 | `metadata`     | 从上传 metadata 中提取的可索引标量字段 |

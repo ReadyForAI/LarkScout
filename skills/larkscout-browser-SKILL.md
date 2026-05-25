@@ -741,6 +741,7 @@ Request body:
 ```json
 {
   "url": "https://example.com/article",
+  "content_type": "Knowledge",
   "tags": ["research", "Q3"],
   "extract_tables": true,
   "lang": "en-US",
@@ -751,6 +752,7 @@ Request body:
 | Parameter        | Type     | Default        | Description                                      |
 | ---------------- | -------- | -------------- | ------------------------------------------------ |
 | `url`            | string   | (required)     | URL to capture                                   |
+| `content_type`   | string   | `"General"`    | Library category: `General`, `Contract`, `Bid`, or `Knowledge` |
 | `tags`           | string[] | `[]`           | Tags for the captured document                   |
 | `extract_tables` | bool     | `true`         | Whether to extract HTML tables                   |
 | `lang`           | string   | `"en-US"`      | Browser locale                                   |
@@ -761,6 +763,8 @@ Response example:
 ```json
 {
   "doc_id": "WEB-005",
+  "content_type": "Knowledge",
+  "storage_path": "Knowledge/WEB-005",
   "digest": "Article covers Q3 revenue trends across regions...",
   "section_count": 8,
   "table_count": 2
@@ -771,6 +775,7 @@ Response example:
 
 - This is a convenience endpoint that internally runs: `session/new → goto → distill → persist → session/close`
 - The captured page is persisted to the document library (same `doc-index.json` shared with DocReader)
+- Omitted `content_type` defaults to `General`; new captures are stored under `docs/<content_type>/<doc_id>`
 - The session is always closed after capture, even on error
 - Rate-limited: returns `429` when too many concurrent captures are in progress
 - URL validation: private IPs, localhost, and non-HTTP(S) schemes are blocked
@@ -929,8 +934,8 @@ Persist collection results (including tables) to the LarkScout document library:
 distill(extract_tables=true, include_actions=false)
 ↓
 Separate text sections and table sections:
-  text sections → docs/WEB-xxx/sections/
-  table sections → docs/WEB-xxx/tables/
+  text sections → docs/<content_type>/WEB-xxx/sections/
+  table sections → docs/<content_type>/WEB-xxx/tables/
 ↓
 Table section Markdown content and table_meta written together
 ↓
@@ -938,6 +943,8 @@ Shared doc-index.json index with XLSX / PDF parsed results
 ↓
 When Agent later searches "Q3 revenue", web tables and Excel tables are discovered uniformly
 ```
+
+Use `content_type` (`General`, `Contract`, `Bid`, `Knowledge`) to put captured pages into the same categorized library layout as uploaded documents. Legacy flat `docs/WEB-xxx` captures remain readable.
 
 ---
 
