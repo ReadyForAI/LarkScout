@@ -126,6 +126,7 @@ class LarkScoutClient:
         self,
         url: str,
         *,
+        content_type: str = "General",
         tags: list[str] | None = None,
         extract_tables: bool = True,
     ) -> dict[str, Any]:
@@ -133,6 +134,7 @@ class LarkScoutClient:
 
         Args:
             url:            The URL to capture.
+            content_type:   Library category: General, Contract, Bid, or Knowledge.
             tags:           Optional list of tags to attach to the document.
             extract_tables: Whether to extract HTML tables (default: True).
 
@@ -141,7 +143,12 @@ class LarkScoutClient:
         """
         return self._post_json(
             "/web/capture",
-            {"url": url, "tags": tags or [], "extract_tables": extract_tables},
+            {
+                "url": url,
+                "content_type": content_type,
+                "tags": tags or [],
+                "extract_tables": extract_tables,
+            },
         )
 
     def parse(
@@ -152,6 +159,7 @@ class LarkScoutClient:
         summary_mode: str | None = None,
         profile: str | None = None,
         extract_tables: bool = True,
+        content_type: str = "General",
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         doc_type: str | None = None,
@@ -170,6 +178,7 @@ class LarkScoutClient:
             summary_mode:     Optional summary mode: ``"sync"``, ``"defer"``, or ``"off"``.
             profile:          Optional document profile name, e.g. ``"contract_cn"``.
             extract_tables:   Extract tables as Markdown (default: True).
+            content_type:     Library category: General, Contract, Bid, or Knowledge.
             tags:             Optional list of tags.
             metadata:         Optional JSON-serializable metadata attached to the document.
             doc_type:         Optional caller-defined document type.
@@ -200,6 +209,7 @@ class LarkScoutClient:
             "/doc/parse",
             {
                 "doc_id": doc_id,
+                "content_type": content_type,
                 "generate_summary": str(generate_summary).lower(),
                 "summary_mode": summary_mode,
                 "document_profile": profile,
@@ -229,6 +239,7 @@ class LarkScoutClient:
         *,
         tags: str | None = None,
         file_type: str | None = None,
+        content_type: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
         """Search the document library.
@@ -237,6 +248,7 @@ class LarkScoutClient:
             query:     Full-text keyword query (searches filename, digest, tags).
             tags:      Comma-separated tag filter, e.g. ``"Q3,financial"``.
             file_type: Filter by file type: ``"pdf"``, ``"docx"``, or ``"web"``.
+            content_type: Filter by library category: General, Contract, Bid, or Knowledge.
             limit:     Maximum number of results (default: 20).
 
         Returns:
@@ -247,6 +259,7 @@ class LarkScoutClient:
             q=query,
             tags=tags,
             file_type=file_type,
+            content_type=content_type,
             limit=limit,
         )
 
@@ -258,6 +271,7 @@ class LarkScoutClient:
         scope: str = "all",
         tags: str | None = None,
         file_type: str | None = None,
+        content_type: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
         """Search full text and/or section text across the document library."""
@@ -268,6 +282,7 @@ class LarkScoutClient:
             scope=scope,
             tags=tags,
             file_type=file_type,
+            content_type=content_type,
             limit=limit,
         )
 
@@ -448,13 +463,19 @@ class AsyncLarkScoutClient:
         self,
         url: str,
         *,
+        content_type: str = "General",
         tags: list[str] | None = None,
         extract_tables: bool = True,
     ) -> dict[str, Any]:
         """Capture a web page and persist it to the document library."""
         return await self._post_json(
             "/web/capture",
-            {"url": url, "tags": tags or [], "extract_tables": extract_tables},
+            {
+                "url": url,
+                "content_type": content_type,
+                "tags": tags or [],
+                "extract_tables": extract_tables,
+            },
         )
 
     async def parse(
@@ -465,6 +486,7 @@ class AsyncLarkScoutClient:
         summary_mode: str | None = None,
         profile: str | None = None,
         extract_tables: bool = True,
+        content_type: str = "General",
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         doc_type: str | None = None,
@@ -493,6 +515,7 @@ class AsyncLarkScoutClient:
             "/doc/parse",
             {
                 "doc_id": doc_id,
+                "content_type": content_type,
                 "generate_summary": str(generate_summary).lower(),
                 "summary_mode": summary_mode,
                 "document_profile": profile,
@@ -522,6 +545,7 @@ class AsyncLarkScoutClient:
         *,
         tags: str | None = None,
         file_type: str | None = None,
+        content_type: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
         """Search the document library."""
@@ -530,6 +554,7 @@ class AsyncLarkScoutClient:
             q=query,
             tags=tags,
             file_type=file_type,
+            content_type=content_type,
             limit=limit,
         )
 
@@ -541,6 +566,7 @@ class AsyncLarkScoutClient:
         scope: str = "all",
         tags: str | None = None,
         file_type: str | None = None,
+        content_type: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
         """Search full text and/or section text across the document library."""
@@ -551,6 +577,7 @@ class AsyncLarkScoutClient:
             scope=scope,
             tags=tags,
             file_type=file_type,
+            content_type=content_type,
             limit=limit,
         )
 
