@@ -42,8 +42,14 @@ _CONTENT_TYPE_LOOKUP = {v.lower(): v for v in CONTENT_TYPES}
 
 
 def _validate_content_type(value: str) -> str:
-    """Return the canonical content_type value, or raise ValueError."""
-    canonical = _CONTENT_TYPE_LOOKUP.get(value.lower()) if isinstance(value, str) else None
+    """Return the canonical content_type value, or raise ValueError.
+
+    Accepts the same forms the server accepts: case-insensitive matches
+    against the documented enum, with leading/trailing whitespace stripped.
+    """
+    canonical = (
+        _CONTENT_TYPE_LOOKUP.get(value.strip().lower()) if isinstance(value, str) else None
+    )
     if canonical is None:
         raise ValueError(
             f"content_type must be one of {CONTENT_TYPES} (case-insensitive); got {value!r}"

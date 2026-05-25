@@ -90,8 +90,9 @@ class TestSyncClient:
     def test_capture_normalizes_lowercase_content_type(self, sync_client):
         client, mock_http, mock_resp = sync_client
         mock_resp.json.return_value = {"doc_id": "WEB-002"}
-        client.capture("https://example.com", content_type="bid")
+        client.capture("https://example.com", content_type="  bid  ")
         body = mock_http.post.call_args.kwargs["json"]
+        # Server strips + lowercases before lookup; the SDK matches that.
         assert body["content_type"] == "Bid"
 
     def test_capture_rejects_unknown_content_type(self, sync_client):
@@ -230,6 +231,12 @@ class TestAsyncClient:
         result = await client.capture("https://example.org", content_type="Knowledge")
         assert result["doc_id"] == "WEB-002"
         assert mock_http.post.call_args.kwargs["json"]["content_type"] == "Knowledge"
+
+    @pytest.mark.asyncio
+    async def test_async_capture_validates_content_type(self, async_client):
+        client, _mock_http, _mock_resp = async_client
+        with pytest.raises(ValueError, match="content_type must be one of"):
+            await client.capture("https://example.org", content_type="Cntract")
 
     @pytest.mark.asyncio
     async def test_async_get_digest(self, async_client):
