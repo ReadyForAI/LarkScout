@@ -143,6 +143,7 @@ Request parameters:
 | --------------------- | ------ | ---------- | --------------------------------------------------------------------------------------- |
 | `file`                | File   | (required) | File to upload (.pdf, .doc/.docx, .ppt/.pptx, .xls/.xlsx, .csv, .html/.htm, .txt/.text, .json/.jsonl/.xml) |
 | `doc_id`              | string | Auto-increment | Manually specify DOC-ID                                                             |
+| `content_type`        | string | `General`  | Library category: `General`, `Contract`, `Bid`, or `Knowledge`                      |
 | `generate_summary`    | bool   | `true`     | Whether to generate summaries (false = extract text only)                               |
 | `summary_mode`        | string | null       | Summary mode: `sync` / `defer` / `off`. Use `defer` for large documents and business Skills |
 | `document_profile`    | string | null       | Optional document profile name; pass only when the caller knows an available profile    |
@@ -166,6 +167,7 @@ Call example:
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@report.pdf" \
+  -F "content_type=General" \
   -F "generate_summary=true" \
   -F "extract_tables=true" \
   -F 'tags=["Q3","financial"]'
@@ -178,6 +180,7 @@ Recommended ingestion for embedded Word images is to create a lightweight image 
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@/path/to/document.docx" \
+  -F "content_type=Bid" \
   -F "summary_mode=defer" \
   -F "extract_tables=true" \
   -F "extract_images=true" \
@@ -191,6 +194,7 @@ If a caller really needs OCR during ingestion, explicitly limit the image count 
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@/path/to/document.docx" \
+  -F "content_type=Bid" \
   -F "summary_mode=defer" \
   -F "extract_images=true" \
   -F "ocr_images=true" \
@@ -208,6 +212,7 @@ Generic ingestion example with metadata:
 ```bash
 curl -X POST http://localhost:9898/doc/parse \
   -F "file=@/path/to/document.pdf" \
+  -F "content_type=Contract" \
   -F "summary_mode=defer" \
   -F "extract_tables=true" \
   -F 'metadata={"display_name":"document.pdf","source_system":"manual_upload"}'
@@ -226,12 +231,14 @@ Response example:
   "doc_id": "DOC-010",
   "filename": "report.pdf",
   "file_type": "pdf",
+  "content_type": "General",
+  "storage_path": "General/DOC-010",
   "total_pages": 45,
   "section_count": 12,
   "table_count": 8,
   "ocr_page_count": 3,
   "digest": "Q3 revenue grew 15%, net profit up 23% YoY...",
-  "manifest_path": "docs/DOC-010/manifest.json",
+  "manifest_path": "docs/General/DOC-010/manifest.json",
   "processing_time_sec": 23.5,
   "source_ref": "source/report.pdf"
 }
@@ -241,6 +248,7 @@ Response example:
 
 - The returned `digest` field already contains the first 300 characters of the summary — Agent usually doesn't need an extra call to `/doc/library/{doc_id}/digest`
 - `generate_summary=false` extracts text and tables only without calling LLM — faster but no summary
+- `content_type` defaults to `General` when omitted; pass `Contract`, `Bid`, or `Knowledge` when the caller already knows the business category
 - `metadata` should be a JSON object; nested objects are preserved in manifest, while shallow scalar fields are available for filtering in `/doc/library/search`
 - `source_ref` points to the stored upload inside the document directory when `LARKSCOUT_STORE_SOURCE_FILES=true`
 - Large files (100+ page PDFs) may take 30–60 seconds to parse — Agents should set a longer timeout
@@ -254,6 +262,7 @@ Response example:
 | `q`         | Keyword (searches filename, digest, tags, metadata summary) |
 | `tags`      | Tag filter, comma-separated                         |
 | `file_type` | File type filter (`pdf` / `docx` / `web`)           |
+| `content_type` | Category filter: `General`, `Contract`, `Bid`, or `Knowledge` |
 | `metadata.*`| Equality-style metadata filters, e.g. `metadata.customer=ACME` |
 | `limit`     | Maximum results (default 20)                        |
 
@@ -266,6 +275,8 @@ Response example:
       "doc_id": "DOC-010",
       "filename": "Q3-report.pdf",
       "file_type": "pdf",
+      "content_type": "General",
+      "storage_path": "General/DOC-010",
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
@@ -291,6 +302,7 @@ Response example:
 | `q`         | Required query string |
 | `tags`      | Tag filter, comma-separated |
 | `file_type` | File type filter |
+| `content_type` | Category filter: `General`, `Contract`, `Bid`, or `Knowledge` |
 | `doc_id`    | Restrict to one document |
 | `scope`     | `all` / `full` / `section` (default `all`) |
 | `limit`     | Maximum results (default 20) |
@@ -305,6 +317,8 @@ Response example:
       "doc_id": "DOC-010",
       "filename": "Q3-report.pdf",
       "file_type": "pdf",
+      "content_type": "General",
+      "storage_path": "General/DOC-010",
       "digest": "Q3 revenue grew 15%...",
       "tags": ["Q3", "financial"],
       "source": "upload",
@@ -415,7 +429,24 @@ All parsed results are stored under `DOCS_DIR`:
 docs/
   ├─ doc-index.json              ← Global index (v2 format, shared with LarkScout Browser)
   │
-  ├─ DOC-001/                    ← PDF parsed results
+  ├─ General/
+  │   └─ DOC-001/                ← Default categorized parsed results
+  │       ├─ .meta.json
+  │       ├─ manifest.json
+  │       ├─ source/
+  │       ├─ digest.md
+  │       ├─ brief.md
+  │       ├─ full.md
+  │       ├─ sections/
+  │       ├─ tables/
+  │       ├─ images.json
+  │       └─ images/
+  │
+  ├─ Contract/
+  ├─ Bid/
+  ├─ Knowledge/
+  │
+  ├─ DOC-001/                    ← Legacy flat parsed results remain readable
   │   ├─ .meta.json
   │   ├─ manifest.json           ← Contains provenance tracking
   │   ├─ source/                 ← Original uploaded file (when enabled)
@@ -435,18 +466,19 @@ docs/
   │       ├─ IMG-001.png
   │       └─ IMG-001.ocr.txt
   │
-  └─ WEB-001/                    ← Web capture results (written by LarkScout Browser, shared index)
-      ├─ manifest.json
-      ├─ digest.md
-      ├─ sections/
-      └─ tables/
+  └─ WEB-001/                    ← Legacy flat web capture results remain readable
+      └─ ...
 ```
+
+New ingested content is stored under `General/`, `Contract/`, `Bid/`, or `Knowledge/`. Direct reads still use `doc_id`; the service resolves the directory by checking `storage_path` (then `content_type`) in `doc-index.json`, scanning the category subdirectories, and finally falling back to the legacy flat `${LARKSCOUT_DOCS_DIR}/<doc_id>` layout.
 
 **doc-index.json v2 Key Fields:**
 
 | Field          | Description                                     |
 | -------------- | ----------------------------------------------- |
 | `id`           | DOC-001 / WEB-001                               |
+| `content_type` | `General`, `Contract`, `Bid`, or `Knowledge`    |
+| `storage_path` | Relative document directory, e.g. `Contract/DOC-001` |
 | `source`       | `"upload"` or `"web_capture"`                   |
 | `tags`         | Tag array                                       |
 | `metadata`     | Indexed scalar metadata copied from upload metadata |

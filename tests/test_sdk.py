@@ -78,22 +78,39 @@ class TestSyncClient:
         mock_resp.json.return_value = {
             "doc_id": "WEB-001", "digest": "test", "section_count": 3, "table_count": 1
         }
-        result = client.capture("https://example.com", tags=["test"])
+        result = client.capture("https://example.com", content_type="Knowledge", tags=["test"])
         assert result["doc_id"] == "WEB-001"
         call_kwargs = mock_http.post.call_args
         assert "capture" in call_kwargs.args[0]
         body = call_kwargs.kwargs["json"]
         assert body["url"] == "https://example.com"
+        assert body["content_type"] == "Knowledge"
         assert body["tags"] == ["test"]
+
+    def test_capture_normalizes_lowercase_content_type(self, sync_client):
+        client, mock_http, mock_resp = sync_client
+        mock_resp.json.return_value = {"doc_id": "WEB-002"}
+        client.capture("https://example.com", content_type="  bid  ")
+        body = mock_http.post.call_args.kwargs["json"]
+        # Server strips + lowercases before lookup; the SDK matches that.
+        assert body["content_type"] == "Bid"
+
+    def test_capture_rejects_unknown_content_type(self, sync_client):
+        client, _mock_http, _mock_resp = sync_client
+        import pytest
+
+        with pytest.raises(ValueError, match="content_type must be one of"):
+            client.capture("https://example.com", content_type="Cntract")
 
     def test_search(self, sync_client):
         client, mock_http, mock_resp = sync_client
         mock_resp.json.return_value = {"results": [], "total": 0}
-        result = client.search("revenue", limit=5)
+        result = client.search("revenue", content_type="Bid", limit=5)
         assert result["total"] == 0
         call_kwargs = mock_http.get.call_args
         assert "search" in call_kwargs.args[0]
         assert call_kwargs.kwargs["params"]["q"] == "revenue"
+        assert call_kwargs.kwargs["params"]["content_type"] == "Bid"
 
     def test_parse_accepts_skill_metadata_options(self, sync_client, tmp_path):
         client, mock_http, mock_resp = sync_client
@@ -105,6 +122,7 @@ class TestSyncClient:
             sample,
             summary_mode="defer",
             profile="tender_cn",
+            content_type="Bid",
             metadata={"app": "bid-manage"},
             project_id="P-001",
             source_role="tender_file",
@@ -114,6 +132,7 @@ class TestSyncClient:
 
         assert result["doc_id"] == "DOC-001"
         data = mock_http.post.call_args.kwargs["data"]
+        assert data["content_type"] == "Bid"
         assert data["summary_mode"] == "defer"
         assert data["document_profile"] == "tender_cn"
         assert data["id_strategy"] == "source_filename"
@@ -209,8 +228,15 @@ class TestAsyncClient:
         mock_resp.json.return_value = {
             "doc_id": "WEB-002", "digest": "d", "section_count": 1, "table_count": 0
         }
-        result = await client.capture("https://example.org")
+        result = await client.capture("https://example.org", content_type="Knowledge")
         assert result["doc_id"] == "WEB-002"
+        assert mock_http.post.call_args.kwargs["json"]["content_type"] == "Knowledge"
+
+    @pytest.mark.asyncio
+    async def test_async_capture_validates_content_type(self, async_client):
+        client, _mock_http, _mock_resp = async_client
+        with pytest.raises(ValueError, match="content_type must be one of"):
+            await client.capture("https://example.org", content_type="Cntract")
 
     @pytest.mark.asyncio
     async def test_async_get_digest(self, async_client):
@@ -230,5 +256,6 @@ class TestAsyncClient:
     async def test_async_search(self, async_client):
         client, mock_http, mock_resp = async_client
         mock_resp.json.return_value = {"results": [{"doc_id": "DOC-001"}], "total": 1}
-        result = await client.search("profit")
+        result = await client.search("profit", content_type="Contract")
         assert result["total"] == 1
+        assert mock_http.get.call_args.kwargs["params"]["content_type"] == "Contract"

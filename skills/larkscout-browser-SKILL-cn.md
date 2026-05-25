@@ -741,6 +741,7 @@ If false:
 ```json
 {
   "url": "https://example.com/article",
+  "content_type": "Knowledge",
   "tags": ["research", "Q3"],
   "extract_tables": true,
   "lang": "en-US",
@@ -751,6 +752,7 @@ If false:
 | Parameter        | Type     | Default        | 说明 |
 | ---------------- | -------- | -------------- | ---- |
 | `url`            | string   | (required)     | 要抓取的 URL |
+| `content_type`   | string   | `"General"`    | 文档库分类：`General`、`Contract`、`Bid`、`Knowledge` |
 | `tags`           | string[] | `[]`           | 写入文档库的标签 |
 | `extract_tables` | bool     | `true`         | 是否提取 HTML 表格 |
 | `lang`           | string   | `"en-US"`      | 浏览器语言环境 |
@@ -761,6 +763,8 @@ If false:
 ```json
 {
   "doc_id": "WEB-005",
+  "content_type": "Knowledge",
+  "storage_path": "Knowledge/WEB-005",
   "digest": "Article covers Q3 revenue trends across regions...",
   "section_count": 8,
   "table_count": 2
@@ -771,6 +775,7 @@ If false:
 
 - 这是一个便捷接口，内部会执行：`session/new → goto → distill → persist → session/close`
 - 抓取结果会持久化到文档库（与 DocReader 共用同一个 `doc-index.json`）
+- 未传 `content_type` 时默认入库到 `General`；新抓取结果会保存到 `docs/<content_type>/<doc_id>`
 - 即使发生错误，session 也一定会被关闭
 - 有并发限流：并发抓取过多时会返回 `429`
 - URL 校验：私有 IP、localhost、非 HTTP(S) 协议都会被拦截
@@ -929,8 +934,8 @@ Option C: need full data → prompt user to export CSV/XLSX, hand off to LarkSco
 distill(extract_tables=true, include_actions=false)
 ↓
 Separate text sections and table sections:
-  text sections → docs/WEB-xxx/sections/
-  table sections → docs/WEB-xxx/tables/
+  text sections → docs/<content_type>/WEB-xxx/sections/
+  table sections → docs/<content_type>/WEB-xxx/tables/
 ↓
 Table section Markdown content and table_meta written together
 ↓
@@ -938,6 +943,8 @@ Shared doc-index.json index with XLSX / PDF parsed results
 ↓
 When Agent later searches "Q3 revenue", web tables and Excel tables are discovered uniformly
 ```
+
+使用 `content_type`（`General`、`Contract`、`Bid`、`Knowledge`）可以把网页抓取结果放入和上传文档一致的分类文档库结构。旧版平铺的 `docs/WEB-xxx` 抓取结果仍可读取。
 
 ---
 
