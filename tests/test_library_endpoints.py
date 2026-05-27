@@ -648,3 +648,111 @@ class TestInputValidation:
     def test_capture_private_ip_blocked(self, client: TestClient):
         resp = client.post("/web/capture", json={"url": "http://169.254.169.254/latest"})
         assert resp.status_code in (400, 422)
+
+
+# ---------------------------------------------------------------------------
+# /doc/parse explicit doc_id collision protection (Layer 1 dedup)
+# ---------------------------------------------------------------------------
+
+
+class TestParseReplaceProtection:
+    def test_collision_without_replace_returns_409(self, client: TestClient):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            existing_id = "REPLACE-TEST-001"
+            _setup_doc(docs_dir, existing_id, content_type="Contract")
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.post(
+                    "/doc/parse",
+                    files={"file": ("test.pdf", b"%PDF-1.4 minimal", "application/pdf")},
+                    data={"doc_id": existing_id},
+                )
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert existing_id in detail
+        assert "replace=true" in detail
+
+    def test_collision_with_replace_bypasses_check(self, client: TestClient):
+        """replace=true must let the handler proceed past the 409 guard.
+
+        We send a stub PDF body and only assert the collision check itself
+        was not raised; downstream parse-level errors are out of scope here.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            existing_id = "REPLACE-TEST-002"
+            _setup_doc(docs_dir, existing_id, content_type="Contract")
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.post(
+                    "/doc/parse",
+                    files={"file": ("test.pdf", b"%PDF-1.4 minimal", "application/pdf")},
+                    data={"doc_id": existing_id, "replace": "true"},
+                )
+        assert resp.status_code != 409
+
+    def test_parse_response_model_defaults_dedup_to_miss(self):
+        import larkscout_docreader
+
+        fields = larkscout_docreader.ParseResponse.model_fields
+        assert "dedup" in fields
+        assert fields["dedup"].default == "miss"
+
+    def test_replace_preserves_existing_content_type(self, client: TestClient):
+        """replace=true must reuse the existing doc's content_type so the
+        new write lands in the same category directory instead of orphaning
+        the old artifacts under Contract/ and writing fresh ones under General/."""
+        sample_pdf = Path(__file__).parent / "e2e" / "fixtures" / "sample.pdf"
+        if not sample_pdf.exists():
+            pytest.skip(f"sample.pdf fixture missing: {sample_pdf}")
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            existing_id = "REPLACE-TEST-003"
+            _setup_doc(docs_dir, existing_id, content_type="Contract")
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.post(
+                    "/doc/parse",
+                    files={
+                        "file": ("sample.pdf", sample_pdf.read_bytes(), "application/pdf"),
+                    },
+                    data={
+                        "doc_id": existing_id,
+                        "replace": "true",
+                        "content_type": "General",
+                        "generate_summary": "false",
+                    },
+                )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["dedup"] == "replaced"
+        assert body["content_type"] == "Contract"
+        assert body["storage_path"] == f"Contract/{existing_id}"
+
+    @pytest.mark.asyncio
+    async def test_optional_doc_id_lock_reuses_lock_per_id(self):
+        """While a request is inside `async with _optional_doc_id_lock(id)`,
+        any concurrent same-id lookup must see the same Lock instance —
+        that's how concurrent same-explicit-id parses serialize."""
+        import larkscout_docreader
+
+        async with larkscout_docreader._optional_doc_id_lock("LOCK-A"):
+            lock_a = larkscout_docreader._doc_id_parse_locks["LOCK-A"]
+            lock_a_again = larkscout_docreader._doc_id_parse_locks["LOCK-A"]
+            assert lock_a is lock_a_again
+            async with larkscout_docreader._optional_doc_id_lock("LOCK-B"):
+                lock_b = larkscout_docreader._doc_id_parse_locks["LOCK-B"]
+                assert lock_b is not lock_a
+
+    @pytest.mark.asyncio
+    async def test_optional_doc_id_lock_entry_collected_after_release(self):
+        """WeakValueDictionary releases entries once no request still holds
+        the lock — keeps long-running servers from leaking one Lock per id
+        when callers churn through high-cardinality explicit doc_ids."""
+        import gc
+
+        import larkscout_docreader
+
+        larkscout_docreader._doc_id_parse_locks.pop("LOCK-EPHEMERAL", None)
+        async with larkscout_docreader._optional_doc_id_lock("LOCK-EPHEMERAL"):
+            assert "LOCK-EPHEMERAL" in larkscout_docreader._doc_id_parse_locks
+        gc.collect()
+        assert "LOCK-EPHEMERAL" not in larkscout_docreader._doc_id_parse_locks
