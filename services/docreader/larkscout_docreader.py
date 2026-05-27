@@ -197,20 +197,52 @@ def _extract_markdown_table_blocks(text: str) -> list[str]:
     for each table. Used to populate PageContent.tables for MarkItDown-derived
     formats (docx/pptx/html/etc.) so the table-sidecar writer has structured
     input.
+
+    Lines inside fenced code blocks (``` or ~~~) are skipped so example tables
+    embedded in code samples don't produce spurious entries. Back-to-back
+    tables with no blank-line gap are split on the second separator row so the
+    count matches the legacy regex-based `_count_markdown_tables`.
     """
     lines = text.splitlines()
-    sep_re = re.compile(r"^\|[\s\-:|]+\|$")
+    # Separator must contain at least one '-' to distinguish it from an
+    # all-empty-cell row like `|  |  |` (which the legacy [\s\-:|]+ allowed).
+    sep_re = re.compile(r"^\|[\s:|]*-[\s\-:|]*\|$")
     row_re = re.compile(r"^\|.*\|$")
+    fence_re = re.compile(r"^(```|~~~)")
+
+    in_fence = False
+    eligible: list[bool] = []
+    for line in lines:
+        stripped = line.strip()
+        if fence_re.match(stripped):
+            in_fence = not in_fence
+            eligible.append(False)
+            continue
+        eligible.append(not in_fence)
+
     blocks: list[str] = []
     used: set[int] = set()
     for i, line in enumerate(lines):
-        if i in used or not sep_re.match(line.strip()):
+        if i in used or not eligible[i] or not sep_re.match(line.strip()):
             continue
         start = i
-        while start > 0 and row_re.match(lines[start - 1].strip()) and (start - 1) not in used:
+        while (
+            start > 0
+            and eligible[start - 1]
+            and row_re.match(lines[start - 1].strip())
+            and (start - 1) not in used
+        ):
             start -= 1
         end = i
-        while end + 1 < len(lines) and row_re.match(lines[end + 1].strip()):
+        while end + 1 < len(lines) and eligible[end + 1] and row_re.match(lines[end + 1].strip()):
+            # Don't consume the next table's header row: if the line after
+            # `end+1` is a separator, then `end+1` belongs to the next table.
+            if (
+                end + 2 < len(lines)
+                and eligible[end + 2]
+                and sep_re.match(lines[end + 2].strip())
+            ):
+                break
             end += 1
         used.update(range(start, end + 1))
         blocks.append("\n".join(lines[start : end + 1]))
