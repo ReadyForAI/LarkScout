@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -50,6 +52,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 MAX_PARSE_ROWS = int(os.environ.get("LARKSCOUT_MAX_PARSE_ROWS", "100000"))
 _MAX_CONCURRENT_PARSE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_PARSE", "2"))
 _parse_sem = asyncio.Semaphore(_MAX_CONCURRENT_PARSE)
+
+# Per-doc_id locks serialize concurrent /doc/parse requests that pin the same
+# explicit doc_id, so the existence check + write reservation can't race past
+# each other when _MAX_CONCURRENT_PARSE > 1.
+#
+# WeakValueDictionary so entries vanish once no request still references the
+# Lock — long-running servers receiving high-cardinality explicit ids would
+# otherwise leak one Lock per id forever. While requests are queued on a
+# lock their `async with lock:` frame keeps it alive.
+_doc_id_parse_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+_doc_id_parse_locks_guard = asyncio.Lock()
+
+
+@contextlib.asynccontextmanager
+async def _optional_doc_id_lock(doc_id: str | None):
+    """Hold a per-doc_id lock for the duration of the parse when doc_id is pinned."""
+    if not doc_id:
+        yield
+        return
+    async with _doc_id_parse_locks_guard:
+        lock = _doc_id_parse_locks.get(doc_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _doc_id_parse_locks[doc_id] = lock
+    async with lock:
+        yield
 
 SUPPORTED_FORMATS = [
     "pdf",
@@ -4794,13 +4822,23 @@ def _doc_exists_anywhere(docs_dir: Path, doc_id: str) -> bool:
 
 
 def _doc_content_type(docs_dir: Path, doc_id: str) -> str:
-    entry = _find_doc_index_entry(docs_dir, doc_id)
-    if entry and isinstance(entry.get("content_type"), str):
-        try:
-            return _normalize_content_type(entry.get("content_type"))
-        except HTTPException:
-            pass
-    doc_dir = _resolve_doc_dir(docs_dir, doc_id)
+    # Derive from the on-disk doc directory first — that's the authoritative
+    # location. doc-index.json may carry a stale content_type that points at a
+    # directory that no longer holds the manifest, and trusting it would let
+    # `replace=true` write the new artifacts under the wrong category dir
+    # (orphaning the real files).
+    try:
+        doc_dir = _resolve_doc_dir(docs_dir, doc_id)
+    except HTTPException:
+        return "General"
+    try:
+        rel_parts = doc_dir.relative_to(docs_dir).parts
+    except ValueError:
+        rel_parts = ()
+    if len(rel_parts) >= 2 and rel_parts[0] in CONTENT_TYPE_DIRS:
+        return rel_parts[0]
+    # Legacy flat layout (or unrecognized prefix): consult the manifest, then
+    # the index, then default to General.
     manifest_path = doc_dir / "manifest.json"
     if manifest_path.exists():
         try:
@@ -4808,6 +4846,12 @@ def _doc_content_type(docs_dir: Path, doc_id: str) -> str:
             if isinstance(manifest, dict) and isinstance(manifest.get("content_type"), str):
                 return _normalize_content_type(manifest.get("content_type"))
         except Exception:
+            pass
+    entry = _find_doc_index_entry(docs_dir, doc_id)
+    if entry and isinstance(entry.get("content_type"), str):
+        try:
+            return _normalize_content_type(entry.get("content_type"))
+        except HTTPException:
             pass
     return "General"
 
@@ -4875,6 +4919,9 @@ class ParseResponse(BaseModel):
     manifest_path: str
     processing_time_sec: float
     source_ref: str | None = None
+    # "miss"     — new parse, no collision
+    # "replaced" — explicit doc_id collided and replace=true allowed overwrite
+    dedup: str = "miss"
 
 
 class SectionInfo(BaseModel):
@@ -6282,18 +6329,53 @@ async def api_parse_doc(
     concurrency: int = Form(3),
     tags: str | None = Form(None),  # JSON array string: '["Q3","financial"]'
     metadata: str | None = Form(None),  # JSON object string
+    replace: bool = Form(False),
 ):
     """Parse uploaded document (PDF/DOCX), return structured result."""
     if _parse_sem.locked():
         raise HTTPException(429, "too many concurrent parse requests")
-    async with _parse_sem:
+    # The per-doc lock must wrap _parse_sem so a request blocked waiting on
+    # another same-doc_id parse doesn't sit inside the global parse slot —
+    # otherwise unrelated documents get 429'd while one same-id queue drains.
+    async with _optional_doc_id_lock(doc_id), _parse_sem:
         docs_dir = _get_docs_dir()
         t0 = time.time()
+        # Guard against silent overwrite when the caller pins an explicit
+        # doc_id that already exists. Auto-resolved doc_ids (counter /
+        # source_filename) can't collide because the resolvers always
+        # pick a fresh id. The _optional_doc_id_lock above serializes
+        # same-explicit-id requests so this check + the eventual manifest
+        # write are one critical section under _MAX_CONCURRENT_PARSE > 1.
+        will_replace = bool(doc_id and _doc_exists_anywhere(docs_dir, doc_id))
+        if will_replace and not replace:
+            raise HTTPException(
+                409,
+                f"doc_id '{doc_id}' already exists. "
+                f"Pass replace=true to overwrite, or omit doc_id to get a fresh one.",
+            )
+        dedup_status = "replaced" if will_replace else "miss"
         parsed_metadata = _parse_metadata_form(metadata)
-        selected_content_type = _normalize_content_type(
-            content_type or str(parsed_metadata.get("content_type") or "General")
-        )
-        parsed_metadata.setdefault("content_type", selected_content_type)
+        if will_replace:
+            # Preserve the existing doc's content_type so replace=true can't
+            # leave orphans in a different category directory. The caller's
+            # content_type is silently overridden because they already
+            # asked to replace this specific doc.
+            existing_content_type = _doc_content_type(docs_dir, doc_id)
+            requested_ct_normalized = _normalize_content_type(
+                content_type or str(parsed_metadata.get("content_type") or "General")
+            )
+            if requested_ct_normalized != existing_content_type:
+                logger.info(
+                    "replace=true: overriding requested content_type '%s' with existing '%s' for doc_id %s",
+                    requested_ct_normalized, existing_content_type, doc_id,
+                )
+            selected_content_type = existing_content_type
+            parsed_metadata["content_type"] = selected_content_type
+        else:
+            selected_content_type = _normalize_content_type(
+                content_type or str(parsed_metadata.get("content_type") or "General")
+            )
+            parsed_metadata.setdefault("content_type", selected_content_type)
         requested_parse_mode = (
             str(parse_mode or parsed_metadata.get("parse_mode") or "").strip()
             or os.environ.get("LARKSCOUT_PDF_PARSE_MODE", "").strip()
@@ -6578,6 +6660,7 @@ async def api_parse_doc(
             source_ref=source_record.get("ref"),
             content_type=selected_content_type,
             storage_path=_doc_storage_rel_path(d_id, selected_content_type),
+            dedup=dedup_status,
         )
 
 
