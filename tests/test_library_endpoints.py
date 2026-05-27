@@ -756,3 +756,86 @@ class TestParseReplaceProtection:
             assert "LOCK-EPHEMERAL" in larkscout_docreader._doc_id_parse_locks
         gc.collect()
         assert "LOCK-EPHEMERAL" not in larkscout_docreader._doc_id_parse_locks
+
+    @pytest.mark.asyncio
+    async def test_next_filename_doc_id_skips_reserved_id(self):
+        """When a same-base id is reserved in _doc_id_parse_locks (an
+        in-flight parse), the resolver must roll to the next candidate so two
+        concurrent same-filename uploads don't both pick the same id."""
+        import asyncio
+
+        import larkscout_docreader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            held_lock = asyncio.Lock()
+            larkscout_docreader._doc_id_parse_locks["report1"] = held_lock
+            try:
+                picked = larkscout_docreader._next_filename_doc_id(docs_dir, "report1.pdf")
+                assert picked == "report1-2"
+            finally:
+                larkscout_docreader._doc_id_parse_locks.pop("report1", None)
+                del held_lock
+
+    @pytest.mark.asyncio
+    async def test_next_filename_doc_id_handles_max_length_base(self):
+        """An 80-char sanitized base that's already reserved would otherwise
+        loop forever because `f"{base}-2"[:80]` is just `base`. The resolver
+        must reserve room for the suffix and produce a distinct candidate."""
+        import asyncio
+
+        import larkscout_docreader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            # 80-char base ending in a digit so _DOC_ID_RE matches.
+            base = ("a" * 79) + "1"
+            assert len(base) == 80
+            held_lock = asyncio.Lock()
+            larkscout_docreader._doc_id_parse_locks[base] = held_lock
+            try:
+                picked = larkscout_docreader._next_filename_doc_id(docs_dir, f"{base}.pdf")
+                assert picked != base
+                assert picked is not None and picked.endswith("-2")
+                assert len(picked) <= 80
+            finally:
+                larkscout_docreader._doc_id_parse_locks.pop(base, None)
+                del held_lock
+
+    def test_oversized_upload_does_not_advance_counter(self, client: TestClient):
+        """413 on oversized upload must not burn a counter slot — the next
+        well-sized upload should still get DOC-001."""
+        import larkscout_docreader
+
+        oversize = b"x" * (larkscout_docreader.MAX_UPLOAD_BYTES + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp_big = client.post(
+                    "/doc/parse",
+                    files={"file": ("huge.pdf", oversize, "application/pdf")},
+                )
+                assert resp_big.status_code == 413
+                # Counter file should not have been created/advanced
+                counter_path = docs_dir / ".counter"
+                assert not counter_path.exists()
+
+    def test_oversized_upload_cleans_scratch_file(self, client: TestClient):
+        """413 must remove the streamed scratch tempfile — repeated rejected
+        uploads would otherwise accumulate large `larkscout-upload-*` files
+        in the system tmp dir."""
+        import larkscout_docreader
+
+        before = {p.name for p in Path(tempfile.gettempdir()).glob("larkscout-upload-*")}
+        oversize = b"x" * (larkscout_docreader.MAX_UPLOAD_BYTES + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            with patch("larkscout_docreader._get_docs_dir", return_value=docs_dir):
+                resp = client.post(
+                    "/doc/parse",
+                    files={"file": ("huge.pdf", oversize, "application/pdf")},
+                )
+                assert resp.status_code == 413
+        after = {p.name for p in Path(tempfile.gettempdir()).glob("larkscout-upload-*")}
+        leaked = after - before
+        assert leaked == set(), f"scratch files leaked after 413: {leaked}"

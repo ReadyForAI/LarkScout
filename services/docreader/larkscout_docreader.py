@@ -53,6 +53,15 @@ MAX_PARSE_ROWS = int(os.environ.get("LARKSCOUT_MAX_PARSE_ROWS", "100000"))
 _MAX_CONCURRENT_PARSE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_PARSE", "2"))
 _parse_sem = asyncio.Semaphore(_MAX_CONCURRENT_PARSE)
 
+# Bound concurrent upload reads so a burst of large requests can't allocate
+# unbounded memory before any parse slot is acquired. The doc_id reservation
+# and `_parse_sem` are deliberately downstream — this gate covers only the
+# upload-buffer footprint.
+_MAX_CONCURRENT_UPLOAD = int(
+    os.environ.get("LARKSCOUT_MAX_CONCURRENT_UPLOAD", str(_MAX_CONCURRENT_PARSE))
+)
+_upload_sem = asyncio.Semaphore(_MAX_CONCURRENT_UPLOAD)
+
 # Per-doc_id locks serialize concurrent /doc/parse requests that pin the same
 # explicit doc_id, so the existence check + write reservation can't race past
 # each other when _MAX_CONCURRENT_PARSE > 1.
@@ -4876,10 +4885,25 @@ def _next_filename_doc_id(docs_dir: Path, filename: str) -> str | None:
         return None
     candidate = base
     suffix = 2
-    while _doc_exists_anywhere(docs_dir, candidate):
-        numbered = f"{base}-{suffix}"
-        candidate = numbered[:80].rstrip("-")
+    # `candidate in _doc_id_parse_locks` filters out ids that another concurrent
+    # parse has reserved but not yet written a manifest for, preventing two
+    # same-filename uploads from racing past this check and both choosing the
+    # same id. Caller must hold `_doc_id_parse_locks_guard` so the check + the
+    # subsequent insert in the dict are atomic.
+    while _doc_exists_anywhere(docs_dir, candidate) or candidate in _doc_id_parse_locks:
+        # Reserve room for "-<suffix>" inside the 80-char limit so we always
+        # produce a candidate distinct from `base`. Without this, an 80-char
+        # `base` that's already reserved would loop forever — `f"{base}-2"[:80]`
+        # is just `base`, leaving the candidate unchanged.
+        suffix_str = f"-{suffix}"
+        head_len = max(1, 80 - len(suffix_str))
+        next_candidate = (base[:head_len] + suffix_str).rstrip("-")
+        if not next_candidate or next_candidate == candidate:
+            return None
+        candidate = next_candidate
         suffix += 1
+        if suffix > 10000:
+            return None
     return candidate if _DOC_ID_RE.match(candidate) else None
 
 
@@ -5286,19 +5310,37 @@ def _safe_source_filename(filename: str) -> str:
     return f"{safe_stem}{suffix}" if suffix else safe_stem
 
 
-def _persist_source_file(doc_dir: Path, filename: str, content: bytes) -> dict[str, Any]:
+def _persist_source_file(doc_dir: Path, filename: str, source_path: Path) -> dict[str, Any]:
     source_dir = doc_dir / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_source_filename(filename)
     target = source_dir / safe_name
-    _write_bytes(target, content)
+    # Stream copy + sha256 into a sibling .tmp file, then atomically rename.
+    # Direct write to `target` would truncate an existing source file on disk
+    # error during replace=true (manifest stays, source is corrupted).
+    tmp = source_dir / (safe_name + ".tmp")
+    hasher = hashlib.sha256()
+    size = 0
+    try:
+        with open(source_path, "rb") as src, open(tmp, "wb") as dst:
+            while chunk := src.read(1024 * 1024):
+                dst.write(chunk)
+                hasher.update(chunk)
+                size += len(chunk)
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return {
         "kind": "upload",
         "filename": filename,
         "stored_filename": safe_name,
         "ref": f"source/{safe_name}",
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "size_bytes": len(content),
+        "sha256": hasher.hexdigest(),
+        "size_bytes": size,
     }
 
 
@@ -6334,334 +6376,416 @@ async def api_parse_doc(
     """Parse uploaded document (PDF/DOCX), return structured result."""
     if _parse_sem.locked():
         raise HTTPException(429, "too many concurrent parse requests")
-    # The per-doc lock must wrap _parse_sem so a request blocked waiting on
-    # another same-doc_id parse doesn't sit inside the global parse slot —
-    # otherwise unrelated documents get 429'd while one same-id queue drains.
-    async with _optional_doc_id_lock(doc_id), _parse_sem:
-        docs_dir = _get_docs_dir()
-        t0 = time.time()
-        # Guard against silent overwrite when the caller pins an explicit
-        # doc_id that already exists. Auto-resolved doc_ids (counter /
-        # source_filename) can't collide because the resolvers always
-        # pick a fresh id. The _optional_doc_id_lock above serializes
-        # same-explicit-id requests so this check + the eventual manifest
-        # write are one critical section under _MAX_CONCURRENT_PARSE > 1.
-        will_replace = bool(doc_id and _doc_exists_anywhere(docs_dir, doc_id))
-        if will_replace and not replace:
-            raise HTTPException(
-                409,
-                f"doc_id '{doc_id}' already exists. "
-                f"Pass replace=true to overwrite, or omit doc_id to get a fresh one.",
-            )
-        dedup_status = "replaced" if will_replace else "miss"
-        parsed_metadata = _parse_metadata_form(metadata)
-        if will_replace:
-            # Preserve the existing doc's content_type so replace=true can't
-            # leave orphans in a different category directory. The caller's
-            # content_type is silently overridden because they already
-            # asked to replace this specific doc.
-            existing_content_type = _doc_content_type(docs_dir, doc_id)
-            requested_ct_normalized = _normalize_content_type(
-                content_type or str(parsed_metadata.get("content_type") or "General")
-            )
-            if requested_ct_normalized != existing_content_type:
-                logger.info(
-                    "replace=true: overriding requested content_type '%s' with existing '%s' for doc_id %s",
-                    requested_ct_normalized, existing_content_type, doc_id,
-                )
-            selected_content_type = existing_content_type
-            parsed_metadata["content_type"] = selected_content_type
-        else:
-            selected_content_type = _normalize_content_type(
-                content_type or str(parsed_metadata.get("content_type") or "General")
-            )
-            parsed_metadata.setdefault("content_type", selected_content_type)
-        requested_parse_mode = (
-            str(parse_mode or parsed_metadata.get("parse_mode") or "").strip()
-            or os.environ.get("LARKSCOUT_PDF_PARSE_MODE", "").strip()
-            or None
-        )
-        field_ocr_profile = (
-            str(document_profile or parsed_metadata.get("document_profile") or "").strip()
-            or str(parsed_metadata.get("field_ocr_profile") or "").strip()
-            or os.environ.get("LARKSCOUT_FIELD_OCR_PROFILE", "").strip()
-            or None
-        )
-        if field_ocr_profile:
-            canonical_profile = _DOCUMENT_PROFILE_ALIASES.get(field_ocr_profile, field_ocr_profile)
-            if canonical_profile != field_ocr_profile:
-                field_ocr_profile = canonical_profile
-                if parsed_metadata.get("document_profile"):
-                    parsed_metadata["document_profile"] = canonical_profile
-        requested_field_ocr_config = (
-            str(field_ocr_config or parsed_metadata.get("field_ocr_config") or "").strip()
-            or os.environ.get("LARKSCOUT_FIELD_OCR_CONFIG", "").strip()
-            or None
-        )
-        requested_summary_mode = (
-            str(summary_mode or parsed_metadata.get("summary_mode") or "").strip()
-            or None
-        )
-        for key, value in {
-            "summary_mode": requested_summary_mode,
-            "document_profile": field_ocr_profile,
-            "field_ocr_config": requested_field_ocr_config,
-            "parse_mode": requested_parse_mode,
-            "id_strategy": id_strategy,
-            "skip_ocr_pages": skip_ocr_pages,
-            "extract_images": str(bool(extract_images)).lower() if extract_images else "",
-            "ocr_images": str(bool(ocr_images)).lower() if ocr_images else "",
-            "image_ocr_backend": image_ocr_backend if extract_images else "",
-            "max_images": str(max_images) if extract_images else "",
-            "max_ocr_images": str(max_ocr_images) if ocr_images else "",
-        }.items():
-            if value:
-                parsed_metadata.setdefault(key, value)
-        selected_image_ocr_backend = (image_ocr_backend or "auto").strip().lower()
-        if selected_image_ocr_backend not in {"auto", "local", "llm"}:
-            raise HTTPException(422, "image_ocr_backend must be one of: auto, local, llm")
-        max_images = max(0, min(int(max_images), 1000))
-        max_ocr_images = max(0, min(int(max_ocr_images), 1000))
-        manual_blank_pages_spec = (
-            _metadata_page_range_spec(skip_ocr_pages)
-            or _metadata_page_range_spec(parsed_metadata.get("skip_ocr_pages"))
-            or _metadata_page_range_spec(parsed_metadata.get("blank_pages"))
-            or _metadata_page_range_spec(parsed_metadata.get("near_blank_pages"))
-            or _metadata_page_range_spec(parsed_metadata.get("manual_blank_pages"))
-        )
 
-        # Check format
-        filename = file.filename or "unknown"
-        suffix = Path(filename).suffix.lower()
-        if suffix not in SUPPORTED_EXTENSIONS:
-            raise HTTPException(422, t("unsupported_format", fmt=suffix))
+    docs_dir = _get_docs_dir()
+    filename = file.filename or "unknown"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(422, t("unsupported_format", fmt=suffix))
 
-        profile = _load_document_profile(field_ocr_profile, requested_field_ocr_config)
-        summary_mode = _resolve_summary_mode(
-            profile=profile,
-            parse_mode=requested_parse_mode,
-            generate_summary=generate_summary,
-            requested_mode=requested_summary_mode,
+    # Reject explicit-doc_id conflicts before streaming the body — the resolver
+    # returns the input verbatim for explicit ids, so the existence check
+    # doesn't need d_id. Catching this here means a conflicting upload can't
+    # waste disk + `_upload_sem` writing a scratch file just to be 409'd.
+    will_replace = bool(doc_id and _doc_exists_anywhere(docs_dir, doc_id))
+    if will_replace and not replace:
+        raise HTTPException(
+            409,
+            f"doc_id '{doc_id}' already exists. "
+            f"Pass replace=true to overwrite, or omit doc_id to get a fresh one.",
         )
+    dedup_status = "replaced" if will_replace else "miss"
 
-        # Parse tags
-        parsed_tags: list[str] = []
-        if tags:
-            try:
-                parsed_tags = json.loads(tags)
-            except json.JSONDecodeError:
-                parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
-
-        content = b""
+    # Stream the upload into a scratch file so the in-memory buffer never
+    # grows beyond one chunk; without this, requests queued on the per-doc
+    # lock or _parse_sem would each pin MAX_UPLOAD_BYTES until parse ends.
+    scratch_path: Path | None = None
+    # Place the scratch tempfile on the docs volume rather than the system tmp
+    # dir; in container/k8s setups /tmp is often a small tmpfs while docs_dir
+    # is the durable mount where the upload would eventually land anyway.
+    scratch_dir = docs_dir / ".upload-tmp"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    async with _upload_sem:
+        scratch_fd, scratch_path_str = tempfile.mkstemp(
+            suffix=suffix, prefix="larkscout-upload-", dir=str(scratch_dir)
+        )
+        scratch_path = Path(scratch_path_str)
+        total_size = 0
+        upload_ok = False
         try:
-            content = await file.read()
-            if len(content) > MAX_UPLOAD_BYTES:
-                raise HTTPException(
-                    413, f"file too large: {len(content)} bytes (max {MAX_UPLOAD_BYTES})"
-                )
-            # Avoid touching counters or storage for requests rejected by size validation.
-            d_id = _resolve_doc_id(docs_dir, filename, doc_id, id_strategy)
-            doc_storage_dir = _doc_storage_dir(docs_dir, d_id, selected_content_type)
-            tmp_dir = doc_storage_dir / ".tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = tmp_dir / filename
-            tmp_path.write_bytes(content)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, t("file_save_failed", err=str(e)))
-
-        # Parse
-        try:
-            loop = asyncio.get_event_loop()
-            if suffix == ".pdf":
-                should_prewarm_local_ocr = False
-                if PREWARM_LOCAL_OCR:
-                    try:
-                        should_prewarm_local_ocr = _should_prewarm_local_ocr_for_pdf(
-                            tmp_path,
-                            profile=profile,
-                            parse_mode=requested_parse_mode,
-                            force_ocr=force_ocr,
-                            ocr_pages_spec=ocr_pages,
-                            manual_blank_pages_spec=manual_blank_pages_spec,
-                            ocr_threshold=OCR_THRESHOLD,
-                        )
-                    except Exception as exc:
-                        logger.warning("Local OCR prewarm planning skipped before parse: %s", exc)
-                if should_prewarm_local_ocr:
-                    try:
-                        with _local_ocr_worker_lock:
-                            _get_local_ocr_worker()
-                        logger.info("Local OCR worker prewarmed before PDF parse")
-                    except Exception as exc:
-                        logger.warning("Local OCR worker prewarm skipped before parse: %s", exc)
-                parsed = await loop.run_in_executor(
-                    None,
-                    lambda: parse_pdf(
-                        tmp_path,
-                        force_ocr=force_ocr,
-                        ocr_threshold=OCR_THRESHOLD,
-                        ocr_pages_spec=ocr_pages,
-                        extract_tables=extract_tables,
-                        max_tables_per_page=max_tables_per_page,
-                        concurrency=concurrency,
-                        cache_dir=doc_storage_dir,
-                        field_ocr_profile=field_ocr_profile,
-                        field_ocr_config=requested_field_ocr_config,
-                        parse_mode=requested_parse_mode,
-                        manual_blank_pages_spec=manual_blank_pages_spec,
-                    ),
-                )
-            elif suffix in (".doc", ".docx"):
-                word_path = _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path
-                if extract_images:
-                    embedded_image_count = _count_word_embedded_image_references(word_path)
-                    requested_ocr_image_count = min(embedded_image_count, max_images)
-                    parsed_metadata.setdefault("embedded_image_count", embedded_image_count)
-                    parsed_metadata.setdefault("requested_image_count", requested_ocr_image_count)
-                    parsed_metadata.setdefault(
-                        "image_inventory_truncated",
-                        bool(embedded_image_count > requested_ocr_image_count),
-                    )
-                    if ocr_images:
-                        parsed_metadata.setdefault(
-                            "requested_ocr_image_count", requested_ocr_image_count
-                        )
-                    if ocr_images and requested_ocr_image_count > max_ocr_images:
+            # Wrap the fd in a Python file object so `.write()` handles partial
+            # writes internally — raw `os.write` may return short on some
+            # filesystems and silently truncate.
+            with os.fdopen(scratch_fd, "wb") as dst:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > MAX_UPLOAD_BYTES:
                         raise HTTPException(
-                            422,
-                            (
-                                "word embedded image OCR refused: "
-                                f"{requested_ocr_image_count} requested images exceeds "
-                                f"max_ocr_images={max_ocr_images} "
-                                f"(embedded_image_count={embedded_image_count}, max_images={max_images}). "
-                                "Retry with ocr_images=false, a higher max_ocr_images value, "
-                                "or a lower max_images value."
-                            ),
+                            413,
+                            f"file too large: {total_size} bytes (max {MAX_UPLOAD_BYTES})",
                         )
-                parsed = await loop.run_in_executor(
-                    None,
-                    lambda: parse_word(
-                        word_path,
-                        extract_tables=extract_tables,
-                        profile=profile,
-                        extract_images=extract_images,
-                        ocr_images=ocr_images,
-                        image_ocr_backend=selected_image_ocr_backend,
-                        max_images=max_images,
-                    ),
-                )
-            elif suffix in (".xlsx", ".xls"):
-                parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
-            elif suffix == ".csv":
-                parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
-            elif suffix == ".ppt":
-                parsed = await loop.run_in_executor(
-                    None, lambda: parse_generic(_convert_legacy_office(tmp_path, "pptx"), profile=profile)
-                )
-            else:  # .pptx, .html, .htm, etc.
-                parsed = await loop.run_in_executor(None, lambda: parse_generic(tmp_path, profile=profile))
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, t("parse_failed", err=str(e)))
+                    dst.write(chunk)
+            upload_ok = True
         finally:
-            # Cleanup temp file
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            # The outer try/finally below only catches errors raised after
+            # upload completes. Clean up the scratch file here if the upload
+            # itself failed (413, read error, etc.) so /tmp doesn't accumulate
+            # `larkscout-upload-*` files from rejected requests.
+            if not upload_ok:
+                try:
+                    scratch_path.unlink()
+                except OSError:
+                    pass
+                scratch_path = None
 
-        parsed.filename = filename
-        parsed.file_type = suffix.lstrip(".")
-        if suffix in {".doc", ".ppt"}:
-            parsed.metadata["converted_to"] = "docx" if suffix == ".doc" else "pptx"
-        parsed_locale = _parsed_document_locale(parsed)
+    try:
+        # The early-reject above was a snapshot before the upload started.
+        # Re-check now so a burst that crowded in past the snapshot fails fast
+        # instead of queueing scratch files against `_parse_sem`.
+        if _parse_sem.locked():
+            raise HTTPException(429, "too many concurrent parse requests")
+        # Atomically resolve the doc_id and reserve it via the per-doc lock dict.
+        # Holding `_doc_id_parse_locks_guard` around resolve + insert means
+        # concurrent same-explicit-id requests serialize, and concurrent
+        # source_filename uploads can't both pick the same id (the second sees
+        # the first's reservation via `_next_filename_doc_id`'s
+        # `in _doc_id_parse_locks` check and rolls to the next candidate).
+        async with _doc_id_parse_locks_guard:
+            d_id = _resolve_doc_id(docs_dir, filename, doc_id, id_strategy)
+            d_id_lock = _doc_id_parse_locks.get(d_id)
+            if d_id_lock is None:
+                d_id_lock = asyncio.Lock()
+                _doc_id_parse_locks[d_id] = d_id_lock
 
-        # Summarize + write
-        digest = _summary_placeholder_text("pending", locale=parsed_locale)
-        source_record = (
-            _persist_source_file(doc_storage_dir, filename, content) if STORE_SOURCE_FILES else {}
-        )
-        try:
-            if summary_mode == "sync":
-                _set_summary_metadata(parsed, mode="sync", status="running")
-                digest_text, brief_text, _ = await loop.run_in_executor(
-                    None, lambda: generate_summaries(parsed, concurrency=concurrency)
+        # Lock outside _parse_sem so waiters don't burn a parse slot — otherwise
+        # unrelated documents get 429'd while one same-id queue drains.
+        async with d_id_lock, _parse_sem:
+            t0 = time.time()
+            # Guard against silent overwrite when the caller pins an explicit
+            # Re-check existence inside d_id_lock to close the TOCTOU race
+            # between the early check (before upload) and this point: two
+            # concurrent same-explicit-id requests both saw the id as free
+            # before either had written a manifest, then one acquired the
+            # lock and wrote — the second must not silently overwrite.
+            if doc_id:
+                exists_now = _doc_exists_anywhere(docs_dir, d_id)
+                if exists_now and not replace:
+                    raise HTTPException(
+                        409,
+                        f"doc_id '{doc_id}' already exists. "
+                        f"Pass replace=true to overwrite, or omit doc_id to get a fresh one.",
+                    )
+                if exists_now and not will_replace:
+                    will_replace = True
+                    dedup_status = "replaced"
+            parsed_metadata = _parse_metadata_form(metadata)
+            if will_replace:
+                # Preserve the existing doc's content_type so replace=true can't
+                # leave orphans in a different category directory. The caller's
+                # content_type is silently overridden because they already
+                # asked to replace this specific doc.
+                existing_content_type = _doc_content_type(docs_dir, doc_id)
+                requested_ct_normalized = _normalize_content_type(
+                    content_type or str(parsed_metadata.get("content_type") or "General")
                 )
-                digest = digest_text
-                _set_summary_metadata(parsed, mode="sync", status="completed")
-                await loop.run_in_executor(
-                    None,
-                    lambda: write_output(
-                        d_id,
-                        parsed,
-                        digest_text,
-                        brief_text,
-                        docs_dir,
-                        tags=parsed_tags,
-                        source="upload",
-                        original_path=str(filename),
-                        metadata=parsed_metadata,
-                        source_record=source_record,
-                        content_type=selected_content_type,
-                    ),
-                )
+                if requested_ct_normalized != existing_content_type:
+                    logger.info(
+                        "replace=true: overriding requested content_type '%s' with existing '%s' for doc_id %s",
+                        requested_ct_normalized, existing_content_type, doc_id,
+                    )
+                selected_content_type = existing_content_type
+                parsed_metadata["content_type"] = selected_content_type
             else:
-                status = "disabled" if summary_mode == "off" else "pending"
-                _set_summary_metadata(parsed, mode=summary_mode, status=status)
-                await loop.run_in_executor(
-                    None,
-                    lambda: write_output_extract_only(
-                        d_id,
-                        parsed,
-                        docs_dir,
-                        tags=parsed_tags,
-                        source="upload",
-                        metadata=parsed_metadata,
-                        source_record=source_record,
-                        content_type=selected_content_type,
-                    ),
+                selected_content_type = _normalize_content_type(
+                    content_type or str(parsed_metadata.get("content_type") or "General")
                 )
-                if summary_mode == "defer":
-                    worker = threading.Thread(
-                        target=_generate_deferred_summary,
-                        args=(
+                parsed_metadata.setdefault("content_type", selected_content_type)
+            requested_parse_mode = (
+                str(parse_mode or parsed_metadata.get("parse_mode") or "").strip()
+                or os.environ.get("LARKSCOUT_PDF_PARSE_MODE", "").strip()
+                or None
+            )
+            field_ocr_profile = (
+                str(document_profile or parsed_metadata.get("document_profile") or "").strip()
+                or str(parsed_metadata.get("field_ocr_profile") or "").strip()
+                or os.environ.get("LARKSCOUT_FIELD_OCR_PROFILE", "").strip()
+                or None
+            )
+            if field_ocr_profile:
+                canonical_profile = _DOCUMENT_PROFILE_ALIASES.get(field_ocr_profile, field_ocr_profile)
+                if canonical_profile != field_ocr_profile:
+                    field_ocr_profile = canonical_profile
+                    if parsed_metadata.get("document_profile"):
+                        parsed_metadata["document_profile"] = canonical_profile
+            requested_field_ocr_config = (
+                str(field_ocr_config or parsed_metadata.get("field_ocr_config") or "").strip()
+                or os.environ.get("LARKSCOUT_FIELD_OCR_CONFIG", "").strip()
+                or None
+            )
+            requested_summary_mode = (
+                str(summary_mode or parsed_metadata.get("summary_mode") or "").strip()
+                or None
+            )
+            for key, value in {
+                "summary_mode": requested_summary_mode,
+                "document_profile": field_ocr_profile,
+                "field_ocr_config": requested_field_ocr_config,
+                "parse_mode": requested_parse_mode,
+                "id_strategy": id_strategy,
+                "skip_ocr_pages": skip_ocr_pages,
+                "extract_images": str(bool(extract_images)).lower() if extract_images else "",
+                "ocr_images": str(bool(ocr_images)).lower() if ocr_images else "",
+                "image_ocr_backend": image_ocr_backend if extract_images else "",
+                "max_images": str(max_images) if extract_images else "",
+                "max_ocr_images": str(max_ocr_images) if ocr_images else "",
+            }.items():
+                if value:
+                    parsed_metadata.setdefault(key, value)
+            selected_image_ocr_backend = (image_ocr_backend or "auto").strip().lower()
+            if selected_image_ocr_backend not in {"auto", "local", "llm"}:
+                raise HTTPException(422, "image_ocr_backend must be one of: auto, local, llm")
+            max_images = max(0, min(int(max_images), 1000))
+            max_ocr_images = max(0, min(int(max_ocr_images), 1000))
+            manual_blank_pages_spec = (
+                _metadata_page_range_spec(skip_ocr_pages)
+                or _metadata_page_range_spec(parsed_metadata.get("skip_ocr_pages"))
+                or _metadata_page_range_spec(parsed_metadata.get("blank_pages"))
+                or _metadata_page_range_spec(parsed_metadata.get("near_blank_pages"))
+                or _metadata_page_range_spec(parsed_metadata.get("manual_blank_pages"))
+            )
+
+            profile = _load_document_profile(field_ocr_profile, requested_field_ocr_config)
+            summary_mode = _resolve_summary_mode(
+                profile=profile,
+                parse_mode=requested_parse_mode,
+                generate_summary=generate_summary,
+                requested_mode=requested_summary_mode,
+            )
+
+            # Parse tags
+            parsed_tags: list[str] = []
+            if tags:
+                try:
+                    parsed_tags = json.loads(tags)
+                except json.JSONDecodeError:
+                    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+            try:
+                doc_storage_dir = _doc_storage_dir(docs_dir, d_id, selected_content_type)
+                tmp_dir = doc_storage_dir / ".tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_path = tmp_dir / filename
+                shutil.move(str(scratch_path), str(tmp_path))
+                scratch_path = None
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(500, t("file_save_failed", err=str(e)))
+
+            # Parse
+            try:
+                loop = asyncio.get_event_loop()
+                if suffix == ".pdf":
+                    should_prewarm_local_ocr = False
+                    if PREWARM_LOCAL_OCR:
+                        try:
+                            should_prewarm_local_ocr = _should_prewarm_local_ocr_for_pdf(
+                                tmp_path,
+                                profile=profile,
+                                parse_mode=requested_parse_mode,
+                                force_ocr=force_ocr,
+                                ocr_pages_spec=ocr_pages,
+                                manual_blank_pages_spec=manual_blank_pages_spec,
+                                ocr_threshold=OCR_THRESHOLD,
+                            )
+                        except Exception as exc:
+                            logger.warning("Local OCR prewarm planning skipped before parse: %s", exc)
+                    if should_prewarm_local_ocr:
+                        try:
+                            with _local_ocr_worker_lock:
+                                _get_local_ocr_worker()
+                            logger.info("Local OCR worker prewarmed before PDF parse")
+                        except Exception as exc:
+                            logger.warning("Local OCR worker prewarm skipped before parse: %s", exc)
+                    parsed = await loop.run_in_executor(
+                        None,
+                        lambda: parse_pdf(
+                            tmp_path,
+                            force_ocr=force_ocr,
+                            ocr_threshold=OCR_THRESHOLD,
+                            ocr_pages_spec=ocr_pages,
+                            extract_tables=extract_tables,
+                            max_tables_per_page=max_tables_per_page,
+                            concurrency=concurrency,
+                            cache_dir=doc_storage_dir,
+                            field_ocr_profile=field_ocr_profile,
+                            field_ocr_config=requested_field_ocr_config,
+                            parse_mode=requested_parse_mode,
+                            manual_blank_pages_spec=manual_blank_pages_spec,
+                        ),
+                    )
+                elif suffix in (".doc", ".docx"):
+                    word_path = _convert_legacy_office(tmp_path, "docx") if suffix == ".doc" else tmp_path
+                    if extract_images:
+                        embedded_image_count = _count_word_embedded_image_references(word_path)
+                        requested_ocr_image_count = min(embedded_image_count, max_images)
+                        parsed_metadata.setdefault("embedded_image_count", embedded_image_count)
+                        parsed_metadata.setdefault("requested_image_count", requested_ocr_image_count)
+                        parsed_metadata.setdefault(
+                            "image_inventory_truncated",
+                            bool(embedded_image_count > requested_ocr_image_count),
+                        )
+                        if ocr_images:
+                            parsed_metadata.setdefault(
+                                "requested_ocr_image_count", requested_ocr_image_count
+                            )
+                        if ocr_images and requested_ocr_image_count > max_ocr_images:
+                            raise HTTPException(
+                                422,
+                                (
+                                    "word embedded image OCR refused: "
+                                    f"{requested_ocr_image_count} requested images exceeds "
+                                    f"max_ocr_images={max_ocr_images} "
+                                    f"(embedded_image_count={embedded_image_count}, max_images={max_images}). "
+                                    "Retry with ocr_images=false, a higher max_ocr_images value, "
+                                    "or a lower max_images value."
+                                ),
+                            )
+                    parsed = await loop.run_in_executor(
+                        None,
+                        lambda: parse_word(
+                            word_path,
+                            extract_tables=extract_tables,
+                            profile=profile,
+                            extract_images=extract_images,
+                            ocr_images=ocr_images,
+                            image_ocr_backend=selected_image_ocr_backend,
+                            max_images=max_images,
+                        ),
+                    )
+                elif suffix in (".xlsx", ".xls"):
+                    parsed = await loop.run_in_executor(None, lambda: parse_xlsx(tmp_path))
+                elif suffix == ".csv":
+                    parsed = await loop.run_in_executor(None, lambda: parse_csv(tmp_path))
+                elif suffix == ".ppt":
+                    parsed = await loop.run_in_executor(
+                        None, lambda: parse_generic(_convert_legacy_office(tmp_path, "pptx"), profile=profile)
+                    )
+                else:  # .pptx, .html, .htm, etc.
+                    parsed = await loop.run_in_executor(None, lambda: parse_generic(tmp_path, profile=profile))
+                # Persist the source while tmp_path still exists; the finally
+                # below removes tmp_dir, and we no longer hold the bytes in
+                # memory after the streaming upload.
+                source_record = (
+                    _persist_source_file(doc_storage_dir, filename, tmp_path)
+                    if STORE_SOURCE_FILES else {}
+                )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(500, t("parse_failed", err=str(e)))
+            finally:
+                # Cleanup temp file
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            parsed.filename = filename
+            parsed.file_type = suffix.lstrip(".")
+            if suffix in {".doc", ".ppt"}:
+                parsed.metadata["converted_to"] = "docx" if suffix == ".doc" else "pptx"
+            parsed_locale = _parsed_document_locale(parsed)
+
+            # Summarize + write
+            digest = _summary_placeholder_text("pending", locale=parsed_locale)
+            try:
+                if summary_mode == "sync":
+                    _set_summary_metadata(parsed, mode="sync", status="running")
+                    digest_text, brief_text, _ = await loop.run_in_executor(
+                        None, lambda: generate_summaries(parsed, concurrency=concurrency)
+                    )
+                    digest = digest_text
+                    _set_summary_metadata(parsed, mode="sync", status="completed")
+                    await loop.run_in_executor(
+                        None,
+                        lambda: write_output(
+                            d_id,
+                            parsed,
+                            digest_text,
+                            brief_text,
+                            docs_dir,
+                            tags=parsed_tags,
+                            source="upload",
+                            original_path=str(filename),
+                            metadata=parsed_metadata,
+                            source_record=source_record,
+                            content_type=selected_content_type,
+                        ),
+                    )
+                else:
+                    status = "disabled" if summary_mode == "off" else "pending"
+                    _set_summary_metadata(parsed, mode=summary_mode, status=status)
+                    await loop.run_in_executor(
+                        None,
+                        lambda: write_output_extract_only(
                             d_id,
                             parsed,
                             docs_dir,
-                            concurrency,
-                            parsed_tags,
-                            parsed_metadata,
-                            source_record,
-                            selected_content_type,
+                            tags=parsed_tags,
+                            source="upload",
+                            metadata=parsed_metadata,
+                            source_record=source_record,
+                            content_type=selected_content_type,
                         ),
-                        daemon=True,
                     )
-                    worker.start()
-                    logger.info("Deferred summary scheduled: %s", d_id)
-        except Exception as e:
-            raise HTTPException(500, t("write_failed", err=str(e)))
+                    if summary_mode == "defer":
+                        worker = threading.Thread(
+                            target=_generate_deferred_summary,
+                            args=(
+                                d_id,
+                                parsed,
+                                docs_dir,
+                                concurrency,
+                                parsed_tags,
+                                parsed_metadata,
+                                source_record,
+                                selected_content_type,
+                            ),
+                            daemon=True,
+                        )
+                        worker.start()
+                        logger.info("Deferred summary scheduled: %s", d_id)
+            except Exception as e:
+                raise HTTPException(500, t("write_failed", err=str(e)))
 
-        elapsed = round(time.time() - t0, 2)
-        return ParseResponse(
-            doc_id=d_id,
-            filename=parsed.filename,
-            file_type=parsed.file_type,
-            total_pages=parsed.total_pages,
-            section_count=len(parsed.sections),
-            table_count=parsed.table_count,
-            image_count=len(parsed.images),
-            ocr_page_count=parsed.ocr_page_count,
-            digest=digest[:300],
-            manifest_path=f"docs/{_doc_storage_rel_path(d_id, selected_content_type)}/manifest.json",
-            processing_time_sec=elapsed,
-            source_ref=source_record.get("ref"),
-            content_type=selected_content_type,
-            storage_path=_doc_storage_rel_path(d_id, selected_content_type),
-            dedup=dedup_status,
-        )
+            elapsed = round(time.time() - t0, 2)
+            return ParseResponse(
+                doc_id=d_id,
+                filename=parsed.filename,
+                file_type=parsed.file_type,
+                total_pages=parsed.total_pages,
+                section_count=len(parsed.sections),
+                table_count=parsed.table_count,
+                image_count=len(parsed.images),
+                ocr_page_count=parsed.ocr_page_count,
+                digest=digest[:300],
+                manifest_path=f"docs/{_doc_storage_rel_path(d_id, selected_content_type)}/manifest.json",
+                processing_time_sec=elapsed,
+                source_ref=source_record.get("ref"),
+                content_type=selected_content_type,
+                storage_path=_doc_storage_rel_path(d_id, selected_content_type),
+                dedup=dedup_status,
+            )
+    finally:
+        if scratch_path is not None and scratch_path.exists():
+            try:
+                scratch_path.unlink()
+            except OSError:
+                pass
 
 
 # ---- Library query endpoints ----
