@@ -278,6 +278,66 @@ class TestPDFParse:
         assert plan["local_ocr_pages"] == [1, 3]
         assert plan["region_llm"] is True
 
+    def test_markdown_headings_use_min_level_as_section_boundary(self):
+        """Regression for #72: when MarkItDown output has explicit ## markers, every
+        ## becomes a section boundary (even if its stripped text fails the legacy
+        heuristics or would be suppressed as an arabic-clause heading), while deeper
+        ### markers stay inside the parent section.
+        """
+        from larkscout_docreader import PageContent, _split_sections
+
+        body = "段落正文" * 30  # 120 chars, defeats _merge_short_sections
+        text = "\n".join(
+            [
+                "## 一、项目名称",
+                body,
+                "## 二、服务要求",
+                body,
+                "## 相关附件",
+                body,
+                "---",
+                "### 概述",
+                "技术规范书卷首段落,概述应吸收到上一节。" + body,
+                "## 4.1前端网站使用需求",
+                body,
+                "## 4.2后端应用性能监控需求",
+                body,
+            ]
+        )
+        sections = _split_sections([PageContent(page_num=1, text=text)])
+
+        titles = [s.title for s in sections]
+        assert titles == [
+            "一、项目名称",
+            "二、服务要求",
+            "相关附件",
+            "4.1前端网站使用需求",
+            "4.2后端应用性能监控需求",
+        ]
+        # `### 概述` must not become its own section; its body lives inside the prior ##.
+        attachments = next(s for s in sections if s.title == "相关附件")
+        assert "概述" in attachments.text
+        assert "技术规范书卷首段落" in attachments.text
+
+    def test_markdown_heading_h3_only_doc_still_cuts_sections(self):
+        """When a doc uses only H3 markers (no H1/H2), H3 becomes the section level."""
+        from larkscout_docreader import PageContent, _split_sections
+
+        body = "段落正文" * 30
+        text = "\n".join(
+            [
+                "### 第一章 引言",
+                body,
+                "### 第二章 方法",
+                body,
+                "### 第三章 结论",
+                body,
+            ]
+        )
+        sections = _split_sections([PageContent(page_num=1, text=text)])
+
+        assert [s.title for s in sections] == ["第一章 引言", "第二章 方法", "第三章 结论"]
+
     def test_tender_section_split_keeps_third_level_under_second_level(self):
         from larkscout_docreader import PageContent, _split_sections
 
