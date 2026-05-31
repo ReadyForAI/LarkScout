@@ -3828,6 +3828,29 @@ def _is_arabic_numbered_heading_candidate(text: str) -> bool:
     return bool(re.match(r"^\d{1,2}(?:\.\d{1,2})?[.、．)）\s]\s*.{2,}", stripped))
 
 
+_MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+\S")
+
+
+def _markdown_heading_level(text: str) -> int:
+    m = _MARKDOWN_HEADING_RE.match(text.strip())
+    return len(m.group(1)) if m else 0
+
+
+def _detect_markdown_section_level(pages: list[PageContent]) -> int | None:
+    """Return the shallowest markdown heading level used across pages, or None."""
+    min_level: int | None = None
+    for page in pages:
+        for raw in page.text.splitlines():
+            lvl = _markdown_heading_level(raw)
+            if lvl == 0:
+                continue
+            if min_level is None or lvl < min_level:
+                min_level = lvl
+                if min_level == 1:
+                    return 1
+    return min_level
+
+
 def _split_sections(
     pages: list[PageContent], section_policy: SectionPolicy | None = None
 ) -> list[Section]:
@@ -3867,6 +3890,7 @@ def _split_sections(
             pages, min_headings=policy.formal_chinese_min_headings
         )
     )
+    md_section_level = None if ocr_mode else _detect_markdown_section_level(pages)
 
     for page in pages:
         page_has_body = False
@@ -3875,9 +3899,13 @@ def _split_sections(
             line = line.strip()
             if not line:
                 continue
-            heading_level = _is_heading(line, ocr_mode=ocr_mode)
-            if suppress_arabic_clause_headings and _is_arabic_numbered_heading_candidate(line):
-                heading_level = 0
+            md_level = _markdown_heading_level(line)
+            if md_section_level is not None and md_level > 0:
+                heading_level = md_level if md_level == md_section_level else 0
+            else:
+                heading_level = _is_heading(line, ocr_mode=ocr_mode)
+                if suppress_arabic_clause_headings and _is_arabic_numbered_heading_candidate(line):
+                    heading_level = 0
             heading_title = _strip_heading_markup(line)
             if heading_level > 0 and not current_lines and current_title == default_section_title:
                 current_title = heading_title
