@@ -5198,6 +5198,17 @@ async def _startup_prewarm_local_ocr() -> None:
         logger.warning("Local OCR worker prewarm skipped: %s", exc)
 
 
+@app.on_event("startup")
+async def _startup_backfill_manifest_tags() -> None:
+    try:
+        stats = _backfill_manifest_tags(_get_docs_dir())
+    except Exception as exc:
+        logger.warning("Manifest tags backfill skipped: %s", exc)
+        return
+    if stats["patched"] or stats["errors"]:
+        logger.info("Manifest tags backfill: %s", stats)
+
+
 def _parse_metadata_form(metadata: str | None) -> dict[str, Any]:
     if not metadata:
         return {}
@@ -6161,6 +6172,59 @@ def _load_doc_tags(docs_dir: Path, doc_id: str) -> list[str]:
                 return [str(tag) for tag in tags]
             return []
     return []
+
+
+def _backfill_manifest_tags(docs_dir: Path) -> dict[str, int]:
+    """Patch legacy per-doc manifest.json files that predate the tags-in-manifest fix.
+
+    Reads `tags` from doc-index.json and writes them into each manifest that is
+    missing the field. Idempotent: manifests that already carry a `tags` list
+    are skipped.
+    """
+    stats = {"checked": 0, "patched": 0, "skipped": 0, "missing_index": 0, "errors": 0}
+    if not docs_dir.exists():
+        return stats
+
+    tags_by_id: dict[str, list[str]] = {}
+    for entry in _load_doc_index(docs_dir):
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str):
+            continue
+        raw = entry.get("tags")
+        if isinstance(raw, list):
+            tags_by_id[entry_id] = [str(t) for t in raw]
+
+    for manifest_path in docs_dir.rglob("manifest.json"):
+        # Skip visual-debug sidecar manifests
+        if VISUAL_DEBUG_ARTIFACT_DIR.split("/")[0] in manifest_path.parts:
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            stats["errors"] += 1
+            continue
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("doc_id"), str):
+            continue
+        stats["checked"] += 1
+        if isinstance(manifest.get("tags"), list):
+            stats["skipped"] += 1
+            continue
+        doc_id = manifest["doc_id"]
+        tags = tags_by_id.get(doc_id)
+        if tags is None:
+            stats["missing_index"] += 1
+            tags = []
+        manifest["tags"] = tags
+        try:
+            tmp_path = manifest_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp_path, manifest_path)
+            stats["patched"] += 1
+        except Exception:
+            stats["errors"] += 1
+    return stats
 
 
 def _load_parsed_document_from_storage(docs_dir: Path, doc_id: str) -> tuple[ParsedDocument, dict[str, Any], dict[str, Any]]:
