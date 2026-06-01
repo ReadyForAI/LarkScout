@@ -16,7 +16,7 @@ DOC_INDEX_REQUIRED_FIELDS = {
 
 # Required fields that every manifest MUST contain
 MANIFEST_REQUIRED_FIELDS = {
-    "doc_id", "filename", "file_type", "source", "paths", "sections", "provenance",
+    "doc_id", "filename", "file_type", "source", "tags", "paths", "sections", "provenance",
 }
 
 PROVENANCE_REQUIRED_FIELDS = {
@@ -232,6 +232,7 @@ class TestManifestDocreaderFormat:
             manifest = json.loads((docs_dir / "DOC-010" / "manifest.json").read_text(encoding="utf-8"))
             missing = MANIFEST_REQUIRED_FIELDS - set(manifest.keys())
             assert not missing, f"Docreader full manifest missing: {missing}"
+            assert manifest["tags"] == ["t"]
 
             prov = manifest["provenance"]
             missing_prov = PROVENANCE_REQUIRED_FIELDS - set(prov.keys())
@@ -245,10 +246,11 @@ class TestManifestDocreaderFormat:
         parsed = self._make_parsed()
         with tempfile.TemporaryDirectory() as tmp:
             docs_dir = Path(tmp)
-            write_output_extract_only("DOC-011", parsed, docs_dir, tags=[], source="upload")
+            write_output_extract_only("DOC-011", parsed, docs_dir, tags=["招标文件"], source="upload")
             manifest = json.loads((docs_dir / "DOC-011" / "manifest.json").read_text(encoding="utf-8"))
             missing = MANIFEST_REQUIRED_FIELDS - set(manifest.keys())
             assert not missing, f"Extract-only manifest missing: {missing}"
+            assert manifest["tags"] == ["招标文件"]
 
             prov = manifest["provenance"]
             missing_prov = PROVENANCE_REQUIRED_FIELDS - set(prov.keys())
@@ -329,3 +331,152 @@ class TestManifestDocreaderFormat:
             manifest = json.loads((docs_dir / "DOC-013" / "manifest.json").read_text(encoding="utf-8"))
             for sec in manifest["sections"]:
                 assert "type" in sec, f"Section missing 'type': {sec}"
+
+
+class TestManifestTagsBackfill:
+    """Startup backfill restores `tags` on legacy manifests from doc-index.json."""
+
+    @staticmethod
+    def _write_legacy_manifest(docs_dir: Path, storage_rel: str, doc_id: str) -> Path:
+        doc_dir = docs_dir / storage_rel
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "doc_id": doc_id,
+            "filename": f"{doc_id}.pdf",
+            "file_type": "pdf",
+            "source": "upload",
+            "paths": {"sections": "sections.json"},
+            "sections": [],
+            "provenance": {"source": "upload", "source_url": "", "created_at": "", "content_hash": ""},
+        }
+        path = doc_dir / "manifest.json"
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _write_index(docs_dir: Path, entries: list[dict]) -> None:
+        (docs_dir / "doc-index.json").write_text(
+            json.dumps({"version": 2, "documents": entries}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def test_backfill_populates_missing_tags_from_index(self):
+        from larkscout_docreader import _backfill_manifest_tags
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            m_path = self._write_legacy_manifest(docs_dir, "Bid/DOC-100", "DOC-100")
+            self._write_index(docs_dir, [{"id": "DOC-100", "tags": ["招标文件"]}])
+
+            stats = _backfill_manifest_tags(docs_dir)
+            assert stats["patched"] == 1
+            assert stats["skipped"] == 0
+            patched = json.loads(m_path.read_text(encoding="utf-8"))
+            assert patched["tags"] == ["招标文件"]
+
+    def test_backfill_is_idempotent(self):
+        from larkscout_docreader import _backfill_manifest_tags
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            m_path = self._write_legacy_manifest(docs_dir, "Bid/DOC-101", "DOC-101")
+            self._write_index(docs_dir, [{"id": "DOC-101", "tags": ["x"]}])
+
+            first = _backfill_manifest_tags(docs_dir)
+            assert first["patched"] == 1
+            second = _backfill_manifest_tags(docs_dir)
+            assert second["patched"] == 0
+            assert second["skipped"] == 1
+            patched = json.loads(m_path.read_text(encoding="utf-8"))
+            assert patched["tags"] == ["x"]
+
+    def test_backfill_writes_empty_when_index_missing_entry(self):
+        from larkscout_docreader import _backfill_manifest_tags
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            m_path = self._write_legacy_manifest(docs_dir, "Bid/DOC-102", "DOC-102")
+            self._write_index(docs_dir, [])  # no entry for DOC-102
+
+            stats = _backfill_manifest_tags(docs_dir)
+            assert stats["patched"] == 1
+            assert stats["missing_index"] == 1
+            patched = json.loads(m_path.read_text(encoding="utf-8"))
+            assert patched["tags"] == []
+
+    def test_backfill_preserves_existing_tags(self):
+        from larkscout_docreader import _backfill_manifest_tags
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            doc_dir = docs_dir / "Bid" / "DOC-103"
+            doc_dir.mkdir(parents=True)
+            manifest = {
+                "doc_id": "DOC-103",
+                "filename": "x.pdf", "file_type": "pdf", "source": "upload",
+                "tags": ["keep-me"],  # already present, must not be overwritten
+                "paths": {}, "sections": [],
+                "provenance": {"source": "upload", "source_url": "", "created_at": "", "content_hash": ""},
+            }
+            m_path = doc_dir / "manifest.json"
+            m_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            self._write_index(docs_dir, [{"id": "DOC-103", "tags": ["overwrite-me"]}])
+
+            stats = _backfill_manifest_tags(docs_dir)
+            assert stats["patched"] == 0
+            assert stats["skipped"] == 1
+            patched = json.loads(m_path.read_text(encoding="utf-8"))
+            assert patched["tags"] == ["keep-me"]
+
+
+class TestDocEntryFromManifestTags:
+    """`_doc_entry_from_manifest` fallback must read tags from manifest, not just .meta.json."""
+
+    def test_fallback_reads_tags_from_manifest(self):
+        from larkscout_docreader import _doc_entry_from_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            doc_dir = docs_dir / "Bid" / "DOC-200"
+            doc_dir.mkdir(parents=True)
+            manifest = {
+                "doc_id": "DOC-200",
+                "filename": "x.pdf", "file_type": "pdf", "source": "upload",
+                "content_type": "Bid", "storage_path": "Bid/DOC-200",
+                "tags": ["招标文件"],
+                "paths": {}, "sections": [],
+                "provenance": {"source": "upload", "source_url": "x.pdf",
+                               "created_at": "2026-06-01T00:00:00Z", "content_hash": ""},
+            }
+            (doc_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+            )
+            # No .meta.json on disk — manifest is the only source.
+            entry = _doc_entry_from_manifest(docs_dir, "DOC-200")
+            assert entry is not None
+            assert entry["tags"] == ["招标文件"]
+
+    def test_fallback_falls_back_to_meta_when_manifest_lacks_tags(self):
+        from larkscout_docreader import _doc_entry_from_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = Path(tmp)
+            doc_dir = docs_dir / "Bid" / "DOC-201"
+            doc_dir.mkdir(parents=True)
+            manifest = {  # legacy manifest, no tags
+                "doc_id": "DOC-201",
+                "filename": "x.pdf", "file_type": "pdf", "source": "upload",
+                "content_type": "Bid", "storage_path": "Bid/DOC-201",
+                "paths": {}, "sections": [],
+                "provenance": {"source": "upload", "source_url": "x.pdf",
+                               "created_at": "2026-06-01T00:00:00Z", "content_hash": ""},
+            }
+            (doc_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+            )
+            (doc_dir / ".meta.json").write_text(
+                json.dumps({"tags": ["legacy-tag"]}, ensure_ascii=False), encoding="utf-8"
+            )
+            entry = _doc_entry_from_manifest(docs_dir, "DOC-201")
+            assert entry is not None
+            assert entry["tags"] == ["legacy-tag"]
