@@ -6106,6 +6106,7 @@ def _doc_entry_from_manifest(docs_dir: Path, doc_id: str) -> dict[str, Any] | No
     storage_path = str(manifest.get("storage_path") or meta.get("storage_path") or doc_dir.relative_to(docs_dir))
     sections = manifest.get("sections") if isinstance(manifest.get("sections"), list) else []
     images = manifest.get("images") if isinstance(manifest.get("images"), list) else []
+    manifest_tags = manifest.get("tags") if isinstance(manifest.get("tags"), list) else None
     parse_metadata = manifest.get("parse_metadata") if isinstance(manifest.get("parse_metadata"), dict) else {}
     summary_meta = parse_metadata.get("summary") if isinstance(parse_metadata.get("summary"), dict) else {}
     digest = ""
@@ -6131,7 +6132,7 @@ def _doc_entry_from_manifest(docs_dir: Path, doc_id: str) -> dict[str, Any] | No
         "images": len(images) if images else meta.get("image_count", 0),
         "digest": digest,
         "digest_path": f"docs/{storage_path}/digest.md",
-        "tags": meta.get("tags", []),
+        "tags": manifest_tags if manifest_tags is not None else meta.get("tags", []),
         "created_at": provenance.get("created_at") or meta.get("created_at"),
         "content_hash": provenance.get("content_hash") or "",
         "metadata": _indexable_metadata(manifest.get("metadata") or meta.get("metadata") or {}),
