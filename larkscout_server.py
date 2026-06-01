@@ -34,9 +34,10 @@ from larkscout_docreader import app as doc_app  # noqa: E402
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Start sub-application lifespans (browser Playwright init, etc.)."""
+    """Start sub-application lifespans (browser Playwright init, docreader startup tasks)."""
     async with browser_app.router.lifespan_context(browser_app):
-        yield
+        async with doc_app.router.lifespan_context(doc_app):
+            yield
 
 
 app = FastAPI(
