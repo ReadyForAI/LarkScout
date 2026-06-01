@@ -3744,6 +3744,62 @@ def _merge_short_sections(sections: list[Section], *, min_chars: int = 80) -> li
     return _renumber_sections(merged)
 
 
+_CHAPTER_TITLE_LINE_RE = re.compile(
+    r"^第[一二三四五六七八九十\d]+[章节部分篇]\s*[、:：]?\s*\S"
+)
+
+
+def _looks_like_toc_stub_body(text: str) -> bool:
+    """True if a section's whole body is just one chapter-title-shaped line.
+
+    Source DOCX files sometimes have transitional/cover pages where a Heading-1
+    style is applied to a line whose only following content is the *next*
+    chapter's title (e.g. ``## 第一章 供应商须知`` followed solely by
+    ``第二章 应答文件格式``). Detecting this exact body shape lets us merge the
+    stub into the preceding section without disturbing legitimate short
+    sections (e.g. ``六、保函`` with body ``无``).
+    """
+    body = text.strip()
+    if not body:
+        return True
+    if len(body.splitlines()) != 1:
+        return False
+    return bool(_CHAPTER_TITLE_LINE_RE.match(body))
+
+
+def _demote_toc_stub_sections(
+    sections: list[Section], *, max_body_chars: int = 30
+) -> list[Section]:
+    """Merge sections whose body is empty or solely another chapter-title line.
+
+    These stubs are typically TOC-like transitional artifacts in the source
+    docx, not real section boundaries. Append the stub title (and any
+    chapter-title body line) to the preceding section as plain text.
+    """
+    if len(sections) < 2:
+        return sections
+    result: list[Section] = []
+    for sec in sections:
+        body = sec.text.strip()
+        if (
+            result
+            and len(body) <= max_body_chars
+            and _looks_like_toc_stub_body(body)
+        ):
+            previous = result[-1]
+            parts = [previous.text.rstrip(), sec.title.strip()]
+            if body:
+                parts.append(body)
+            previous.text = "\n".join(part for part in parts if part).strip()
+            start, _ = _page_bounds(previous.page_range)
+            _, end = _page_bounds(sec.page_range)
+            if start and end:
+                previous.page_range = f"p.{start}-{end}"
+            continue
+        result.append(sec)
+    return _renumber_sections(result)
+
+
 def _numeric_heading_prefix(text: str) -> str | None:
     stripped = text.strip()
     dotted = re.match(r"^(\d{1,2}(?:\.\d{1,2})*)", stripped)
@@ -4011,6 +4067,8 @@ def _split_sections(
                 page_range=f"p.1-{pages[-1].page_num if pages else 1}",
             )
         )
+    if not ocr_mode:
+        sections = _demote_toc_stub_sections(sections)
     if ocr_mode:
         sections = _merge_short_ocr_sections(sections)
     else:
