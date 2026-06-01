@@ -2,7 +2,9 @@ from services.docreader.larkscout_docreader import (
     PageContent,
     ParsedDocument,
     Section,
+    _demote_toc_stub_sections,
     _load_document_profile,
+    _looks_like_toc_stub_body,
     _parsed_document_locale,
     _split_sections,
     _summary_placeholder_text,
@@ -106,3 +108,62 @@ def test_split_sections_suppresses_numbered_clauses_in_formal_chinese_docs() -> 
     assert "三、投标文件的编制" in titles
     assert "1、项目名称" not in titles
     assert not any(title.startswith("3.1 招标人不组织") for title in titles)
+
+
+def test_toc_stub_body_classifier() -> None:
+    assert _looks_like_toc_stub_body("")
+    assert _looks_like_toc_stub_body("第二章 应答文件格式")
+    assert _looks_like_toc_stub_body("第三章 评审办法")
+    # multi-line body — real content, not a stub
+    assert not _looks_like_toc_stub_body("第二章 应答文件格式\n这里是正文")
+    # short legitimate body that is NOT a chapter-title line
+    assert not _looks_like_toc_stub_body("无")
+    assert not _looks_like_toc_stub_body("见附件")
+
+
+def test_demote_toc_stub_merges_transition_page_artifacts() -> None:
+    sections = [
+        Section(index=1, title="第一章 供应商须知", level=1,
+                text="供应商须知正文。" * 10, page_range="p.1-2"),
+        Section(index=2, title="第一章 供应商须知", level=1,
+                text="第二章 应答文件格式", page_range="p.3-3"),
+        Section(index=3, title="第二章 应答文件格式", level=1,
+                text="应答文件格式正文。" * 10, page_range="p.4-5"),
+    ]
+    demoted = _demote_toc_stub_sections(sections)
+    assert [sec.title for sec in demoted] == [
+        "第一章 供应商须知", "第二章 应答文件格式",
+    ]
+    assert "第二章 应答文件格式" in demoted[0].text
+    assert demoted[0].page_range == "p.1-3"
+
+
+def test_demote_toc_stub_preserves_legitimate_short_section() -> None:
+    sections = [
+        Section(index=1, title="五、供应商资格", level=1,
+                text="资格正文。" * 10, page_range="p.1-1"),
+        Section(index=2, title="六、保函", level=1,
+                text="无", page_range="p.2-2"),
+        Section(index=3, title="七、采购文件", level=1,
+                text="采购文件正文。" * 10, page_range="p.3-3"),
+    ]
+    demoted = _demote_toc_stub_sections(sections)
+    titles = [sec.title for sec in demoted]
+    assert "六、保函" in titles
+    body = next(sec.text for sec in demoted if sec.title == "六、保函")
+    assert body.strip() == "无"
+
+
+def test_demote_toc_stub_handles_empty_body() -> None:
+    sections = [
+        Section(index=1, title="第一章 须知", level=1,
+                text="正文。" * 10, page_range="p.1-1"),
+        Section(index=2, title="第二章", level=1,
+                text="", page_range="p.2-2"),
+        Section(index=3, title="第三章 评审", level=1,
+                text="评审正文。" * 10, page_range="p.3-3"),
+    ]
+    demoted = _demote_toc_stub_sections(sections)
+    titles = [sec.title for sec in demoted]
+    assert "第二章" not in titles
+    assert "第二章" in demoted[0].text
