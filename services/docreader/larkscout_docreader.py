@@ -1448,6 +1448,64 @@ def _looks_like_plain_table_row(line: str) -> bool:
     return False
 
 
+def _extract_pdf_page_tables(
+    page: "fitz.Page",
+) -> tuple[list[str], list[tuple[float, float, float, float]]]:
+    try:
+        finder = page.find_tables()
+    except Exception as exc:
+        logger.warning("find_tables failed on page %d: %s", page.number + 1, exc)
+        return [], []
+    tabs = finder.tables if hasattr(finder, "tables") else list(finder)
+    out_md: list[str] = []
+    out_bboxes: list[tuple[float, float, float, float]] = []
+    for table in tabs:
+        try:
+            md = table.to_markdown()
+        except Exception as exc:
+            logger.warning("table.to_markdown failed on page %d: %s", page.number + 1, exc)
+            continue
+        if not md or not md.strip():
+            continue
+        out_md.append(md.strip())
+        bbox = getattr(table, "bbox", None)
+        if bbox is None:
+            continue
+        try:
+            out_bboxes.append((float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out_md, out_bboxes
+
+
+def _strip_text_in_table_bboxes(
+    page: "fitz.Page", bboxes: list[tuple[float, float, float, float]]
+) -> str:
+    if not bboxes:
+        return page.get_text("text").strip()
+    import fitz
+
+    rects = [fitz.Rect(*bbox) for bbox in bboxes]
+    try:
+        blocks = page.get_text("blocks")
+    except Exception as exc:
+        logger.warning("get_text(blocks) failed on page %d: %s", page.number + 1, exc)
+        return page.get_text("text").strip()
+    kept: list[str] = []
+    for block in blocks:
+        try:
+            x0, y0, x1, y1, text = block[0], block[1], block[2], block[3], block[4]
+        except (IndexError, TypeError):
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        centroid = fitz.Point((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        if any(centroid in r for r in rects):
+            continue
+        kept.append(text.rstrip())
+    return "\n".join(part for part in kept if part).strip()
+
+
 def _extract_tables_from_ocr_text(text: str, page_num: int, total_pages: int) -> tuple[str, list[str]]:
     lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     lines = [line.strip() for line in lines if line.strip()]
@@ -2431,11 +2489,19 @@ def parse_pdf(
     # Build page-level baseline signals for selective enhancement.
     page_texts: dict[int, str] = {}
     page_signals: list[dict[str, Any]] = []
+    pdf_tables_by_page: dict[int, list[str]] = {}
 
     for i, page in enumerate(doc):
         page_num = i + 1
         text = page.get_text("text").strip()
-        page_texts[page_num] = text
+        if extract_tables:
+            page_tables, table_bboxes = _extract_pdf_page_tables(page)
+            pdf_tables_by_page[page_num] = page_tables
+            page_texts[page_num] = (
+                _strip_text_in_table_bboxes(page, table_bboxes) if table_bboxes else text
+            )
+        else:
+            page_texts[page_num] = text
         image_count = 0
         try:
             image_count = len(page.get_images(full=False))
@@ -2626,24 +2692,30 @@ def parse_pdf(
 
     pages: list[PageContent] = []
     ocr_table_count = 0
+    pdf_table_count = 0
     ocr_count = len(local_ocr_set | llm_ocr_set)
     for page_num in range(1, total_pages + 1):
         raw_text = page_texts.get(page_num, "")
         page_text = raw_text
         page_tables: list[str] = []
+        tables_in_text = False
         enhanced = llm_ocr_results.get(page_num) or local_ocr_results.get(page_num)
         if enhanced:
             page_text = _cleanup_ocr_text(_usable_page_text(raw_text, enhanced))
             if extract_tables:
                 page_text, page_tables = _extract_tables_from_ocr_text(page_text, page_num, total_pages)
                 ocr_table_count += len(page_tables)
+                tables_in_text = bool(page_tables)
+        elif extract_tables:
+            page_tables = pdf_tables_by_page.get(page_num, [])
+            pdf_table_count += len(page_tables)
         pages.append(
             PageContent(
                 page_num=page_num,
                 text=page_text.strip(),
                 is_ocr=page_num in (local_ocr_set | llm_ocr_set),
                 tables=page_tables,
-                tables_in_text=bool(page_tables),
+                tables_in_text=tables_in_text,
             )
         )
 
@@ -2685,9 +2757,9 @@ def parse_pdf(
     for sec in sections:
         sec.sid = _section_sid(sec.title, sec.text)
 
-    # Count tables in Markdown output
+    # Count tables actually materialized onto pages (so manifest matches files on disk).
     if extract_tables:
-        table_count = _count_markdown_tables(markdown_text) if (markdown_text and (not profile or profile.table_policy.prefer_markitdown)) else ocr_table_count
+        table_count = ocr_table_count + pdf_table_count
     else:
         table_count = 0
 
@@ -4466,6 +4538,7 @@ def write_output(
             "source_size_bytes": (source_record or {}).get("size_bytes", 0),
         },
     }
+    _attach_table_refs(manifest["sections"], table_entries)
     _write_json(doc_dir / "sections.json", manifest["sections"])
     _write_json(doc_dir / "manifest.json", manifest)
     logger.info("manifest.json written")
@@ -4627,6 +4700,7 @@ def write_output_extract_only(
             "source_size_bytes": (source_record or {}).get("size_bytes", 0),
         },
     }
+    _attach_table_refs(manifest["sections"], table_entries)
     _write_json(doc_dir / "sections.json", manifest["sections"])
     _write_json(doc_dir / "manifest.json", manifest)
     _update_doc_index(
@@ -5353,6 +5427,28 @@ def _build_section_entry(sec: Section, summary_preview: str = "") -> dict[str, A
         "summary_preview": summary_preview,
         "file": f"sections/{sec.index:02d}-{sec.sid}-{_safe_filename(sec.title)}.md",
     }
+
+
+def _attach_table_refs(
+    section_entries: list[dict[str, Any]], table_entries: list[dict[str, Any]]
+) -> None:
+    """Populate each section's table_refs with table_ids whose page range overlaps the section."""
+    if not table_entries:
+        return
+    for sec in section_entries:
+        s_start = sec.get("page_start")
+        s_end = sec.get("page_end")
+        if s_start is None or s_end is None:
+            continue
+        refs: list[str] = []
+        for entry in table_entries:
+            t_start = entry.get("page_start") or entry.get("page")
+            t_end = entry.get("page_end") or entry.get("page")
+            if t_start is None or t_end is None:
+                continue
+            if t_start <= s_end and t_end >= s_start:
+                refs.append(entry["table_id"])
+        sec["table_refs"] = refs
 
 
 def _build_table_entries(parsed: ParsedDocument) -> list[dict[str, Any]]:
