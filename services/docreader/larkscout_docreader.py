@@ -70,7 +70,7 @@ _upload_sem = asyncio.Semaphore(_MAX_CONCURRENT_UPLOAD)
 # Lock — long-running servers receiving high-cardinality explicit ids would
 # otherwise leak one Lock per id forever. While requests are queued on a
 # lock their `async with lock:` frame keeps it alive.
-_doc_id_parse_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+_doc_id_parse_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 _doc_id_parse_locks_guard = asyncio.Lock()
 
 
