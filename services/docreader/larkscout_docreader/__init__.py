@@ -96,7 +96,25 @@ from .ocr.tables import (
     _reconstruct_table_from_candidate,
 )
 from .ocr.tables import _is_markdown_table_separator as _is_markdown_table_separator
+from .text_utils import (
+    _amount_to_uppercase_rmb as _amount_to_uppercase_rmb,
+)
+from .text_utils import (
+    _apply_company_name_replacements as _apply_company_name_replacements,
+)
+from .text_utils import (
+    _build_company_name_replacements as _build_company_name_replacements,
+)
 from .text_utils import _cleanup_extracted_text_noise, _normalize_amount_phrases
+from .text_utils import (
+    _collect_company_names as _collect_company_names,
+)
+from .text_utils import (
+    _looks_like_signature_watermark_line as _looks_like_signature_watermark_line,
+)
+from .text_utils import (
+    _split_company_name as _split_company_name,
+)
 
 init_locale()
 
