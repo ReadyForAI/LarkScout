@@ -40,6 +40,16 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from i18n import init_locale, prompt_for_locale, t, tmpl_for_locale
+from larkscout_common.atomic import _write_bytes, _write_json, _write_text
+from larkscout_common.paths import _mask_path
+from larkscout_common.storage import (
+    CONTENT_TYPE_DIRS,
+    DEFAULT_DOCS_DIR,
+    _doc_storage_dir,
+    _doc_storage_rel_path,
+    _get_docs_dir,
+    _normalize_content_type,
+)
 
 init_locale()
 
@@ -4954,22 +4964,6 @@ def _update_doc_index(
 # ═══════════════════════════════════════════
 
 
-def _write_text(path: Path, content: str):
-    """Write text atomically via temp file + os.replace."""
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
-
-
-def _write_json(path: Path, data: dict):
-    """Write JSON atomically via temp file + os.replace."""
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
 def _normalize_layout_bbox(bbox: tuple[float, float, float, float] | list[float]) -> list[float]:
     """Normalize a bbox to [x0, y0, x1, y1] floats and reject malformed geometry."""
     if len(bbox) != 4:
@@ -5008,14 +5002,6 @@ def _write_ocr_blocks_sidecar(doc_dir: Path, sidecar: OCRBlocksSidecar) -> dict[
     )
 
 
-def _write_bytes(path: Path, content: bytes):
-    """Write bytes atomically via temp file + os.replace."""
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "wb") as f:
-        f.write(content)
-    os.replace(tmp, path)
-
-
 def _safe_filename(title: str, max_len: int = 40) -> str:
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title)
     safe = safe.strip().replace(" ", "-")
@@ -5048,13 +5034,6 @@ def _next_doc_id(docs_dir: Path) -> str:
 # HTTP API（FastAPI）
 # ═══════════════════════════════════════════
 
-DEFAULT_DOCS_DIR = Path(
-    os.environ.get(
-        "LARKSCOUT_DOCS_DIR",
-        os.path.expanduser("~/.larkscout/docs"),
-    )
-)
-
 MAX_UPLOAD_BYTES = int(os.environ.get("LARKSCOUT_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 STORE_SOURCE_FILES = os.environ.get("LARKSCOUT_STORE_SOURCE_FILES", "true").lower() not in {
     "0",
@@ -5065,8 +5044,6 @@ STORE_SOURCE_FILES = os.environ.get("LARKSCOUT_STORE_SOURCE_FILES", "true").lowe
 _DOC_ID_RE = re.compile(r"^(?=.{1,80}$)(?=.*\d)[A-Za-z0-9](?:[A-Za-z0-9-]{0,78}[A-Za-z0-9])?$")
 _TABLE_ID_RE = re.compile(r"^(table-)?\d+$")
 _IMAGE_ID_RE = re.compile(r"^(IMG-)?\d{1,6}$", re.IGNORECASE)
-CONTENT_TYPE_DIRS = ("General", "Contract", "Bid", "Knowledge")
-_CONTENT_TYPE_ALIASES = {name.lower(): name for name in CONTENT_TYPE_DIRS}
 
 
 def _validate_doc_id(doc_id: str) -> None:
@@ -5095,31 +5072,6 @@ def _normalize_image_id(image_id: str) -> str:
     else:
         number = int(value)
     return f"IMG-{number:03d}"
-
-
-def _get_docs_dir() -> Path:
-    d = DEFAULT_DOCS_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _normalize_content_type(value: str | None) -> str:
-    raw = (value or "General").strip()
-    normalized = _CONTENT_TYPE_ALIASES.get(raw.lower())
-    if not normalized:
-        allowed = ", ".join(CONTENT_TYPE_DIRS)
-        raise HTTPException(422, f"content_type must be one of: {allowed}")
-    return normalized
-
-
-def _doc_storage_rel_path(doc_id: str, content_type: str | None = None) -> str:
-    if content_type is None:
-        return doc_id
-    return f"{_normalize_content_type(content_type)}/{doc_id}"
-
-
-def _doc_storage_dir(docs_dir: Path, doc_id: str, content_type: str | None = None) -> Path:
-    return docs_dir / _doc_storage_rel_path(doc_id, content_type)
 
 
 def _resolve_index_storage_path(docs_dir: Path, storage_path: Any) -> Path | None:
@@ -6789,13 +6741,6 @@ def _make_snippet(text: str, query: str, radius: int = 90) -> str:
 
 def _search_score(*parts: tuple[bool, float]) -> float:
     return sum(weight for matched, weight in parts if matched)
-
-
-def _mask_path(p: str | Path) -> str:
-    """Replace home directory prefix with ~ to avoid exposing absolute paths."""
-    s = str(p)
-    home = os.path.expanduser("~")
-    return s.replace(home, "~") if s.startswith(home) else s
 
 
 @app.get("/health")

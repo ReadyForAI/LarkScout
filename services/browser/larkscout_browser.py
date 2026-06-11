@@ -25,6 +25,13 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from pydantic import BaseModel, Field
 
 from i18n import t
+from larkscout_common.atomic import _write_text as _write_text_atomic
+from larkscout_common.paths import _mask_path
+from larkscout_common.storage import (
+    _doc_storage_rel_path,
+    _get_docs_dir,
+    _normalize_content_type,
+)
 
 logger = logging.getLogger("larkscout_browser")
 
@@ -47,16 +54,6 @@ _capture_sem = asyncio.Semaphore(_MAX_CONCURRENT_CAPTURE)
 _session_sem = asyncio.Semaphore(_MAX_CONCURRENT_SESSIONS)
 
 BASE_DIR = Path(__file__).resolve().parent
-
-# ---- Document library (shared with docreader) ----
-_DEFAULT_DOCS_DIR = Path(
-    os.environ.get(
-        "LARKSCOUT_DOCS_DIR",
-        os.path.expanduser("~/.larkscout/docs"),
-    )
-)
-CONTENT_TYPE_DIRS = ("General", "Contract", "Bid", "Knowledge")
-_CONTENT_TYPE_ALIASES = {name.lower(): name for name in CONTENT_TYPE_DIRS}
 
 # ---- URL validation (anti-SSRF) ----
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -1964,32 +1961,6 @@ _browser: Browser | None = None
 # ============================================================
 
 
-def _get_docs_dir() -> Path:
-    """Return the document library root, creating it if necessary."""
-    d = _DEFAULT_DOCS_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _normalize_content_type(value: str | None) -> str:
-    raw = (value or "General").strip()
-    normalized = _CONTENT_TYPE_ALIASES.get(raw.lower())
-    if not normalized:
-        allowed = ", ".join(CONTENT_TYPE_DIRS)
-        raise HTTPException(422, f"content_type must be one of: {allowed}")
-    return normalized
-
-
-def _doc_storage_rel_path(doc_id: str, content_type: str | None = None) -> str:
-    if content_type is None:
-        return doc_id
-    return f"{_normalize_content_type(content_type)}/{doc_id}"
-
-
-def _doc_storage_dir(docs_dir: Path, doc_id: str, content_type: str | None = None) -> Path:
-    return docs_dir / _doc_storage_rel_path(doc_id, content_type)
-
-
 _web_counter_lock = threading.Lock()
 _web_index_lock = threading.Lock()
 
@@ -2059,14 +2030,6 @@ def _build_manifest_sections(
             "file": f"tables/table-{i:02d}.md",
         })
     return result
-
-
-def _write_text_atomic(path: Path, content: str) -> None:
-    """Write text atomically via temp file + os.replace."""
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
 
 
 def _persist_web_capture(
@@ -2238,13 +2201,6 @@ app = FastAPI(
 # ============================================================
 # Routes
 # ============================================================
-def _mask_path(p: str | Path) -> str:
-    """Replace home directory prefix with ~ to avoid exposing absolute paths."""
-    s = str(p)
-    home = os.path.expanduser("~")
-    return s.replace(home, "~") if s.startswith(home) else s
-
-
 @app.get("/health")
 async def health() -> dict:
     return {
