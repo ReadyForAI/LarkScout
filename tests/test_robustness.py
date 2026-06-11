@@ -106,9 +106,9 @@ class TestPDFParse:
             encoding="utf-8",
         )
         monkeypatch.setenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", f"{sys.executable} {worker}")
-        monkeypatch.setattr(larkscout_docreader, "_local_ocr_disabled_until", 0.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "_local_ocr_disabled_until", 0.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
 
         try:
             text = larkscout_docreader.local_ocr(b"not-an-image", 1, "paddleocr")
@@ -133,10 +133,10 @@ class TestPDFParse:
             encoding="utf-8",
         )
         monkeypatch.setenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", f"{sys.executable} {worker}")
-        monkeypatch.setattr(larkscout_docreader, "_local_ocr_disabled_until", 0.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_CIRCUIT_BREAKER_SEC", 0.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "_local_ocr_disabled_until", 0.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_CIRCUIT_BREAKER_SEC", 0.0)
 
         try:
             text = larkscout_docreader.local_ocr(b"not-an-image", 1, "paddleocr")
