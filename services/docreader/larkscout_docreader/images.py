@@ -205,4 +205,3 @@ def _ocr_embedded_image(image: EmbeddedImage, backend: str) -> tuple[str, str, s
         return _cleanup_ocr_text(text), "llm", "ok", ""
     used_backend = "llm" if selected == "llm" else "auto"
     return "", used_backend, "failed", text or "LLM OCR returned no text"
-
