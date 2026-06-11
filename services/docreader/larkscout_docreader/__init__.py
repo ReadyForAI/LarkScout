@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import hashlib
 import io
@@ -17,11 +16,8 @@ import math
 import os
 import posixpath
 import re
-import selectors
-import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -63,7 +59,6 @@ from .models import (
     FieldRule,
     OCRBlocksSidecar,
     OCRPageBlocks,
-    OCRTextBlock,
     PageContent,
     ParsedDocument,
     ProcessingPolicy,
@@ -75,6 +70,23 @@ from .models import (
     UpgradePolicy,
     _normalize_layout_bbox,
 )
+from .models import (
+    OCRTextBlock as OCRTextBlock,
+)
+from .ocr.engines import (
+    _get_local_ocr_worker,
+    _is_ocr_failed_text,
+    _local_ocr_worker_initializing,
+    _local_ocr_worker_lock,
+    _local_ocr_worker_ready,
+    _ocr_cache_key,
+    _ocr_cache_path,
+    _ocr_cache_variant_path,
+    gemini_ocr,
+    local_ocr,
+    local_ocr_with_layout,
+)
+from .ocr.engines import _stop_local_ocr_worker as _stop_local_ocr_worker
 from .ocr.tables import (
     _apply_table_continuation_links,
     _count_markdown_tables,
@@ -249,23 +261,6 @@ def _parsed_document_locale(parsed: ParsedDocument) -> str:
 # LLM provider wrapper
 # ═══════════════════════════════════════════
 
-
-def gemini_ocr(image_bytes: bytes, page_num: int, *, proofread: bool | None = None) -> str:
-    """OCR a single page image via the active LLM provider."""
-    from providers import get_provider
-
-    try:
-        return get_provider().ocr(image_bytes, page_num, proofread=proofread)
-    except Exception as exc:
-        logger.warning("OCR unavailable for page %d: %s", page_num, exc)
-        return t("ocr_failed", page=page_num)
-
-
-def _is_ocr_failed_text(text: str | None) -> bool:
-    if not text:
-        return False
-    value = text.strip()
-    return value.startswith("[OCR failed") or value.startswith("[OCR 失败")
 
 
 def gemini_summarize(text: str, summarize_prompt: str, max_retries: int = 2) -> str:
@@ -465,244 +460,13 @@ def _page_blank_signal(page: Any, *, scale: float = 0.5) -> dict[str, Any]:
     }
 
 
-def _ocr_cache_path(doc_dir: Path, page_num: int) -> Path:
-    cache_dir = doc_dir / ".cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"ocr_p{page_num:04d}.txt"
 
-
-def _ocr_cache_variant_path(doc_dir: Path, key: str) -> Path:
-    cache_dir = doc_dir / ".cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", key).strip("-") or "cache"
-    return cache_dir / safe
-
-
-def _ocr_cache_key(image_bytes: bytes) -> str:
-    return hashlib.sha1(image_bytes).hexdigest()[:16]
-
-
-_local_ocr_worker: subprocess.Popen[str] | None = None
-_local_ocr_worker_lock = threading.Lock()
-_local_ocr_worker_ready = threading.Event()
-_local_ocr_worker_initializing = threading.Event()
-_local_ocr_disabled_until = 0.0
 _deferred_summary_sem = threading.BoundedSemaphore(DEFERRED_SUMMARY_MAX_CONCURRENT)
 DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC = float(
     os.environ.get("LARKSCOUT_DEFERRED_SUMMARY_LOCAL_OCR_WAIT_SEC", "30")
 )
-LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC = float(
-    os.environ.get("LARKSCOUT_LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", "180")
-)
-LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC = float(
-    os.environ.get("LARKSCOUT_LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", "180")
-)
-LOCAL_OCR_CIRCUIT_BREAKER_SEC = float(
-    os.environ.get("LARKSCOUT_LOCAL_OCR_CIRCUIT_BREAKER_SEC", "120")
-)
 
 
-def _local_ocr_worker_command() -> list[str]:
-    raw = os.environ.get("LARKSCOUT_LOCAL_OCR_WORKER_CMD", "").strip()
-    if raw:
-        return shlex.split(raw)
-    worker = Path(__file__).resolve().parent.parent / "paddle_ocr_worker.py"
-    return [sys.executable, str(worker)]
-
-
-def _drain_local_ocr_worker_stderr(proc: subprocess.Popen[str]) -> None:
-    assert proc.stderr is not None
-    for line in proc.stderr:
-        value = line.rstrip()
-        if value:
-            logger.info("[local-ocr-worker] %s", value)
-
-
-def _read_local_ocr_worker_message(proc: subprocess.Popen[str], timeout: float) -> dict[str, Any]:
-    if proc.stdout is None:
-        raise RuntimeError("local OCR worker stdout is unavailable")
-    deadline = time.monotonic() + max(timeout, 0.1)
-    selector = selectors.DefaultSelector()
-    selector.register(proc.stdout, selectors.EVENT_READ)
-    try:
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(f"local OCR worker exited with code {proc.returncode}")
-            remaining = max(deadline - time.monotonic(), 0.1)
-            events = selector.select(timeout=remaining)
-            if not events:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"local OCR worker closed stdout with code {proc.poll()}")
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Ignoring non-JSON local OCR worker output: %s", line.rstrip())
-                continue
-            if isinstance(message, dict):
-                return message
-        raise TimeoutError(f"local OCR worker timed out after {timeout:.1f}s")
-    finally:
-        selector.close()
-
-
-def _mark_local_ocr_worker_unhealthy(reason: str) -> None:
-    global _local_ocr_disabled_until
-    _local_ocr_disabled_until = time.monotonic() + max(LOCAL_OCR_CIRCUIT_BREAKER_SEC, 0)
-    logger.warning("Local OCR worker marked unhealthy: %s", reason)
-
-
-def _stop_local_ocr_worker() -> None:
-    global _local_ocr_worker
-    proc = _local_ocr_worker
-    _local_ocr_worker = None
-    _local_ocr_worker_ready.clear()
-    if not proc:
-        return
-    try:
-        if proc.stdin:
-            proc.stdin.close()
-    except Exception:
-        pass
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-
-
-def _get_local_ocr_worker() -> subprocess.Popen[str]:
-    global _local_ocr_worker
-    if _local_ocr_disabled_until > time.monotonic():
-        raise RuntimeError("local OCR worker is temporarily disabled after a crash")
-    if _local_ocr_worker is not None and _local_ocr_worker.poll() is None:
-        return _local_ocr_worker
-    if _local_ocr_worker is not None:
-        _stop_local_ocr_worker()
-
-    _local_ocr_worker_initializing.set()
-    try:
-        cmd = _local_ocr_worker_command()
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        _local_ocr_worker = proc
-        threading.Thread(
-            target=_drain_local_ocr_worker_stderr,
-            args=(proc,),
-            daemon=True,
-        ).start()
-        message = _read_local_ocr_worker_message(
-            proc, timeout=LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC
-        )
-        if message.get("type") != "ready":
-            error = message.get("error") or message
-            _stop_local_ocr_worker()
-            raise RuntimeError(f"local OCR worker startup failed: {error}")
-        _local_ocr_worker_ready.set()
-        return proc
-    except Exception as exc:
-        _stop_local_ocr_worker()
-        _mark_local_ocr_worker_unhealthy(str(exc))
-        raise
-    finally:
-        _local_ocr_worker_initializing.clear()
-
-
-def _ocr_page_blocks_from_worker_response(
-    page_num: int,
-    response: dict[str, Any],
-    source: str,
-) -> OCRPageBlocks | None:
-    raw_blocks = response.get("blocks")
-    if not isinstance(raw_blocks, list):
-        return None
-    blocks: list[OCRTextBlock] = []
-    for index, raw in enumerate(raw_blocks):
-        if not isinstance(raw, dict):
-            continue
-        text = str(raw.get("text") or "").strip()
-        if not text:
-            continue
-        try:
-            bbox = tuple(_normalize_layout_bbox(raw.get("bbox") or [0, 0, 0, 0]))
-        except (TypeError, ValueError):
-            bbox = (0.0, 0.0, 0.0, 0.0)
-        order = int(raw.get("order") if raw.get("order") is not None else index)
-        line_index = int(raw.get("line_index") if raw.get("line_index") is not None else order)
-        blocks.append(
-            OCRTextBlock(
-                block_id=f"p{page_num}-b{len(blocks) + 1:04d}",
-                text=text,
-                bbox=bbox,  # type: ignore[arg-type]
-                confidence=float(raw.get("confidence") or 0.0),
-                source=source,
-                line_index=line_index,
-                order=order,
-            )
-        )
-    width = int(response.get("width") or 0)
-    height = int(response.get("height") or 0)
-    return OCRPageBlocks(page=page_num, width=width, height=height, blocks=tuple(blocks))
-
-
-def local_ocr_with_layout(
-    image_bytes: bytes,
-    page_num: int,
-    backend: str,
-) -> tuple[str, OCRPageBlocks | None]:
-    name = (backend or "").strip().lower()
-    if name in {"", "none"}:
-        return "", None
-    if name != "paddleocr":
-        raise RuntimeError(f"unsupported local OCR backend: {backend}")
-    with _local_ocr_worker_lock:
-        try:
-            proc = _get_local_ocr_worker()
-            if proc.stdin is None:
-                raise RuntimeError("local OCR worker stdin is unavailable")
-            request = {
-                "page_num": page_num,
-                "image_b64": base64.b64encode(image_bytes).decode("ascii"),
-            }
-            proc.stdin.write(json.dumps(request) + "\n")
-            proc.stdin.flush()
-            response = _read_local_ocr_worker_message(
-                proc, timeout=LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC
-            )
-            if not response.get("ok"):
-                logger.warning(
-                    "Local OCR worker failed page %d via %s: %s",
-                    page_num,
-                    backend,
-                    response.get("error") or response,
-                )
-                return t("ocr_failed", page=page_num), None
-            text = str(response.get("text") or "").strip()
-            page_blocks = _ocr_page_blocks_from_worker_response(
-                page_num,
-                response,
-                source=f"local-{name}",
-            )
-            return text or t("ocr_failed", page=page_num), page_blocks
-        except Exception as exc:
-            _stop_local_ocr_worker()
-            _mark_local_ocr_worker_unhealthy(str(exc))
-            logger.warning("Local OCR unavailable for page %d via %s: %s", page_num, backend, exc)
-            return t("ocr_failed", page=page_num), None
-
-
-def local_ocr(image_bytes: bytes, page_num: int, backend: str) -> str:
-    text, _page_blocks = local_ocr_with_layout(image_bytes, page_num, backend)
-    return text
 
 
 def _remove_footer_page_number(lines: list[str], page_num: int, total_pages: int) -> list[str]:

@@ -106,9 +106,9 @@ class TestPDFParse:
             encoding="utf-8",
         )
         monkeypatch.setenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", f"{sys.executable} {worker}")
-        monkeypatch.setattr(larkscout_docreader, "_local_ocr_disabled_until", 0.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "_local_ocr_disabled_until", 0.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
 
         try:
             text = larkscout_docreader.local_ocr(b"not-an-image", 1, "paddleocr")
@@ -133,10 +133,10 @@ class TestPDFParse:
             encoding="utf-8",
         )
         monkeypatch.setenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", f"{sys.executable} {worker}")
-        monkeypatch.setattr(larkscout_docreader, "_local_ocr_disabled_until", 0.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
-        monkeypatch.setattr(larkscout_docreader, "LOCAL_OCR_CIRCUIT_BREAKER_SEC", 0.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "_local_ocr_disabled_until", 0.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_STARTUP_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_WORKER_REQUEST_TIMEOUT_SEC", 3.0)
+        monkeypatch.setattr(larkscout_docreader.ocr.engines, "LOCAL_OCR_CIRCUIT_BREAKER_SEC", 0.0)
 
         try:
             text = larkscout_docreader.local_ocr(b"not-an-image", 1, "paddleocr")
@@ -144,6 +144,17 @@ class TestPDFParse:
             larkscout_docreader._stop_local_ocr_worker()
 
         assert text.startswith("[OCR failed")
+
+    def test_local_ocr_worker_default_command_points_at_real_worker(self, monkeypatch):
+        # No env override: the default must resolve to the on-disk worker script.
+        # Regression guard for the __file__-relative path after the ocr/ package move.
+        import larkscout_docreader
+
+        monkeypatch.delenv("LARKSCOUT_LOCAL_OCR_WORKER_CMD", raising=False)
+        cmd = larkscout_docreader.ocr.engines._local_ocr_worker_command()
+        worker_path = Path(cmd[-1])
+        assert worker_path.name == "paddle_ocr_worker.py"
+        assert worker_path.exists(), f"default worker path does not exist: {worker_path}"
 
     def test_load_document_profile_contract_cn(self):
         from larkscout_docreader import _load_document_profile
