@@ -8,13 +8,10 @@ import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from fastapi import FastAPI, HTTPException
-from PIL import Image
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from i18n import t
@@ -25,6 +22,16 @@ from larkscout_common.storage import (
     _get_docs_dir,
     _normalize_content_type,
 )
+
+# URL validation (anti-SSRF). Re-exported so the goto/capture endpoints and
+# test_security keep calling _validate_url off the package namespace.
+# Browser session object + manager + the process-wide `sessions` singleton.
+# Re-exported so endpoints keep calling sessions.get/put/... and test_concurrency
+# can import Session/SessionManager off the package namespace.
+# YOLO detection + Readability.js loading. Imported as `vision` so endpoints can
+# read the startup-mutated vision.YOLO_ENABLED / vision.READABILITY_* state live;
+# the functions are re-exported for bare calls.
+from . import vision as vision
 
 # Pydantic request/response models for the /web endpoints. Re-exported so the
 # endpoint handlers keep referencing them off the package namespace.
@@ -161,12 +168,6 @@ from .security import (
 from .security import (
     _validate_url as _validate_url,
 )
-
-# URL validation (anti-SSRF). Re-exported so the goto/capture endpoints and
-# test_security keep calling _validate_url off the package namespace.
-# Browser session object + manager + the process-wide `sessions` singleton.
-# Re-exported so endpoints keep calling sessions.get/put/... and test_concurrency
-# can import Session/SessionManager off the package namespace.
 from .session import (
     SESSION_MAXSIZE as SESSION_MAXSIZE,
 )
@@ -182,6 +183,24 @@ from .session import (
 from .session import (
     sessions as sessions,
 )
+from .vision import (
+    _decode_yolov8_like as _decode_yolov8_like,
+)
+from .vision import (
+    _init_yolo as _init_yolo,
+)
+from .vision import (
+    _letterbox as _letterbox,
+)
+from .vision import (
+    _load_readability_js as _load_readability_js,
+)
+from .vision import (
+    _nms_xyxy as _nms_xyxy,
+)
+from .vision import (
+    yolo_detect_ui_components as yolo_detect_ui_components,
+)
 
 logger = logging.getLogger("larkscout_browser")
 
@@ -194,31 +213,6 @@ _MAX_CONCURRENT_CAPTURE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_CAPTURE",
 _MAX_CONCURRENT_SESSIONS = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_SESSIONS", "20"))
 _capture_sem = asyncio.Semaphore(_MAX_CONCURRENT_CAPTURE)
 _session_sem = asyncio.Semaphore(_MAX_CONCURRENT_SESSIONS)
-
-BASE_DIR = Path(__file__).resolve().parent
-
-
-# ---- Readability.js local file ----
-READABILITY_JS_PATH = Path(os.getenv("READABILITY_JS_PATH", str(BASE_DIR / "readability.js")))
-READABILITY_JS: str | None = None
-READABILITY_AVAILABLE = False
-
-# ---- YOLO (onnxruntime) ----
-YOLO_ONNX_PATH = os.getenv("YOLO_ONNX_PATH", "")
-YOLO_INPUT_SIZE = int(os.getenv("YOLO_INPUT_SIZE", "640"))
-YOLO_CLASS_MAP_JSON = os.getenv(
-    "YOLO_CLASS_MAP_JSON",
-    '{"0":"button","1":"textbox","2":"checkbox","3":"link","4":"combobox"}',
-)
-try:
-    YOLO_CLASS_MAP = {int(k): v for k, v in json.loads(YOLO_CLASS_MAP_JSON).items()}
-except Exception:
-    YOLO_CLASS_MAP = {0: "button", 1: "textbox"}
-
-YOLO_ENABLED = False
-YOLO_SESSION = None
-YOLO_INPUT_NAME = None
-YOLO_OUTPUT_NAMES = None
 
 
 # ============================================================
@@ -831,137 +825,6 @@ async (toolName, params, autoSubmit) => {
 # ============================================================
 # Readability loader
 # ============================================================
-def _load_readability_js():
-    global READABILITY_JS, READABILITY_AVAILABLE
-    try:
-        READABILITY_JS = READABILITY_JS_PATH.read_text(encoding="utf-8")
-        READABILITY_AVAILABLE = True
-    except Exception:
-        READABILITY_JS = None
-        READABILITY_AVAILABLE = False
-
-
-# ============================================================
-# YOLO init + decode helpers (onnxruntime)
-# ============================================================
-def _init_yolo():
-    global YOLO_ENABLED, YOLO_SESSION, YOLO_INPUT_NAME, YOLO_OUTPUT_NAMES
-    if not YOLO_ONNX_PATH:
-        YOLO_ENABLED = False
-        return
-    try:
-        import onnxruntime as ort
-
-        YOLO_SESSION = ort.InferenceSession(YOLO_ONNX_PATH, providers=["CPUExecutionProvider"])
-        YOLO_INPUT_NAME = YOLO_SESSION.get_inputs()[0].name
-        YOLO_OUTPUT_NAMES = [o.name for o in YOLO_SESSION.get_outputs()]
-        YOLO_ENABLED = True
-    except Exception:
-        YOLO_ENABLED = False
-        YOLO_SESSION = None
-
-
-def _letterbox(img: Image.Image, new_size: int = 640, color=(114, 114, 114)):
-    w, h = img.size
-    r = min(new_size / w, new_size / h)
-    nw, nh = int(round(w * r)), int(round(h * r))
-    img_resized = img.resize((nw, nh), Image.BILINEAR)
-
-    canvas = Image.new("RGB", (new_size, new_size), color)
-    pad_w = (new_size - nw) // 2
-    pad_h = (new_size - nh) // 2
-    canvas.paste(img_resized, (pad_w, pad_h))
-
-    arr = np.asarray(canvas).astype(np.float32) / 255.0
-    arr = np.transpose(arr, (2, 0, 1))
-    arr = np.expand_dims(arr, 0)
-    return arr, r, (pad_w, pad_h)
-
-
-def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> list[int]:
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-    order = scores.argsort()[::-1]
-    keep = []
-
-    while order.size > 0:
-        i = order[0]
-        keep.append(int(i))
-        if order.size == 1:
-            break
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-
-        w = np.maximum(0.0, xx2 - xx1 + 1)
-        h = np.maximum(0.0, yy2 - yy1 + 1)
-        inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-
-        inds = np.where(iou <= iou_thresh)[0]
-        order = order[inds + 1]
-
-    return keep
-
-
-def _decode_yolov8_like(out: np.ndarray, conf_thresh: float):
-    if out.ndim == 3:
-        out = out[0]
-    pred = out.T
-    boxes = pred[:, :4]
-    cls_scores = pred[:, 4:]
-    class_ids = np.argmax(cls_scores, axis=1)
-    scores = cls_scores[np.arange(cls_scores.shape[0]), class_ids]
-
-    mask = scores >= conf_thresh
-    boxes, scores, class_ids = boxes[mask], scores[mask], class_ids[mask]
-
-    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
-    return xyxy, scores, class_ids
-
-
-def yolo_detect_ui_components(
-    image_bytes: bytes,
-    conf_thresh: float,
-    iou_thresh: float,
-    max_boxes: int,
-) -> list[dict[str, Any]]:
-    if not YOLO_ENABLED or YOLO_SESSION is None:
-        return []
-
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    inp, ratio, (pad_w, pad_h) = _letterbox(img, YOLO_INPUT_SIZE)
-
-    outputs = YOLO_SESSION.run(YOLO_OUTPUT_NAMES, {YOLO_INPUT_NAME: inp})
-    xyxy, scores, class_ids = _decode_yolov8_like(outputs[0], conf_thresh=conf_thresh)
-    if xyxy.size == 0:
-        return []
-
-    keep = _nms_xyxy(xyxy, scores, iou_thresh=iou_thresh)[:max_boxes]
-
-    w0, h0 = img.size
-    dets = []
-    for i in keep:
-        x1, y1, x2, y2 = xyxy[i]
-        x1 = float(np.clip((x1 - pad_w) / ratio, 0, w0 - 1))
-        y1 = float(np.clip((y1 - pad_h) / ratio, 0, h0 - 1))
-        x2 = float(np.clip((x2 - pad_w) / ratio, 0, w0 - 1))
-        y2 = float(np.clip((y2 - pad_h) / ratio, 0, h0 - 1))
-
-        cid = int(class_ids[i])
-        dets.append(
-            {
-                "bbox": [x1, y1, x2, y2],
-                "class_id": cid,
-                "type": YOLO_CLASS_MAP.get(cid, f"class_{cid}"),
-                "score": float(scores[i]),
-            }
-        )
-    return dets
-
-
 # ============================================================
 # Distill: blocks -> stable sections
 # ============================================================
@@ -1185,7 +1048,7 @@ async def _extract_actions_a11y(page: Page, max_actions: int) -> tuple[list[dict
 
 
 async def _extract_actions_vision(page: Page, req: DistillRequest) -> list[dict[str, Any]]:
-    if not YOLO_ENABLED or not req.enable_vision_fallback:
+    if not vision.YOLO_ENABLED or not req.enable_vision_fallback:
         return []
 
     try:
@@ -1354,20 +1217,20 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
 
     mode = req.distill_mode
     if mode == "auto":
-        mode = "readability" if READABILITY_AVAILABLE else "simple"
+        mode = "readability" if vision.READABILITY_AVAILABLE else "simple"
 
     blocks: list[dict[str, str]] = []
     readability_meta = {}
     extracted_tables: list[dict[str, Any]] = []
 
     if mode == "readability":
-        if not READABILITY_AVAILABLE or not READABILITY_JS:
+        if not vision.READABILITY_AVAILABLE or not vision.READABILITY_JS:
             mode = "simple"
         else:
             # avoid re-injecting Readability.js
             already = await page.evaluate("typeof Readability !== 'undefined'")
             if not already:
-                await page.add_script_tag(content=READABILITY_JS)
+                await page.add_script_tag(content=vision.READABILITY_JS)
 
             data = await page.evaluate(READABILITY_EVAL, 40000)
             if not data or not (data.get("text") or "").strip():
@@ -1465,8 +1328,8 @@ async def _distill(session: Session, req: DistillRequest) -> dict[str, Any]:
 
     meta = {
         "mode": mode,
-        "readability_available": READABILITY_AVAILABLE,
-        "yolo_enabled": YOLO_ENABLED,
+        "readability_available": vision.READABILITY_AVAILABLE,
+        "yolo_enabled": vision.YOLO_ENABLED,
         "a11y": {
             "attempted": a11y_attempted,
             "mode": a11y_mode,
@@ -1804,11 +1667,11 @@ async def health() -> dict:
     return {
         "ok": True,
         "sessions": len(sessions),
-        "readability_available": READABILITY_AVAILABLE,
-        "readability_js_path": _mask_path(READABILITY_JS_PATH),
-        "yolo_enabled": YOLO_ENABLED,
-        "yolo_onnx_path": _mask_path(YOLO_ONNX_PATH) if YOLO_ONNX_PATH else None,
-        "yolo_input_size": YOLO_INPUT_SIZE,
+        "readability_available": vision.READABILITY_AVAILABLE,
+        "readability_js_path": _mask_path(vision.READABILITY_JS_PATH),
+        "yolo_enabled": vision.YOLO_ENABLED,
+        "yolo_onnx_path": _mask_path(vision.YOLO_ONNX_PATH) if vision.YOLO_ONNX_PATH else None,
+        "yolo_input_size": vision.YOLO_INPUT_SIZE,
         "webmcp_support": True,
     }
 
