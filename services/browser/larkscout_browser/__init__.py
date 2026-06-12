@@ -5,11 +5,8 @@ import os
 import re
 import secrets
 import threading
-import time
-from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -158,9 +155,6 @@ from .ranking import (
 from .ranking import (
     _trim_action_fields as _trim_action_fields,
 )
-
-# URL validation (anti-SSRF). Re-exported so the goto/capture endpoints and
-# test_security keep calling _validate_url off the package namespace.
 from .security import (
     _ALLOWED_SCHEMES as _ALLOWED_SCHEMES,
 )
@@ -168,13 +162,32 @@ from .security import (
     _validate_url as _validate_url,
 )
 
+# URL validation (anti-SSRF). Re-exported so the goto/capture endpoints and
+# test_security keep calling _validate_url off the package namespace.
+# Browser session object + manager + the process-wide `sessions` singleton.
+# Re-exported so endpoints keep calling sessions.get/put/... and test_concurrency
+# can import Session/SessionManager off the package namespace.
+from .session import (
+    SESSION_MAXSIZE as SESSION_MAXSIZE,
+)
+from .session import (
+    SESSION_TTL_SECONDS as SESSION_TTL_SECONDS,
+)
+from .session import (
+    Session as Session,
+)
+from .session import (
+    SessionManager as SessionManager,
+)
+from .session import (
+    sessions as sessions,
+)
+
 logger = logging.getLogger("larkscout_browser")
 
 # ============================================================
 # Config
 # ============================================================
-SESSION_TTL_SECONDS = 30 * 60  # 30 min idle
-SESSION_MAXSIZE = 200
 
 # ---- Rate limiting (in-memory semaphores) ----
 _MAX_CONCURRENT_CAPTURE = int(os.environ.get("LARKSCOUT_MAX_CONCURRENT_CAPTURE", "10"))
@@ -206,99 +219,6 @@ YOLO_ENABLED = False
 YOLO_SESSION = None
 YOLO_INPUT_NAME = None
 YOLO_OUTPUT_NAMES = None
-
-
-# ============================================================
-# Session object
-# ============================================================
-@dataclass
-class Session:
-    context: BrowserContext
-    page: Page
-    lang: str
-    last_distill: dict[str, Any] | None = None
-    action_map: dict[str, dict[str, Any]] = field(
-        default_factory=dict
-    )  # ✅ IMPROVED: field(default_factory)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # concurrency lock
-    closed: bool = False  # set when session is evicted/expired
-    # WebMCP: cached tool list
-    webmcp_tools: list[dict[str, Any]] | None = None
-    webmcp_available: bool = False
-
-
-# ============================================================
-# SessionManager with expiry callbacks,
-#    replaces TTLCache to fix resource leak on expired sessions
-# ============================================================
-class SessionManager:
-    def __init__(self, ttl: int = SESSION_TTL_SECONDS, maxsize: int = SESSION_MAXSIZE):
-        self._sessions: OrderedDict[str, tuple[float, Session]] = OrderedDict()
-        self._ttl = ttl
-        self._maxsize = maxsize
-        self._lock = asyncio.Lock()
-
-    def __len__(self):
-        return len(self._sessions)
-
-    async def put(self, sid: str, sess: Session) -> None:
-        async with self._lock:
-            # evict oldest
-            if len(self._sessions) >= self._maxsize:
-                old_sid, (_, old_sess) = self._sessions.popitem(last=False)
-                logger.info("session evicted (maxsize): %s", old_sid)
-                await self._close_session(old_sess)
-            self._sessions[sid] = (time.time(), sess)
-
-    async def get(self, sid: str) -> Session | None:
-        async with self._lock:
-            item = self._sessions.get(sid)
-            if not item:
-                return None
-            ts, sess = item
-            if time.time() - ts > self._ttl:
-                del self._sessions[sid]
-                logger.info("session expired on access: %s", sid)
-                await self._close_session(sess)
-                return None
-            # refresh timestamp & move to end
-            self._sessions[sid] = (time.time(), sess)
-            self._sessions.move_to_end(sid)
-            return sess
-
-    async def remove(self, sid: str) -> None:
-        async with self._lock:
-            item = self._sessions.pop(sid, None)
-            if item:
-                _, sess = item
-                await self._close_session(sess)
-
-    async def cleanup(self) -> None:
-        """Periodic cleanup of expired sessions."""
-        async with self._lock:
-            now = time.time()
-            expired = [sid for sid, (ts, _) in self._sessions.items() if now - ts > self._ttl]
-            for sid in expired:
-                _, sess = self._sessions.pop(sid)
-                logger.info("session expired (cleanup): %s", sid)
-                await self._close_session(sess)
-
-    async def close_all(self) -> None:
-        async with self._lock:
-            for sid, (_, sess) in self._sessions.items():
-                await self._close_session(sess)
-            self._sessions.clear()
-
-    @staticmethod
-    async def _close_session(sess: Session):
-        sess.closed = True
-        try:
-            await sess.context.close()
-        except Exception:
-            pass
-
-
-sessions = SessionManager()
 
 
 # ============================================================
