@@ -46,6 +46,89 @@ _TABLE_HEADER_TERMS = {
 _TABLE_FOOTER_TERMS = ("小计", "合计", "大写人民币")
 
 
+# Running header/footer stripping: only act on multi-page docs, only inspect the
+# top/bottom few lines of each page, and only drop a line when it repeats across
+# at least half the pages — so body text is never touched.
+_HF_MIN_PAGES = 4
+_HF_EDGE_LINES = 2
+_HF_RATIO = 0.5
+
+
+def _norm_edge_line(line: str) -> str:
+    """Normalise an edge line for cross-page comparison.
+
+    Whitespace is dropped. A line that is *only* digits (a bare page number)
+    collapses to one sentinel so page numbers compare equal across pages, while
+    alphanumeric body lines like ``item1`` / ``item2`` stay distinct and are
+    never mistaken for a repeating template.
+    """
+    compact = re.sub(r"\s+", "", line)
+    return "\x00page-number" if compact.isdigit() else compact
+
+
+def _strip_repeated_headers_footers(page_texts: dict[int, str], total_pages: int) -> dict[int, str]:
+    """Drop running headers/footers that repeat across most pages.
+
+    Native PDF text keeps the running header/footer on every page (e.g. a
+    company-name banner, or ``<title> - page N``). ``_cleanup_ocr_text``'s
+    per-page rules miss these because they are identical prose, not a
+    page-number pattern. Here we detect lines that recur at the top or bottom
+    edge of a majority of pages (after normalising digits, so page numbers
+    collapse) and remove only those edge lines, leaving body text intact.
+    """
+    if total_pages < _HF_MIN_PAGES:
+        return page_texts
+
+    top_counts: dict[str, int] = {}
+    bottom_counts: dict[str, int] = {}
+    for pn in range(1, total_pages + 1):
+        nonblank = [ln for ln in (x.strip() for x in page_texts.get(pn, "").split("\n")) if ln]
+        for ln in nonblank[:_HF_EDGE_LINES]:
+            key = _norm_edge_line(ln)
+            top_counts[key] = top_counts.get(key, 0) + 1
+        for ln in nonblank[-_HF_EDGE_LINES:]:
+            key = _norm_edge_line(ln)
+            bottom_counts[key] = bottom_counts.get(key, 0) + 1
+
+    threshold = max(2, int(total_pages * _HF_RATIO))
+    top_templates = {k for k, c in top_counts.items() if k and c >= threshold}
+    bottom_templates = {k for k, c in bottom_counts.items() if k and c >= threshold}
+    if not top_templates and not bottom_templates:
+        return page_texts
+
+    result: dict[int, str] = dict(page_texts)
+    for pn in range(1, total_pages + 1):
+        lines = page_texts.get(pn, "").split("\n")
+        drop: set[int] = set()
+        seen = 0
+        for i, ln in enumerate(lines):
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            seen += 1
+            if seen > _HF_EDGE_LINES:
+                break
+            if _norm_edge_line(stripped) in top_templates:
+                drop.add(i)
+            else:
+                break
+        seen = 0
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            seen += 1
+            if seen > _HF_EDGE_LINES:
+                break
+            if _norm_edge_line(stripped) in bottom_templates:
+                drop.add(i)
+            else:
+                break
+        if drop:
+            result[pn] = "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
+    return result
+
+
 def _remove_footer_page_number(lines: list[str], page_num: int, total_pages: int) -> list[str]:
     cleaned = list(lines)
     if not cleaned:
