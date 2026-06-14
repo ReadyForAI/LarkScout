@@ -79,11 +79,17 @@ def _strip_repeated_headers_footers(page_texts: dict[int, str], total_pages: int
     """Drop running headers/footers that repeat across most pages.
 
     Native PDF text keeps the running header/footer on every page (e.g. a
-    company-name banner, or ``<title> - page N``). ``_cleanup_ocr_text``'s
-    per-page rules miss these because they are identical prose, not a
-    page-number pattern. Here we detect lines that recur at the top or bottom
-    edge of a majority of pages (after normalising digits, so page numbers
-    collapse) and remove only those edge lines, leaving body text intact.
+    company-name banner repeated verbatim). ``_cleanup_ocr_text``'s per-page
+    rules miss these because they are identical prose, not a page-number
+    pattern. Here we detect lines that recur verbatim at the top or bottom edge
+    of a majority of pages (a bare footer page number collapses to one sentinel
+    so page numbers compare equal) and remove only those edge lines, leaving
+    body text intact.
+
+    Known limitation: a footer that embeds a *changing* page number into prose
+    (``Project X - page N``) is left in place — collapsing it needs in-line
+    digit normalisation, which risks deleting legitimate body numbering
+    (``item1`` / ``item2``), so that case is deferred.
     """
     if total_pages < _HF_MIN_PAGES:
         return page_texts
