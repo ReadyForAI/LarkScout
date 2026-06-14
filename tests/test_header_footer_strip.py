@@ -88,6 +88,34 @@ def test_numeric_heading_not_page_number_kept():
     assert "banner" not in out[1]  # the real running header still goes
 
 
+def test_top_numeric_heading_equal_to_page_index_kept():
+    # Top headings whose value equals the page index (1,2,3,4) must survive:
+    # the page-number sentinel is footer-only, so top digits compare verbatim.
+    pages = _pages(
+        "1\nScope",
+        "2\nDefinitions",
+        "3\nRequirements",
+        "4\nAcceptance",
+    )
+    out = _strip_repeated_headers_footers(pages, 4)
+    for pn in range(1, 5):
+        assert str(pn) in out[pn]
+    assert "Scope" in out[1]
+
+
+def test_footer_page_numbers_still_stripped():
+    pages = _pages(
+        "Title\nbody1\n1",
+        "Title\nbody2\n2",
+        "Title\nbody3\n3",
+        "Title\nbody4\n4",
+    )
+    out = _strip_repeated_headers_footers(pages, 4)
+    for pn in range(1, 5):
+        # Footer page number collapses + strips; banner strips; body stays.
+        assert out[pn].strip().splitlines() == [f"body{pn}"]
+
+
 def test_odd_page_count_uses_ceiling_threshold():
     # 5 pages: an edge line on only 2 pages (40%) is below "at least half"
     # and must be kept (ceil(5*0.5) == 3, not floor == 2).
