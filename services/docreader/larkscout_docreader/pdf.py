@@ -45,6 +45,7 @@ from .ocr_text import (
     _extract_pdf_page_tables,
     _extract_tables_from_ocr_text,
     _normalize_document_text,
+    _strip_repeated_headers_footers,
     _strip_text_in_table_bboxes,
 )
 from .profiles import _apply_field_focused_ocr, _load_document_profile
@@ -193,6 +194,12 @@ def parse_pdf(
                 **blank_info,
             }
         )
+
+    # Drop running headers/footers that repeat across most pages (e.g. a
+    # company-name banner on every page). Native PDF text keeps these on every
+    # page; removing them here cleans both the section body text and the
+    # classification text below.
+    page_texts = _strip_repeated_headers_footers(page_texts, total_pages)
 
     # Contract/keyword classification must see the same content the dropped
     # MarkItDown pass produced: native body text PLUS table text. page_texts has

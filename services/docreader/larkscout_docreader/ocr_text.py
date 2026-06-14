@@ -22,6 +22,7 @@ back into helpers defined here.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Any
 
@@ -44,6 +45,111 @@ _TABLE_HEADER_TERMS = {
     "服务描述",
 }
 _TABLE_FOOTER_TERMS = ("小计", "合计", "大写人民币")
+
+
+# Running header/footer stripping: only act on multi-page docs, only inspect the
+# top/bottom few lines of each page, and only drop a line when it repeats across
+# at least half the pages — so body text is never touched.
+_HF_MIN_PAGES = 4
+_HF_EDGE_LINES = 2
+_HF_RATIO = 0.5
+
+
+def _norm_edge_line(line: str, page_num: int, total_pages: int, *, is_footer: bool) -> str:
+    """Normalise an edge line for cross-page comparison.
+
+    Whitespace is dropped. A digits-only line collapses to one page-number
+    sentinel ONLY in a footer position AND when its value tracks the page index
+    (a real page number, small offset tolerated for cover / front-matter pages).
+    Top-edge digits are always compared verbatim, so a standalone numeric
+    section heading like ``1`` / ``2`` — even one that happens to equal the page
+    index — stays distinct and is never deleted as a running header. Page
+    numbers, which sit in the footer, still collapse and get stripped.
+    Alphanumeric body lines (``item1`` / ``item2``) always stay distinct.
+    """
+    compact = re.sub(r"\s+", "", line)
+    if is_footer and compact.isdigit():
+        value = int(compact)
+        if 1 <= value <= total_pages and abs(value - page_num) <= 2:
+            return "\x00page-number"
+    return compact
+
+
+def _strip_repeated_headers_footers(page_texts: dict[int, str], total_pages: int) -> dict[int, str]:
+    """Drop running headers/footers that repeat across most pages.
+
+    Native PDF text keeps the running header/footer on every page (e.g. a
+    company-name banner repeated verbatim). ``_cleanup_ocr_text``'s per-page
+    rules miss these because they are identical prose, not a page-number
+    pattern. Here we detect lines that recur verbatim at the top or bottom edge
+    of a majority of pages (a bare footer page number collapses to one sentinel
+    so page numbers compare equal) and remove only those edge lines, leaving
+    body text intact.
+
+    Known limitation: a footer that embeds a *changing* page number into prose
+    (``Project X - page N``) is left in place — collapsing it needs in-line
+    digit normalisation, which risks deleting legitimate body numbering
+    (``item1`` / ``item2``), so that case is deferred.
+    """
+    if total_pages < _HF_MIN_PAGES:
+        return page_texts
+
+    top_counts: dict[str, int] = {}
+    bottom_counts: dict[str, int] = {}
+    for pn in range(1, total_pages + 1):
+        nonblank = [ln for ln in (x.strip() for x in page_texts.get(pn, "").split("\n")) if ln]
+        # Count each normalized key at most once per page, so a line duplicated
+        # within a single page is not mistaken for a cross-page running header.
+        top_keys = {
+            _norm_edge_line(ln, pn, total_pages, is_footer=False)
+            for ln in nonblank[:_HF_EDGE_LINES]
+        }
+        for key in top_keys:
+            top_counts[key] = top_counts.get(key, 0) + 1
+        bottom_keys = {
+            _norm_edge_line(ln, pn, total_pages, is_footer=True)
+            for ln in nonblank[-_HF_EDGE_LINES:]
+        }
+        for key in bottom_keys:
+            bottom_counts[key] = bottom_counts.get(key, 0) + 1
+
+    threshold = max(2, math.ceil(total_pages * _HF_RATIO))
+    top_templates = {k for k, c in top_counts.items() if k and c >= threshold}
+    bottom_templates = {k for k, c in bottom_counts.items() if k and c >= threshold}
+    if not top_templates and not bottom_templates:
+        return page_texts
+
+    result: dict[int, str] = dict(page_texts)
+    for pn in range(1, total_pages + 1):
+        lines = page_texts.get(pn, "").split("\n")
+        drop: set[int] = set()
+        seen = 0
+        for i, ln in enumerate(lines):
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            seen += 1
+            if seen > _HF_EDGE_LINES:
+                break
+            if _norm_edge_line(stripped, pn, total_pages, is_footer=False) in top_templates:
+                drop.add(i)
+            else:
+                break
+        seen = 0
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            seen += 1
+            if seen > _HF_EDGE_LINES:
+                break
+            if _norm_edge_line(stripped, pn, total_pages, is_footer=True) in bottom_templates:
+                drop.add(i)
+            else:
+                break
+        if drop:
+            result[pn] = "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
+    return result
 
 
 def _remove_footer_page_number(lines: list[str], page_num: int, total_pages: int) -> list[str]:
