@@ -82,7 +82,6 @@ def parse_pdf(
         OCR_RENDER_SCALE,
         _assess_contract_quality,
         _classify_contract_text,
-        _convert_to_markdown,
         _page_blank_signal,
         _parse_page_range,
         _plan_pdf_ocr,
@@ -119,13 +118,6 @@ def parse_pdf(
         "large_file_threshold_mb": processing_policy.large_file_threshold_mb,
         "large_file": source_size_bytes > large_file_threshold_bytes,
     }
-    markdown_text = ""
-    try:
-        markdown_text = _convert_to_markdown(filepath)
-        logger.info(f"MarkItDown extraction complete: {len(markdown_text)} chars")
-    except RuntimeError as exc:
-        logger.warning("MarkItDown extraction failed for %s: %s", filepath.name, exc)
-
     # Open with fitz for page count, TOC, and OCR rendering
     doc = fitz.open(str(filepath))
     total_pages = len(doc)
@@ -202,7 +194,11 @@ def parse_pdf(
             }
         )
 
-    assessment = _assess_contract_quality(markdown_text, page_signals, profile)
+    # Contract/keyword classification runs on the native PyMuPDF page text. This
+    # is the same content the dropped MarkItDown pass produced (body text is
+    # byte-identical), so we reuse page_texts instead of parsing the PDF twice.
+    native_full_text = "\n".join(page_texts[pn] for pn in sorted(page_texts))
+    assessment = _assess_contract_quality(native_full_text, page_signals, profile)
     ocr_plan = _plan_pdf_ocr(
         profile=profile,
         parse_mode=selected_mode,
